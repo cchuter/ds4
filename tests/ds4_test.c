@@ -172,24 +172,31 @@ static void test_fill_q8_k_block(test_block_q8_K *b, float d, uint32_t seed) {
     }
 }
 
-static float test_q8_k_dot_f32(const test_block_q8_K *b, const float *x) {
+static float test_q8_k_dot_f32(const test_block_q8_K *blocks, const float *x, uint32_t dim) {
     float sum = 0.0f;
-    for (uint32_t i = 0; i < TEST_QK_K; i++) {
-        sum += ((float)b->qs[i] * b->d) * x[i];
+    for (uint32_t ib = 0; ib < dim / TEST_QK_K; ib++) {
+        const test_block_q8_K *b = &blocks[ib];
+        const float *xb = x + (uint64_t)ib * TEST_QK_K;
+        for (uint32_t i = 0; i < TEST_QK_K; i++) {
+            sum += ((float)b->qs[i] * b->d) * xb[i];
+        }
     }
     return sum;
 }
 
 static void test_metal_q8_k_routed_moe_one_tensor(void) {
     const uint32_t q8_k_type = 15;
-    const uint32_t expert_in_dim = 256;
-    const uint32_t expert_mid_dim = 256;
+    const uint32_t selected_expert = 17;
+    const uint32_t expert_in_dim = 512;
+    const uint32_t expert_mid_dim = 512;
     const uint32_t out_dim = 8;
     const uint32_t n_expert = 1;
     const uint64_t q8_k_block = sizeof(test_block_q8_K);
-    const uint64_t gate_row_bytes = q8_k_block;
+    const uint64_t gate_row_blocks = expert_in_dim / TEST_QK_K;
+    const uint64_t down_row_blocks = expert_mid_dim / TEST_QK_K;
+    const uint64_t gate_row_bytes = gate_row_blocks * q8_k_block;
     const uint64_t gate_expert_bytes = (uint64_t)expert_mid_dim * gate_row_bytes;
-    const uint64_t down_row_bytes = q8_k_block;
+    const uint64_t down_row_bytes = down_row_blocks * q8_k_block;
     const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
     const uint64_t gate_offset = 0;
     const uint64_t up_offset = 256ull * gate_expert_bytes;
@@ -202,15 +209,25 @@ static void test_metal_q8_k_routed_moe_one_tensor(void) {
     if (!model_raw) return;
     memset(model_raw, 0, (size_t)model_alloc);
 
-    test_block_q8_K *gate_w = (test_block_q8_K *)((char *)model_raw + gate_offset);
-    test_block_q8_K *up_w = (test_block_q8_K *)((char *)model_raw + up_offset);
-    test_block_q8_K *down_w = (test_block_q8_K *)((char *)model_raw + down_offset);
+    test_block_q8_K *gate_w =
+        (test_block_q8_K *)((char *)model_raw + gate_offset + (uint64_t)selected_expert * gate_expert_bytes);
+    test_block_q8_K *up_w =
+        (test_block_q8_K *)((char *)model_raw + up_offset + (uint64_t)selected_expert * gate_expert_bytes);
+    test_block_q8_K *down_w =
+        (test_block_q8_K *)((char *)model_raw + down_offset + (uint64_t)selected_expert * down_expert_bytes);
     for (uint32_t row = 0; row < expert_mid_dim; row++) {
-        test_fill_q8_k_block(&gate_w[row], 0.0035f, 3u + row * 5u);
-        test_fill_q8_k_block(&up_w[row], 0.0025f, 11u + row * 7u);
+        for (uint32_t ib = 0; ib < gate_row_blocks; ib++) {
+            test_fill_q8_k_block(&gate_w[(uint64_t)row * gate_row_blocks + ib],
+                                 0.0035f, 3u + row * 5u + ib * 101u);
+            test_fill_q8_k_block(&up_w[(uint64_t)row * gate_row_blocks + ib],
+                                 0.0025f, 11u + row * 7u + ib * 103u);
+        }
     }
     for (uint32_t row = 0; row < out_dim; row++) {
-        test_fill_q8_k_block(&down_w[row], 0.0040f, 19u + row * 13u);
+        for (uint32_t ib = 0; ib < down_row_blocks; ib++) {
+            test_fill_q8_k_block(&down_w[(uint64_t)row * down_row_blocks + ib],
+                                 0.0040f, 19u + row * 13u + ib * 107u);
+        }
     }
 
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)expert_in_dim * sizeof(float));
@@ -250,15 +267,18 @@ static void test_metal_q8_k_routed_moe_one_tensor(void) {
         x_host[i] = (float)((int)((i * 5u + 3u) % 29u) - 14) / 21.0f;
     }
     for (uint32_t row = 0; row < expert_mid_dim; row++) {
-        float g = test_q8_k_dot_f32(&gate_w[row], x_host);
-        float u = test_q8_k_dot_f32(&up_w[row], x_host);
+        float g = test_q8_k_dot_f32(&gate_w[(uint64_t)row * gate_row_blocks],
+                                    x_host, expert_in_dim);
+        float u = test_q8_k_dot_f32(&up_w[(uint64_t)row * gate_row_blocks],
+                                    x_host, expert_in_dim);
         mid_ref[row] = (g / (1.0f + expf(-g))) * u;
     }
     for (uint32_t row = 0; row < out_dim; row++) {
-        out_ref[row] = test_q8_k_dot_f32(&down_w[row], mid_ref);
+        out_ref[row] = test_q8_k_dot_f32(&down_w[(uint64_t)row * down_row_blocks],
+                                         mid_ref, expert_mid_dim);
     }
 
-    const int32_t selected_host[1] = {0};
+    const int32_t selected_host[1] = {(int32_t)selected_expert};
     const float weights_host[1] = {1.0f};
     TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host,
                                      (uint64_t)expert_in_dim * sizeof(float)) != 0);
