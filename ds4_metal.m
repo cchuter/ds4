@@ -11660,6 +11660,14 @@ static NSUInteger ds4_gpu_routed_mv_smem(uint32_t type) {
     return 0;
 }
 
+static NSUInteger ds4_gpu_routed_mv_nsg(uint32_t type) {
+    return type == DS4_METAL_TENSOR_Q8_0 ? 4u : 2u;
+}
+
+static bool ds4_gpu_routed_mv_rows_per_group_is_nr0(uint32_t type) {
+    return type == DS4_METAL_TENSOR_Q8_0;
+}
+
 static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_Q8_0:
@@ -12926,6 +12934,10 @@ int ds4_gpu_routed_moe_one_tensor(
 
         const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(gate_type);
         const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
+        const NSUInteger gate_nsg = ds4_gpu_routed_mv_nsg(gate_type);
+        const NSUInteger down_nsg = ds4_gpu_routed_mv_nsg(down_type);
+        const bool gate_rows_per_group_is_nr0 = ds4_gpu_routed_mv_rows_per_group_is_nr0(gate_type);
+        const bool down_rows_per_group_is_nr0 = ds4_gpu_routed_mv_rows_per_group_is_nr0(down_type);
         int ok = 1;
         const bool write_clamped_moe =
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL;
@@ -13029,8 +13041,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                             selectedbuf,
                                             ds4_gpu_tensor_offset(selected),
                                             gate_smem,
-                                            2,
-                                            false) &&
+                                            gate_nsg,
+                                            gate_rows_per_group_is_nr0) &&
                  ds4_gpu_encode_mul_mv_id(cb,
                                             gate_mv_pipeline,
                                             &gate_args,
@@ -13043,8 +13055,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                             selectedbuf,
                                             ds4_gpu_tensor_offset(selected),
                                             gate_smem,
-                                            2,
-                                            false);
+                                            gate_nsg,
+                                            gate_rows_per_group_is_nr0);
         }
         if (ok && !fuse_pair_swiglu) {
             ok = ds4_gpu_encode_moe_swiglu_weight(cb,
@@ -13103,8 +13115,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                                  selectedbuf,
                                                  ds4_gpu_tensor_offset(selected),
                                                  down_smem,
-                                                 2,
-                                                 false);
+                                                 down_nsg,
+                                                 down_rows_per_group_is_nr0);
         }
         if (ok && n_expert > 1 && !direct_down_sum) {
             ok = ds4_gpu_encode_moe_sum_experts(cb,
@@ -13319,6 +13331,10 @@ int ds4_gpu_routed_moe_batch_tensor(
 
         const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(gate_type);
         const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
+        const NSUInteger gate_nsg = ds4_gpu_routed_mv_nsg(gate_type);
+        const NSUInteger down_nsg = ds4_gpu_routed_mv_nsg(down_type);
+        const bool gate_rows_per_group_is_nr0 = ds4_gpu_routed_mv_rows_per_group_is_nr0(gate_type);
+        const bool down_rows_per_group_is_nr0 = ds4_gpu_routed_mv_rows_per_group_is_nr0(down_type);
         id<MTLComputePipelineState> down_sum6_pipeline = nil;
         if (down_type == DS4_METAL_TENSOR_Q2_K) {
             down_sum6_pipeline = g_moe_mul_mv_id_q2_k_sum6_pipeline;
@@ -13405,8 +13421,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                   selectedbuf,
                                                   ds4_gpu_tensor_offset(selected),
                                                   gate_smem,
-                                                  2,
-                                                  false) &&
+                                                  gate_nsg,
+                                                  gate_rows_per_group_is_nr0) &&
                  ds4_gpu_encode_mul_mv_id(cb,
                                                   gate_mv_pipeline,
                                                   &gate_args,
@@ -13419,8 +13435,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                   selectedbuf,
                                                   ds4_gpu_tensor_offset(selected),
                                                   gate_smem,
-                                                  2,
-                                                  false);
+                                                  gate_nsg,
+                                                  gate_rows_per_group_is_nr0);
         }
         DS4_METAL_PROFILE_MOE_STAGE("gate_up");
         const bool use_fused_activation = !g_quality_mode;
@@ -13560,8 +13576,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                      selectedbuf,
                                                      ds4_gpu_tensor_offset(selected),
                                                      down_smem,
-                                                     2,
-                                                     false);
+                                                     down_nsg,
+                                                     down_rows_per_group_is_nr0);
             }
         }
         DS4_METAL_PROFILE_MOE_STAGE("down");
