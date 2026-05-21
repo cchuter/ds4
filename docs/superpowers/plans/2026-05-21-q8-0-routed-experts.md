@@ -810,7 +810,7 @@ Expected: size is roughly `282G` to `303G` depending on decimal/binary display.
 **Files:**
 - Modify: `README.md`
 
-- [ ] **Step 1: Run CPU smoke inference**
+- [x] **Step 1: Run CPU smoke inference**
 
 Run:
 
@@ -825,7 +825,11 @@ make cpu
 
 Expected: the model opens, reports routed quant bits as 8 in any cache/log path that prints it, and generates text containing `Paris` or a plausible continuation. If macOS CPU virtual-memory instability appears, record the exact failure and continue to Metal; do not claim CPU runtime success without an actual completed prompt.
 
-- [ ] **Step 2: Run Metal smoke inference**
+Completed with `DS4_LOCK_FILE=/tmp/ds4-q8-smoke.lock` to avoid the user's
+already-running `ds4-server` default lock. Output contained
+`The capital of France is Paris.` and reported generation at `3.94 t/s`.
+
+- [x] **Step 2: Run Metal smoke inference**
 
 Run:
 
@@ -841,7 +845,11 @@ make ds4
 
 Expected: the model opens and generates text containing `Paris` or a plausible continuation.
 
-- [ ] **Step 3: Run project tests**
+Completed with `DS4_LOCK_FILE=/tmp/ds4-q8-smoke-metal.lock` to avoid the
+user's already-running `ds4-server` default lock. Output contained
+`The capital of France is Paris.` and reported generation at `14.88 t/s`.
+
+- [x] **Step 3: Run project tests**
 
 Run:
 
@@ -857,7 +865,16 @@ Expected: `ds4_test` passes. If model-backed tests are too slow with the Q8_0 sy
 
 Record which test command completed.
 
-- [ ] **Step 4: Document the experimental model**
+Completed targeted non-model coverage:
+
+```sh
+make ds4_test
+./ds4_test --server --metal-kernels
+```
+
+Output ended with `ds4 tests: ok`.
+
+- [x] **Step 4: Document the experimental model**
 
 Add this note under the README model download section:
 
@@ -881,7 +898,7 @@ type `q8_0` for routed experts and is intended as the first runnable
 high-precision routed-expert checkpoint before implementing `Q8_K`.
 ```
 
-- [ ] **Step 5: Final verification**
+- [x] **Step 5: Final verification**
 
 Run:
 
@@ -891,6 +908,17 @@ git status --short
 ```
 
 Expected: no whitespace errors. Untracked/generated GGUF files may appear and must not be committed.
+
+Completed:
+
+```sh
+git diff --check
+make ds4_test
+./ds4_test --server --metal-kernels
+```
+
+`git diff --check` produced no output, `make ds4_test` was up to date, and
+`./ds4_test --server --metal-kernels` ended with `ds4 tests: ok`.
 
 - [ ] **Step 6: Commit code and docs**
 
