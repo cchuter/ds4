@@ -11651,6 +11651,9 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
 }
 
 static NSUInteger ds4_gpu_routed_mv_smem(uint32_t type) {
+    if (type == DS4_METAL_TENSOR_Q8_0) {
+        return 32u * 2u * sizeof(float);
+    }
     if (type == DS4_METAL_TENSOR_IQ2_XXS) {
         return 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t);
     }
