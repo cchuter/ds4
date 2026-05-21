@@ -43,7 +43,7 @@ rg -n "tensor_is_routed_expert_type|routed_expert_block_bytes|ds4_engine_routed_
 
 Expected: the routed helper accepts `IQ2_XXS`, `Q2_K`, and `Q4_K`, and `ds4_engine_routed_quant_bits()` returns `4` for Q4 and `2` for everything else.
 
-- [ ] **Step 2: Admit Q8_0 routed expert tensors**
+- [ ] **Step 2: Admit Q8_0 routed expert tensors and compute type-aware row bytes**
 
 In `ds4.c`, change the helpers to include `DS4_TENSOR_Q8_0`:
 
@@ -67,7 +67,18 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
 }
 ```
 
-Keep `routed_expert_row_bytes()` unchanged. `Q8_0` has 32 elements per block and the model dimensions are divisible by 256, so the existing row-byte calculation through `tensor_type()` also remains valid for tensor offsets.
+Update `routed_expert_row_bytes()` so it uses the GGUF tensor type metadata for
+the block element count. `Q8_0` has 32 elements per block, while the K-family
+expert types have 256 elements per block:
+
+```c
+static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
+    const gguf_type_info *info = tensor_type(t->type);
+    if (!info || info->block_elems == 0) ds4_die("unsupported routed expert tensor type");
+    if ((t->dim[0] % info->block_elems) != 0) ds4_die("routed expert row is not quant block aligned");
+    return (t->dim[0] / info->block_elems) * routed_expert_block_bytes(t->type);
+}
+```
 
 - [ ] **Step 3: Report 8-bit routed expert metadata**
 
