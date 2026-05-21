@@ -150,6 +150,162 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(weights_raw);
 }
 
+enum { TEST_QK_K = 256 };
+
+typedef struct {
+    float   d;
+    int8_t  qs[TEST_QK_K];
+    int16_t bsums[TEST_QK_K / 16];
+} test_block_q8_K;
+
+static void test_fill_q8_k_block(test_block_q8_K *b, float d, uint32_t seed) {
+    b->d = d;
+    for (uint32_t i = 0; i < TEST_QK_K; i++) {
+        b->qs[i] = (int8_t)((int)((seed + i * 7u) % 17u) - 8);
+    }
+    for (uint32_t g = 0; g < TEST_QK_K / 16; g++) {
+        int sum = 0;
+        for (uint32_t i = 0; i < 16; i++) {
+            sum += b->qs[g * 16u + i];
+        }
+        b->bsums[g] = (int16_t)sum;
+    }
+}
+
+static float test_q8_k_dot_f32(const test_block_q8_K *b, const float *x) {
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < TEST_QK_K; i++) {
+        sum += ((float)b->qs[i] * b->d) * x[i];
+    }
+    return sum;
+}
+
+static void test_metal_q8_k_routed_moe_one_tensor(void) {
+    const uint32_t q8_k_type = 15;
+    const uint32_t expert_in_dim = 256;
+    const uint32_t expert_mid_dim = 256;
+    const uint32_t out_dim = 8;
+    const uint32_t n_expert = 1;
+    const uint64_t q8_k_block = sizeof(test_block_q8_K);
+    const uint64_t gate_row_bytes = q8_k_block;
+    const uint64_t gate_expert_bytes = (uint64_t)expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = q8_k_block;
+    const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = 256ull * gate_expert_bytes;
+    const uint64_t down_offset = up_offset + 256ull * gate_expert_bytes;
+    const uint64_t model_bytes = down_offset + 256ull * down_expert_bytes;
+    const uint64_t model_alloc = test_round_up_u64(model_bytes, (uint64_t)getpagesize());
+
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(&model_raw, (size_t)getpagesize(), (size_t)model_alloc) == 0);
+    if (!model_raw) return;
+    memset(model_raw, 0, (size_t)model_alloc);
+
+    test_block_q8_K *gate_w = (test_block_q8_K *)((char *)model_raw + gate_offset);
+    test_block_q8_K *up_w = (test_block_q8_K *)((char *)model_raw + up_offset);
+    test_block_q8_K *down_w = (test_block_q8_K *)((char *)model_raw + down_offset);
+    for (uint32_t row = 0; row < expert_mid_dim; row++) {
+        test_fill_q8_k_block(&gate_w[row], 0.0035f, 3u + row * 5u);
+        test_fill_q8_k_block(&up_w[row], 0.0025f, 11u + row * 7u);
+    }
+    for (uint32_t row = 0; row < out_dim; row++) {
+        test_fill_q8_k_block(&down_w[row], 0.0040f, 19u + row * 13u);
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)expert_in_dim * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc((uint64_t)n_expert * expert_mid_dim * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc((uint64_t)n_expert * expert_mid_dim * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)n_expert * expert_mid_dim * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)n_expert * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)n_expert * sizeof(float));
+    TEST_ASSERT(x != NULL && gate != NULL && up != NULL && mid != NULL &&
+                out != NULL && selected != NULL && weights != NULL);
+
+    float *x_host = malloc((size_t)expert_in_dim * sizeof(float));
+    float *mid_ref = malloc((size_t)expert_mid_dim * sizeof(float));
+    float *out_ref = malloc((size_t)out_dim * sizeof(float));
+    float *out_host = malloc((size_t)out_dim * sizeof(float));
+    TEST_ASSERT(x_host != NULL && mid_ref != NULL && out_ref != NULL && out_host != NULL);
+
+    if (!x || !gate || !up || !mid || !out || !selected || !weights ||
+        !x_host || !mid_ref || !out_ref || !out_host) {
+        free(x_host);
+        free(mid_ref);
+        free(out_ref);
+        free(out_host);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(gate);
+        ds4_gpu_tensor_free(up);
+        ds4_gpu_tensor_free(mid);
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(selected);
+        ds4_gpu_tensor_free(weights);
+        free(model_raw);
+        return;
+    }
+
+    for (uint32_t i = 0; i < expert_in_dim; i++) {
+        x_host[i] = (float)((int)((i * 5u + 3u) % 29u) - 14) / 21.0f;
+    }
+    for (uint32_t row = 0; row < expert_mid_dim; row++) {
+        float g = test_q8_k_dot_f32(&gate_w[row], x_host);
+        float u = test_q8_k_dot_f32(&up_w[row], x_host);
+        mid_ref[row] = (g / (1.0f + expf(-g))) * u;
+    }
+    for (uint32_t row = 0; row < out_dim; row++) {
+        out_ref[row] = test_q8_k_dot_f32(&down_w[row], mid_ref);
+    }
+
+    const int32_t selected_host[1] = {0};
+    const float weights_host[1] = {1.0f};
+    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host,
+                                     (uint64_t)expert_in_dim * sizeof(float)) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(selected, 0, selected_host, sizeof(selected_host)) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(weights, 0, weights_host, sizeof(weights_host)) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_alloc) != 0);
+    ds4_gpu_set_quality(false);
+    TEST_ASSERT(ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, NULL,
+                                              model_raw, model_alloc,
+                                              gate_offset, up_offset, down_offset,
+                                              q8_k_type, q8_k_type,
+                                              gate_expert_bytes, gate_row_bytes,
+                                              down_expert_bytes, down_row_bytes,
+                                              expert_in_dim, expert_mid_dim, out_dim,
+                                              selected, weights, n_expert, 0.0f, x) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host,
+                                    (uint64_t)out_dim * sizeof(float)) != 0);
+
+    float max_abs = 0.0f;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        float err = fabsf(out_host[row] - out_ref[row]);
+        if (err > max_abs) max_abs = err;
+    }
+    if (max_abs >= 0.01f) {
+        fprintf(stderr, "ds4-test: q8_k routed MoE max_abs=%g\n", max_abs);
+    }
+    TEST_ASSERT(max_abs < 0.01f);
+
+    free(x_host);
+    free(mid_ref);
+    free(out_ref);
+    free(out_host);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    free(model_raw);
+}
+
+static void test_metal_kernel_regressions(void) {
+    test_metal_f16_matvec_fast_nr0_4();
+    test_metal_q8_k_routed_moe_one_tensor();
+}
+
 static char *test_read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
@@ -666,7 +822,7 @@ static const ds4_test_entry test_entries[] = {
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
-    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
+    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_regressions},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
