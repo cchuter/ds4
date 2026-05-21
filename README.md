@@ -128,6 +128,24 @@ If you want to regenerate GGUF files or collect a new imatrix, see
 model-building work and can take a long time on the full DeepSeek V4 Flash
 weights.
 
+### Local Q8_0 Routed Expert Experiment
+
+The `feat/q8-routed-experts` branch can build a local experimental
+`Q8_0Experts` GGUF from the official DeepSeek V4 Flash safetensors:
+
+```sh
+./gguf-tools/deepseek4-quantize \
+  --hf /Users/cchuter/models/DeepSeek-V4-Flash \
+  --template gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
+  --out gguf/DeepSeek-V4-Flash-Q8_0Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --experts q8_0 \
+  --threads 8
+```
+
+This is distinct from true `Q8_K` expert weights. `Q8_0Experts` uses GGUF
+type `q8_0` for routed experts and is intended as the first runnable
+high-precision routed-expert checkpoint before implementing `Q8_K`.
+
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
 enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
