@@ -2293,13 +2293,15 @@ static void tensor_expect_plain_layout(
 }
 
 static bool tensor_is_routed_expert_type(uint32_t type) {
-    return type == DS4_TENSOR_IQ2_XXS ||
+    return type == DS4_TENSOR_Q8_0 ||
+           type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
+    case DS4_TENSOR_Q8_0:    return 34;
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
@@ -15981,7 +15983,15 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
     const ds4_tensor *gate = e->weights.layer[0].ffn_gate_exps;
     if (!gate) return 0;
-    return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+    switch (gate->type) {
+    case DS4_TENSOR_Q8_0: return 8;
+    case DS4_TENSOR_Q4_K: return 4;
+    case DS4_TENSOR_Q2_K:
+    case DS4_TENSOR_IQ2_XXS:
+        return 2;
+    default:
+        return 0;
+    }
 }
 
 bool ds4_engine_has_mtp(ds4_engine *e) {
