@@ -206,6 +206,10 @@ typedef struct {
     float *routed_mid_all;
     block_q8_K *routed_xq;
     block_q8_K *routed_midq;
+    int8_t *routed_q8_xq;
+    float *routed_q8_xscale;
+    int8_t *routed_q8_midq;
+    float *routed_q8_midscale;
 
     int8_t *q8_xq;
     float *q8_xscale;
@@ -5768,7 +5772,11 @@ static void layer_routed_moe_one_prealloc(
         float               clamp,
         float              * mid_all,
         block_q8_K         * xq,
-        block_q8_K         * midq) {
+        block_q8_K         * midq,
+        int8_t             * q8_xq,
+        float              * q8_xscale,
+        int8_t             * q8_midq,
+        float              * q8_midscale) {
     int selected[DS4_N_EXPERT_USED];
     float expert_weight[DS4_N_EXPERT_USED];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
@@ -5798,36 +5806,30 @@ static void layer_routed_moe_one_prealloc(
     }
 
     if (routed_q8_0) {
-        const uint64_t x_blocks = expert_in_dim / 32u;
-        int8_t *xq8 = xmalloc((size_t)x_blocks * 32u);
-        float *xscale8 = xmalloc((size_t)x_blocks * sizeof(float));
-        quantize_q8_0_activation(x, xq8, xscale8, expert_in_dim);
+        if (!q8_xq || !q8_xscale || !q8_midq || !q8_midscale) {
+            ds4_die("missing Q8_0 routed decode scratch");
+        }
+        quantize_q8_0_activation(x, q8_xq, q8_xscale, expert_in_dim);
 
         matvec_q8_0_experts_mid_prequant(mid_all, model,
                                          layer->ffn_gate_exps,
                                          layer->ffn_up_exps,
-                                         xq8,
-                                         xscale8,
+                                         q8_xq,
+                                         q8_xscale,
                                          selected,
                                          expert_weight,
                                          DS4_N_EXPERT_USED,
                                          clamp);
 
         const uint64_t mid_blocks = down_in_dim / 32u;
-        int8_t *midq8 = xmalloc((size_t)DS4_N_EXPERT_USED * mid_blocks * 32u);
-        float *midscale8 = xmalloc((size_t)DS4_N_EXPERT_USED * mid_blocks * sizeof(float));
         for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
             quantize_q8_0_activation(mid_all + (uint64_t)i * down_in_dim,
-                                     midq8 + (uint64_t)i * mid_blocks * 32u,
-                                     midscale8 + (uint64_t)i * mid_blocks,
+                                     q8_midq + (uint64_t)i * mid_blocks * 32u,
+                                     q8_midscale + (uint64_t)i * mid_blocks,
                                      down_in_dim);
         }
         matvec_q8_0_experts_accum_prequant(out, model, layer->ffn_down_exps,
-                                           midq8, midscale8, selected, DS4_N_EXPERT_USED);
-        free(midscale8);
-        free(midq8);
-        free(xscale8);
-        free(xq8);
+                                           q8_midq, q8_midscale, selected, DS4_N_EXPERT_USED);
         (void)il;
         return;
     }
@@ -6258,7 +6260,11 @@ static void layer_ffn_one_decode_scratch(
                                   DS4_SWIGLU_CLAMP_EXP,
                                   scratch->routed_mid_all,
                                   scratch->routed_xq,
-                                  scratch->routed_midq);
+                                  scratch->routed_midq,
+                                  scratch->routed_q8_xq,
+                                  scratch->routed_q8_xscale,
+                                  scratch->routed_q8_midq,
+                                  scratch->routed_q8_midscale);
     if (profile) t_routed = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
@@ -6370,13 +6376,20 @@ typedef struct {
     uint64_t expert_in_dim;
     uint64_t down_in_dim;
     uint32_t il;
+    bool routed_q8_0;
 } routed_moe_tokens_ctx;
 
 static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
     routed_moe_tokens_ctx *ctx = vctx;
+    const uint64_t q8_x_blocks = ctx->expert_in_dim / 32u;
+    const uint64_t q8_mid_blocks = ctx->down_in_dim / 32u;
     float *routed_mid = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
-    block_q8_K *routed_xq = xmalloc((size_t)(ctx->expert_in_dim / QK_K) * sizeof(routed_xq[0]));
-    block_q8_K *routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (ctx->down_in_dim / QK_K) * sizeof(routed_midq[0]));
+    block_q8_K *routed_xq = ctx->routed_q8_0 ? NULL : xmalloc((size_t)(ctx->expert_in_dim / QK_K) * sizeof(routed_xq[0]));
+    block_q8_K *routed_midq = ctx->routed_q8_0 ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (ctx->down_in_dim / QK_K) * sizeof(routed_midq[0]));
+    int8_t *routed_q8_xq = ctx->routed_q8_0 ? xmalloc((size_t)q8_x_blocks * 32u) : NULL;
+    float *routed_q8_xscale = ctx->routed_q8_0 ? xmalloc((size_t)q8_x_blocks * sizeof(routed_q8_xscale[0])) : NULL;
+    int8_t *routed_q8_midq = ctx->routed_q8_0 ? xmalloc((size_t)DS4_N_EXPERT_USED * q8_mid_blocks * 32u) : NULL;
+    float *routed_q8_midscale = ctx->routed_q8_0 ? xmalloc((size_t)DS4_N_EXPERT_USED * q8_mid_blocks * sizeof(routed_q8_midscale[0])) : NULL;
 
     for (uint64_t t = t0; t < t1; t++) {
         layer_routed_moe_one_prealloc(ctx->moe + t * DS4_N_EMBD,
@@ -6388,9 +6401,17 @@ static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
                                       DS4_SWIGLU_CLAMP_EXP,
                                       routed_mid,
                                       routed_xq,
-                                      routed_midq);
+                                      routed_midq,
+                                      routed_q8_xq,
+                                      routed_q8_xscale,
+                                      routed_q8_midq,
+                                      routed_q8_midscale);
     }
 
+    free(routed_q8_midscale);
+    free(routed_q8_midq);
+    free(routed_q8_xscale);
+    free(routed_q8_xq);
     free(routed_midq);
     free(routed_xq);
     free(routed_mid);
@@ -6413,6 +6434,10 @@ static void layer_routed_moe_tokens_parallel(
         .expert_in_dim = layer->ffn_gate_exps->dim[0],
         .down_in_dim = layer->ffn_down_exps->dim[0],
         .il = il,
+        .routed_q8_0 =
+            layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 &&
+            layer->ffn_up_exps->type == DS4_TENSOR_Q8_0 &&
+            layer->ffn_down_exps->type == DS4_TENSOR_Q8_0,
     };
     ds4_parallel_for_min_rows(n_tok, routed_moe_tokens_worker, &ctx, 1);
 }
@@ -6444,12 +6469,22 @@ static void layer_ffn_shared_batch(
     float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const bool routed_q8_0 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q8_0;
+    const uint64_t routed_q8_x_blocks = expert_in_dim / 32u;
+    const uint64_t routed_q8_mid_blocks = down_in_dim / 32u;
     const bool routed_token_parallel =
         getenv("DS4_ROUTED_TOKEN_PARALLEL") != NULL ||
         (getenv("DS4_NO_ROUTED_TOKEN_PARALLEL") == NULL && n_tok >= 64);
     float *routed_mid = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
-    block_q8_K *routed_xq = routed_token_parallel ? NULL : xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
-    block_q8_K *routed_midq = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
+    block_q8_K *routed_xq = (routed_token_parallel || routed_q8_0) ? NULL : xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
+    block_q8_K *routed_midq = (routed_token_parallel || routed_q8_0) ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
+    int8_t *routed_q8_xq = (!routed_token_parallel && routed_q8_0) ? xmalloc((size_t)routed_q8_x_blocks * 32u) : NULL;
+    float *routed_q8_xscale = (!routed_token_parallel && routed_q8_0) ? xmalloc((size_t)routed_q8_x_blocks * sizeof(routed_q8_xscale[0])) : NULL;
+    int8_t *routed_q8_midq = (!routed_token_parallel && routed_q8_0) ? xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * 32u) : NULL;
+    float *routed_q8_midscale = (!routed_token_parallel && routed_q8_0) ? xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * sizeof(routed_q8_midscale[0])) : NULL;
 
     double t0 = profile ? now_sec() : 0.0;
     hc_pre_norm_batch(model,
@@ -6480,7 +6515,11 @@ static void layer_ffn_shared_batch(
                                           DS4_SWIGLU_CLAMP_EXP,
                                           routed_mid,
                                           routed_xq,
-                                          routed_midq);
+                                          routed_midq,
+                                          routed_q8_xq,
+                                          routed_q8_xscale,
+                                          routed_q8_midq,
+                                          routed_q8_midscale);
         }
     }
     if (profile) t_routed = now_sec() - t0;
@@ -6526,6 +6565,10 @@ static void layer_ffn_shared_batch(
 
     free(comb);
     free(post);
+    free(routed_q8_midscale);
+    free(routed_q8_midq);
+    free(routed_q8_xscale);
+    free(routed_q8_xq);
     free(routed_midq);
     free(routed_xq);
     free(routed_mid);
@@ -6665,6 +6708,11 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t q8_cap = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t q8_blocks = (q8_cap + 31u) / 32u;
+    if ((DS4_N_EMBD % 32u) != 0 || (DS4_N_FF_EXP % 32u) != 0) {
+        ds4_die("Q8_0 routed decode scratch dimensions are not QK8_0 aligned");
+    }
+    const uint64_t routed_q8_x_blocks = DS4_N_EMBD / 32u;
+    const uint64_t routed_q8_mid_blocks = DS4_N_FF_EXP / 32u;
 
     /*
      * The CPU decode path used to malloc/free dozens of medium-sized buffers
@@ -6718,6 +6766,10 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->routed_mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
     scratch->routed_xq = xmalloc((size_t)(DS4_N_EMBD / QK_K) * sizeof(block_q8_K));
     scratch->routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (DS4_N_FF_EXP / QK_K) * sizeof(block_q8_K));
+    scratch->routed_q8_xq = xmalloc((size_t)routed_q8_x_blocks * 32u);
+    scratch->routed_q8_xscale = xmalloc((size_t)routed_q8_x_blocks * sizeof(float));
+    scratch->routed_q8_midq = xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * 32u);
+    scratch->routed_q8_midscale = xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * sizeof(float));
 
     scratch->q8_xq = xmalloc((size_t)q8_blocks * 32u);
     scratch->q8_xscale = xmalloc((size_t)q8_blocks * sizeof(float));
@@ -6740,6 +6792,10 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->hc_flat);
     free(scratch->q8_xscale);
     free(scratch->q8_xq);
+    free(scratch->routed_q8_midscale);
+    free(scratch->routed_q8_midq);
+    free(scratch->routed_q8_xscale);
+    free(scratch->routed_q8_xq);
     free(scratch->routed_midq);
     free(scratch->routed_xq);
     free(scratch->routed_mid_all);
@@ -10667,6 +10723,12 @@ static void metal_graph_trace_layer_stages(
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const bool routed_q8_0 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q8_0;
+    const uint64_t routed_q8_x_blocks = expert_in_dim / 32u;
+    const uint64_t routed_q8_mid_blocks = down_in_dim / 32u;
 
     float *cpu_attn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *cpu_attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
@@ -10697,6 +10759,10 @@ static void metal_graph_trace_layer_stages(
     float *routed_mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * down_in_dim * sizeof(float));
     block_q8_K *routed_xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(block_q8_K));
     block_q8_K *routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(block_q8_K));
+    int8_t *routed_q8_xq = routed_q8_0 ? xmalloc((size_t)routed_q8_x_blocks * 32u) : NULL;
+    float *routed_q8_xscale = routed_q8_0 ? xmalloc((size_t)routed_q8_x_blocks * sizeof(routed_q8_xscale[0])) : NULL;
+    int8_t *routed_q8_midq = routed_q8_0 ? xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * 32u) : NULL;
+    float *routed_q8_midscale = routed_q8_0 ? xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * sizeof(routed_q8_midscale[0])) : NULL;
 
     hc_pre_from_state_one(model,
                           layer->hc_attn_fn,
@@ -10739,7 +10805,11 @@ static void metal_graph_trace_layer_stages(
                                   DS4_SWIGLU_CLAMP_EXP,
                                   routed_mid_all,
                                   routed_xq,
-                                  routed_midq);
+                                  routed_midq,
+                                  routed_q8_xq,
+                                  routed_q8_xscale,
+                                  routed_q8_midq,
+                                  routed_q8_midscale);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
@@ -10843,6 +10913,10 @@ static void metal_graph_trace_layer_stages(
     free(gpu_q);
     free(gpu_attn_norm);
     free(gpu_attn_cur);
+    free(routed_q8_midscale);
+    free(routed_q8_midq);
+    free(routed_q8_xscale);
+    free(routed_q8_xq);
     free(routed_midq);
     free(routed_xq);
     free(routed_mid_all);
@@ -10884,6 +10958,12 @@ static int metal_graph_decode_test(
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t vocab_dim = weights->output->dim[1];
+    const bool routed_q8_0 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q8_0;
+    const uint64_t routed_q8_x_blocks = expert_in_dim / 32u;
+    const uint64_t routed_q8_mid_blocks = down_in_dim / 32u;
 
     float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *cpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
@@ -10926,6 +11006,10 @@ static int metal_graph_decode_test(
     float *routed_mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * down_in_dim * sizeof(float));
     block_q8_K *routed_xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(block_q8_K));
     block_q8_K *routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(block_q8_K));
+    int8_t *routed_q8_xq = routed_q8_0 ? xmalloc((size_t)routed_q8_x_blocks * 32u) : NULL;
+    float *routed_q8_xscale = routed_q8_0 ? xmalloc((size_t)routed_q8_x_blocks * sizeof(routed_q8_xscale[0])) : NULL;
+    int8_t *routed_q8_midq = routed_q8_0 ? xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * 32u) : NULL;
+    float *routed_q8_midscale = routed_q8_0 ? xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * sizeof(routed_q8_midscale[0])) : NULL;
     int selected[DS4_N_EXPERT_USED];
     float expert_weight[DS4_N_EXPERT_USED];
 
@@ -10963,7 +11047,11 @@ static int metal_graph_decode_test(
                                   DS4_SWIGLU_CLAMP_EXP,
                                   routed_mid_all,
                                   routed_xq,
-                                  routed_midq);
+                                  routed_midq,
+                                  routed_q8_xq,
+                                  routed_q8_xscale,
+                                  routed_q8_midq,
+                                  routed_q8_midscale);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
@@ -11066,6 +11154,10 @@ static int metal_graph_decode_test(
     }
 
     metal_graph_free(&g);
+    free(routed_q8_midscale);
+    free(routed_q8_midq);
+    free(routed_q8_xscale);
+    free(routed_q8_xq);
     free(routed_midq);
     free(routed_xq);
     free(routed_mid_all);
