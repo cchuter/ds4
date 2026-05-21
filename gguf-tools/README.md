@@ -8,7 +8,7 @@ The important pieces are:
 - `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
 - `quants.[ch]`: the deliberately small local quantization implementation used
   by the quantizer.  It implements the DS4 output formats we actually ship:
-  `q8_0`, `q4_K`, `q2_K`, and `iq2_xxs`.
+  `q8_0`, `q8_K`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
@@ -90,7 +90,7 @@ True Q8_K routed experts:
 
 ```sh
 gguf-tools/deepseek4-quantize \
-  --hf /Users/cchuter/models/DeepSeek-V4-Flash \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
   --template gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
   --out gguf/DeepSeek-V4-Flash-Q8KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --experts q8_K \
