@@ -6181,6 +6181,10 @@ static void layer_routed_moe_one_prealloc(
         return;
     }
 
+    if (routed_q8_k && (!mid_all || !xq || !midq)) {
+        ds4_die("missing Q8_K routed decode scratch");
+    }
+
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
     if (routed_q8_k) {
@@ -6842,7 +6846,6 @@ typedef struct {
     uint64_t down_in_dim;
     uint32_t il;
     bool routed_q8_0;
-    bool routed_q8_k;
 } routed_moe_tokens_ctx;
 
 static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
@@ -6891,24 +6894,31 @@ static void layer_routed_moe_tokens_parallel(
         const int         * token_ids,
         uint32_t            n_tok,
         uint32_t            il) {
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const bool routed_q8_k =
         layer->ffn_gate_exps->type == DS4_TENSOR_Q8_K &&
         layer->ffn_up_exps->type == DS4_TENSOR_Q8_K &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q8_K;
+    if (routed_q8_k) {
+        if (expert_in_dim % QK_K != 0) ds4_die("Q8_K expert input is not QK_K aligned");
+        if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) {
+            ds4_die("Q8_K expert input has an unexpected layout");
+        }
+    }
     routed_moe_tokens_ctx ctx = {
         .moe = moe,
         .model = model,
         .layer = layer,
         .norm = norm,
         .token_ids = token_ids,
-        .expert_in_dim = layer->ffn_gate_exps->dim[0],
-        .down_in_dim = layer->ffn_down_exps->dim[0],
+        .expert_in_dim = expert_in_dim,
+        .down_in_dim = down_in_dim,
         .il = il,
         .routed_q8_0 =
             layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 &&
             layer->ffn_up_exps->type == DS4_TENSOR_Q8_0 &&
             layer->ffn_down_exps->type == DS4_TENSOR_Q8_0,
-        .routed_q8_k = routed_q8_k,
     };
     ds4_parallel_for_min_rows(n_tok, routed_moe_tokens_worker, &ctx, 1);
 }
