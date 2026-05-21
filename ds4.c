@@ -895,6 +895,7 @@ enum {
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
+    DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
 };
@@ -1890,6 +1891,74 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
 #endif
 }
 
+static void ds4_vec_dot_q8_K_q8_K(int n, float *s, const block_q8_K *x, const block_q8_K *y) {
+    const int nb = n / QK_K;
+    float sum = 0.0f;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    for (int i = 0; i < nb; i++) {
+        int32x4_t isum = vdupq_n_s32(0);
+        for (int j = 0; j < QK_K; j += 16) {
+            const int8x16_t xv = vld1q_s8(x[i].qs + j);
+            const int8x16_t yv = vld1q_s8(y[i].qs + j);
+            isum = vdotq_s32(isum, xv, yv);
+        }
+        sum += x[i].d * y[i].d * (float)vaddvq_s32(isum);
+    }
+#else
+    for (int i = 0; i < nb; i++) {
+        int isum = 0;
+        for (int j = 0; j < QK_K; j++) {
+            isum += (int)x[i].qs[j] * (int)y[i].qs[j];
+        }
+        sum += x[i].d * y[i].d * (float)isum;
+    }
+#endif
+
+    *s = sum;
+}
+
+static void ds4_vec_dot_q8_K_pair_q8_K(
+        int n,
+        float *s0,
+        float *s1,
+        const block_q8_K *x0,
+        const block_q8_K *x1,
+        const block_q8_K *y) {
+    const int nb = n / QK_K;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    for (int i = 0; i < nb; i++) {
+        int32x4_t isum0 = vdupq_n_s32(0);
+        int32x4_t isum1 = vdupq_n_s32(0);
+        for (int j = 0; j < QK_K; j += 16) {
+            const int8x16_t yv = vld1q_s8(y[i].qs + j);
+            isum0 = vdotq_s32(isum0, vld1q_s8(x0[i].qs + j), yv);
+            isum1 = vdotq_s32(isum1, vld1q_s8(x1[i].qs + j), yv);
+        }
+        sum0 += x0[i].d * y[i].d * (float)vaddvq_s32(isum0);
+        sum1 += x1[i].d * y[i].d * (float)vaddvq_s32(isum1);
+    }
+#else
+    for (int i = 0; i < nb; i++) {
+        int isum0 = 0;
+        int isum1 = 0;
+        for (int j = 0; j < QK_K; j++) {
+            const int yv = (int)y[i].qs[j];
+            isum0 += (int)x0[i].qs[j] * yv;
+            isum1 += (int)x1[i].qs[j] * yv;
+        }
+        sum0 += x0[i].d * y[i].d * (float)isum0;
+        sum1 += x1[i].d * y[i].d * (float)isum1;
+    }
+#endif
+
+    *s0 = sum0;
+    *s1 = sum1;
+}
+
 static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const block_q8_K *y) {
     const int nb = n / QK_K;
 
@@ -2300,7 +2369,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
-           type == DS4_TENSOR_Q4_K;
+           type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q8_K;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -2309,6 +2379,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
+    case DS4_TENSOR_Q8_K:    return sizeof(block_q8_K);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -3914,6 +3985,20 @@ typedef struct {
     int n_expert;
 } matvec_q8_0_mid_ctx;
 
+typedef struct {
+    float *mid;
+    const uint8_t *gate_base[DS4_N_EXPERT_USED];
+    const uint8_t *up_base[DS4_N_EXPERT_USED];
+    const block_q8_K *xq;
+    float expert_weight[DS4_N_EXPERT_USED];
+    float clamp;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t gate_row_bytes[DS4_N_EXPERT_USED];
+    uint64_t up_row_bytes[DS4_N_EXPERT_USED];
+    int n_expert;
+} matvec_q8_k_mid_ctx;
+
 static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
     matvec_iq2_xxs_mid_ctx *ctx = vctx;
 
@@ -3949,6 +4034,28 @@ static void matvec_q8_0_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
         const uint8_t *up_row = ctx->up_base[slot] + row * ctx->up_row_bytes[slot];
         dot_q8_0_row_pair(gate_row, up_row, ctx->xq, ctx->xscale,
                           ctx->in_dim, ctx->blocks, &gate, &up);
+
+        if (ctx->clamp > 1.0e-6f) {
+            if (gate > ctx->clamp) gate = ctx->clamp;
+            if (up > ctx->clamp) up = ctx->clamp;
+            if (up < -ctx->clamp) up = -ctx->clamp;
+        }
+        ctx->mid[idx] = silu(gate) * up * ctx->expert_weight[slot];
+    }
+}
+
+static void matvec_q8_k_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_q8_k_mid_ctx *ctx = vctx;
+
+    for (uint64_t idx = row0; idx < row1; idx++) {
+        const int slot = (int)(idx / ctx->out_dim);
+        const uint64_t row = idx - (uint64_t)slot * ctx->out_dim;
+        float gate = 0.0f;
+        float up = 0.0f;
+
+        const block_q8_K *gate_row = (const block_q8_K *)(ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot]);
+        const block_q8_K *up_row = (const block_q8_K *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
+        ds4_vec_dot_q8_K_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, ctx->xq);
 
         if (ctx->clamp > 1.0e-6f) {
             if (gate > ctx->clamp) gate = ctx->clamp;
@@ -4058,6 +4165,55 @@ static DS4_MAYBE_UNUSED void matvec_q8_0_experts_mid_prequant(
     ctx.out_dim = out_dim0;
     ctx.blocks = in_dim0 / 32u;
     ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q8_0_mid_worker, &ctx);
+}
+
+static DS4_MAYBE_UNUSED void matvec_q8_k_experts_mid_prequant(
+        float            *mid,
+        const ds4_model  *m,
+        const ds4_tensor *gate_w,
+        const ds4_tensor *up_w,
+        const block_q8_K *xq,
+        const int        *selected,
+        const float      *expert_weight,
+        int               n_expert,
+        float             clamp) {
+    if (gate_w->type != DS4_TENSOR_Q8_K || up_w->type != DS4_TENSOR_Q8_K) {
+        ds4_die("expected Q8_K expert tensors");
+    }
+    if (n_expert < 1 || n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+
+    uint64_t in_dim0 = 0;
+    uint64_t out_dim0 = 0;
+    matvec_q8_k_mid_ctx ctx = {
+        .mid = mid,
+        .xq = xq,
+        .clamp = clamp,
+        .n_expert = n_expert,
+    };
+
+    for (int i = 0; i < n_expert; i++) {
+        uint64_t gate_in_dim, gate_out_dim;
+        uint64_t up_in_dim, up_out_dim;
+        ctx.gate_base[i] = tensor_expert_bytes(m, gate_w, (uint32_t)selected[i],
+                                               &gate_in_dim, &gate_out_dim, &ctx.gate_row_bytes[i]);
+        ctx.up_base[i] = tensor_expert_bytes(m, up_w, (uint32_t)selected[i],
+                                             &up_in_dim, &up_out_dim, &ctx.up_row_bytes[i]);
+        if (gate_in_dim != up_in_dim || gate_out_dim != up_out_dim) {
+            ds4_die("paired Q8_K expert tensors do not match");
+        }
+        if (i == 0) {
+            in_dim0 = gate_in_dim;
+            out_dim0 = gate_out_dim;
+        } else if (gate_in_dim != in_dim0 || gate_out_dim != out_dim0) {
+            ds4_die("Q8_K expert tensors do not share a layout");
+        }
+        ctx.expert_weight[i] = expert_weight[i];
+    }
+    if (in_dim0 % QK_K != 0) ds4_die("Q8_K expert row is not QK_K aligned");
+
+    ctx.in_dim = in_dim0;
+    ctx.out_dim = out_dim0;
+    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q8_k_mid_worker, &ctx);
 }
 
 typedef struct {
@@ -4235,6 +4391,68 @@ static DS4_MAYBE_UNUSED void matvec_q8_0_experts_accum_prequant(
     }
 
     ds4_parallel_for(out_dim0, matvec_q8_0_accum_worker, &ctx);
+}
+
+typedef struct {
+    float *out;
+    const uint8_t *base[DS4_N_EXPERT_USED];
+    const block_q8_K *xq[DS4_N_EXPERT_USED];
+    uint64_t in_dim;
+    uint64_t row_bytes[DS4_N_EXPERT_USED];
+    int n_expert;
+} matvec_q8_k_accum_ctx;
+
+static void matvec_q8_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_q8_k_accum_ctx *ctx = vctx;
+
+    for (uint64_t row = row0; row < row1; row++) {
+        float acc = 0.0f;
+        for (int i = 0; i < ctx->n_expert; i++) {
+            float v = 0.0f;
+            const block_q8_K *br = (const block_q8_K *)(ctx->base[i] + row * ctx->row_bytes[i]);
+            ds4_vec_dot_q8_K_q8_K((int)ctx->in_dim, &v, br, ctx->xq[i]);
+            acc += v;
+        }
+        ctx->out[row] = acc;
+    }
+}
+
+static DS4_MAYBE_UNUSED void matvec_q8_k_experts_accum_prequant(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const block_q8_K *xq,
+        const int        *selected,
+        int               n_expert) {
+    if (w->type != DS4_TENSOR_Q8_K) ds4_die("expected a Q8_K expert tensor");
+    if (n_expert < 1 || n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+
+    uint64_t in_dim0 = 0;
+    uint64_t out_dim0 = 0;
+    matvec_q8_k_accum_ctx ctx = {
+        .out = out,
+        .n_expert = n_expert,
+    };
+
+    for (int i = 0; i < n_expert; i++) {
+        uint64_t in_dim, out_dim;
+        ctx.base[i] = tensor_expert_bytes(m, w, (uint32_t)selected[i], &in_dim, &out_dim, &ctx.row_bytes[i]);
+        if (i == 0) {
+            in_dim0 = in_dim;
+            out_dim0 = out_dim;
+        } else if (in_dim != in_dim0 || out_dim != out_dim0) {
+            ds4_die("Q8_K expert tensors do not share a layout");
+        }
+    }
+    if (in_dim0 % QK_K != 0) ds4_die("Q8_K expert row is not QK_K aligned");
+
+    const uint64_t n_blocks = in_dim0 / QK_K;
+    ctx.in_dim = in_dim0;
+    for (int i = 0; i < n_expert; i++) {
+        ctx.xq[i] = xq + (uint64_t)i * n_blocks;
+    }
+
+    ds4_parallel_for(out_dim0, matvec_q8_k_accum_worker, &ctx);
 }
 
 typedef struct {
