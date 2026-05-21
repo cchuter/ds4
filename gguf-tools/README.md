@@ -86,6 +86,17 @@ gguf-tools/deepseek4-quantize \
   --imatrix gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4.dat
 ```
 
+True Q8_K routed experts:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf /Users/cchuter/models/DeepSeek-V4-Flash \
+  --template gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
+  --out gguf/DeepSeek-V4-Flash-Q8KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --experts q8_K \
+  --threads 8
+```
+
 You can override tensor families:
 
 ```sh

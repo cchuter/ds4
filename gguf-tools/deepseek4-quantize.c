@@ -1710,7 +1710,7 @@ static void usage(const char *argv0) {
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
     printf("  --n-experts N          routed expert count, default 256\n");
     printf("  --threads N            expert worker count, default 8\n");
-    printf("\nTYPE examples: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs\n");
+    printf("\nTYPE examples: f16, f32, bf16, q8_0, q8_K, q4_k, q2_k, iq2_xxs\n");
 }
 
 static char *need_value(int argc, char **argv, int *i, const char *arg) {
