@@ -128,45 +128,6 @@ If you want to regenerate GGUF files or collect a new imatrix, see
 model-building work and can take a long time on the full DeepSeek V4 Flash
 weights.
 
-### Local Q8 Routed Expert Experiments
-
-Local experimental 8-bit routed-expert GGUFs can be built from the official
-DeepSeek V4 Flash safetensors.
-
-`Q8_0Experts` uses GGUF type `q8_0` for routed experts and is the first
-runnable high-precision checkpoint:
-
-```sh
-./gguf-tools/deepseek4-quantize \
-  --hf /Users/cchuter/models/DeepSeek-V4-Flash \
-  --template gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
-  --out gguf/DeepSeek-V4-Flash-Q8_0Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
-  --experts q8_0 \
-  --threads 8
-```
-
-`Q8KExperts` uses GGUF type `q8_K` for routed experts. It is the true Phase 2
-8-bit K-block format and is expected to be slightly larger than Q8_0 because
-each `q8_K` block stores per-block sums in addition to the quantized bytes:
-
-```sh
-./gguf-tools/deepseek4-quantize \
-  --hf /Users/cchuter/models/DeepSeek-V4-Flash \
-  --template gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf \
-  --out gguf/DeepSeek-V4-Flash-Q8KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
-  --experts q8_K \
-  --threads 8
-```
-
-On a Mac Studio M3 Ultra with the prompt `What is the capital of France?`,
-`--ctx 1024 -n 8 --nothink --temp 0` produced:
-
-| Local GGUF | Size | Prefill | Generation | Answer |
-| --- | ---: | ---: | ---: | --- |
-| Q4KExperts imatrix | 153G | 49.55 t/s | 25.88 t/s | Paris |
-| Q8_0Experts | 282G | 39.46 t/s | 20.94 t/s | Paris |
-| Q8KExperts | 302G | 39.29 t/s | 20.39 t/s | Paris |
-
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
 enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
