@@ -27,7 +27,7 @@
 - Modify: `gguf-tools/deepseek4-quantize.c`
 - Modify: `gguf-tools/README.md`
 
-- [ ] **Step 1: Run the current red dry-run**
+- [x] **Step 1: Run the current red dry-run**
 
 Run:
 
@@ -43,7 +43,9 @@ make -C gguf-tools
 
 Expected before this task is implemented: the command fails because `q8_K` is named but not quantizable.
 
-- [ ] **Step 2: Add the q8_K quantizer**
+Completed by `8add6c4`: red dry-run exited `1` with `error: unsupported planned tensor type`.
+
+- [x] **Step 2: Add the q8_K quantizer**
 
 In `gguf-tools/quants.c`, change the `DS4Q_TYPE_Q8_K` trait from non-quantizable to quantizable:
 
@@ -113,7 +115,7 @@ case DS4Q_TYPE_Q8_K:
     return ds4q_quantize_q8_K(src, dst, start, nrows, ncols);
 ```
 
-- [ ] **Step 3: Update quantizer help and docs**
+- [x] **Step 3: Update quantizer help and docs**
 
 In `gguf-tools/deepseek4-quantize.c`, update the type examples line:
 
@@ -136,7 +138,7 @@ gguf-tools/deepseek4-quantize \
 ```
 ````
 
-- [ ] **Step 4: Run quantizer verification**
+- [x] **Step 4: Run quantizer verification**
 
 Run:
 
@@ -152,7 +154,11 @@ make -C gguf-tools
 
 Expected: `type_changes: 129`, and every `type_change:` line for routed expert tensors ends in `-> q8_K`.
 
-- [ ] **Step 5: Commit quantizer support**
+Completed by `8add6c4` and docs cleanup `4733071`: `make -C gguf-tools`
+passed, q8_K dry-run reported `type_changes: 129`, a strict type-change check
+found no bad type changes, and `git diff --check` passed.
+
+- [x] **Step 5: Commit quantizer support**
 
 Run:
 
@@ -166,7 +172,7 @@ git commit -m "feat: emit q8_k routed expert tensors"
 **Files:**
 - Modify: `ds4.c`
 
-- [ ] **Step 1: Add stored Q8_K type admission**
+- [x] **Step 1: Add stored Q8_K type admission**
 
 In `ds4.c`, add `DS4_TENSOR_Q8_K = 15` to the tensor enum and route helpers:
 
@@ -188,7 +194,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
 case DS4_TENSOR_Q8_K:    return sizeof(block_q8_K);
 ```
 
-- [ ] **Step 2: Add CPU Q8_K x Q8_K dot products**
+- [x] **Step 2: Add CPU Q8_K x Q8_K dot products**
 
 Add these helpers near `ds4_vec_dot_q2_K_q8_K()`:
 
@@ -256,7 +262,7 @@ static void ds4_vec_dot_q8_K_pair_q8_K(
 }
 ```
 
-- [ ] **Step 3: Add CPU expert mid and down helpers**
+- [x] **Step 3: Add CPU expert mid and down helpers**
 
 Add Q8_K versions alongside the existing `matvec_iq2_xxs_*` and `matvec_q8_0_*` helpers:
 
@@ -278,7 +284,7 @@ typedef struct {
 
 Implement `matvec_q8_k_mid_worker()`, `matvec_q8_k_experts_mid_prequant()`, `matvec_q8_k_accum_worker()`, and `matvec_q8_k_experts_accum_prequant()` by matching the Q8_0 helper structure but replacing `dot_q8_0_row_pair()` and `dot_q8_0_row()` with `ds4_vec_dot_q8_K_pair_q8_K()` and `ds4_vec_dot_q8_K_q8_K()`.
 
-- [ ] **Step 4: Build CPU**
+- [x] **Step 4: Build CPU**
 
 Run:
 
@@ -288,7 +294,11 @@ make cpu
 
 Expected: CPU binaries build without warnings from the new Q8_K functions.
 
-- [ ] **Step 5: Commit CPU dot kernels**
+Completed by `e38b6c2`: `make cpu` passed and `git diff --check` was clean.
+Spec and code-quality reviews approved the Q8_K dot math, scalar/NEON parity,
+helper validation, and lack of routed dispatch wiring.
+
+- [x] **Step 5: Commit CPU dot kernels**
 
 Run:
 
@@ -302,7 +312,7 @@ git commit -m "feat: add cpu q8_k routed expert kernels"
 **Files:**
 - Modify: `ds4.c`
 
-- [ ] **Step 1: Add Q8_K routed type detection**
+- [x] **Step 1: Add Q8_K routed type detection**
 
 In `layer_routed_moe_one()`, `layer_routed_moe_one_prealloc()`, `layer_routed_moe_batch()`, and token-parallel routed contexts, add:
 
@@ -325,7 +335,7 @@ if (routed_q8_k) {
 }
 ```
 
-- [ ] **Step 2: Wire single-token CPU Q8_K**
+- [x] **Step 2: Wire single-token CPU Q8_K**
 
 In `layer_routed_moe_one()`, allocate `block_q8_K *xq` and `block_q8_K *midq` for Q8_K exactly as the existing IQ2/Q2 branch does. Add this branch before the IQ2/Q2 branch:
 
@@ -348,7 +358,7 @@ In `layer_routed_moe_one()`, allocate `block_q8_K *xq` and `block_q8_K *midq` fo
                                        midq, selected, DS4_N_EXPERT_USED);
 ```
 
-- [ ] **Step 3: Wire allocation-free CPU decode**
+- [x] **Step 3: Wire allocation-free CPU decode**
 
 In `layer_routed_moe_one_prealloc()`, reuse existing `xq` and `midq` scratch for Q8_K. Add this branch after `ds4_quantize_row_q8_K(x, xq, ...)` and before IQ2/Q2 dispatch:
 
@@ -374,7 +384,7 @@ if (routed_q8_k) {
 }
 ```
 
-- [ ] **Step 4: Wire CPU batch prefill**
+- [x] **Step 4: Wire CPU batch prefill**
 
 Add Q8_K batch contexts by matching the existing IQ2/Q2 batch path:
 
@@ -400,7 +410,7 @@ typedef struct {
 
 Implement `matvec_q8_k_batch_mid_worker()` and `matvec_q8_k_batch_accum_rows_worker()` by matching the IQ2/Q2 batch workers and swapping in the Q8_K dot helpers.
 
-- [ ] **Step 5: Update routed quant bits**
+- [x] **Step 5: Update routed quant bits**
 
 In `ds4_engine_routed_quant_bits()`, make `Q8_K` report as 8:
 
@@ -410,7 +420,7 @@ case DS4_TENSOR_Q8_K:
     return 8;
 ```
 
-- [ ] **Step 6: Build CPU and commit**
+- [x] **Step 6: Build CPU and commit**
 
 Run:
 
@@ -419,6 +429,11 @@ make cpu
 ```
 
 Expected: CPU binaries build cleanly.
+
+Completed by `ae66bc3` with cleanup `dc6eff1`: `make cpu` and
+`git diff --check` passed. Spec review approved the CPU routed Q8_K control
+flow, and code-quality re-review approved the scratch guard cleanup and removal
+of dead token-parallel plumbing.
 
 Commit:
 
@@ -433,7 +448,7 @@ git commit -m "feat: route q8_k experts on cpu"
 - Modify: `metal/moe.metal`
 - Modify: `ds4_metal.m`
 
-- [ ] **Step 1: Add Metal Q8_K block and dequantization**
+- [x] **Step 1: Add Metal Q8_K block and dequantization**
 
 In the Metal source prelude in `ds4_metal.m`, add:
 
@@ -460,7 +475,7 @@ void dequantize_q8_K(device const block_q8_K *xb, short il, thread type4x4 &reg)
 }
 ```
 
-- [ ] **Step 2: Export routed matmul pipelines**
+- [x] **Step 2: Export routed matmul pipelines**
 
 In `metal/moe.metal`, add host-visible Q8_K matmul templates next to the existing Q2/Q4/IQ2 templates:
 
@@ -478,7 +493,7 @@ kernel_mul_mm_id<half, half4x4, simdgroup_half8x8,
                  half, half4x4, half, half2x4>;
 ```
 
-- [ ] **Step 3: Add decode matvec pipeline**
+- [x] **Step 3: Add decode matvec pipeline**
 
 Use the generic routed matvec template by adding a Q8_K implementation. Add `N_R0_Q8_K` near the other routed constants:
 
@@ -495,7 +510,7 @@ template [[host_name("kernel_mul_mv_id_q8_K_f32")]] kernel kernel_mul_mv_id_q_t
 kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q8_K_f32_impl<N_R0_Q8_K>>>;
 ```
 
-- [ ] **Step 4: Add Metal host type dispatch**
+- [x] **Step 4: Add Metal host type dispatch**
 
 In `ds4_metal.m`, add:
 
@@ -532,7 +547,7 @@ static bool ds4_gpu_routed_mv_rows_per_group_is_nr0(uint32_t type) {
 }
 ```
 
-- [ ] **Step 5: Build Metal**
+- [x] **Step 5: Build Metal**
 
 Run:
 
@@ -543,7 +558,13 @@ make -B ds4 ds4_test
 
 Expected: Metal library compilation succeeds and `metal-kernels: OK`.
 
-- [ ] **Step 6: Commit Metal support**
+Completed by `42aabd9` with fixes `9ede9e6`, `16dadd3`, and `7e1225e`:
+`make -B ds4 ds4_test`, `./ds4_test --metal-kernels`, and `git diff --check`
+passed. The added Metal kernel regression dispatches Q8_K routed MoE with a
+nonzero expert id and multi-block Q8_K gate/up/down inputs, catching the
+original partial-block matvec risk.
+
+- [x] **Step 6: Commit Metal support**
 
 Run:
 
@@ -557,7 +578,7 @@ git commit -m "feat: route q8_k experts on metal"
 **Files:**
 - Generated, ignored: `gguf/DeepSeek-V4-Flash-Q8KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf`
 
-- [ ] **Step 1: Run dry-run after runtime support builds**
+- [x] **Step 1: Run dry-run after runtime support builds**
 
 Run:
 
@@ -572,7 +593,10 @@ Run:
 
 Expected: `type_changes: 129`, and `approx_file_bytes` is larger than the Q8_0Experts dry-run because each Q8_K block stores `292` bytes per `256` values.
 
-- [ ] **Step 2: Generate the full model**
+Completed: dry-run reported `type_changes: 129` and
+`approx_file_bytes: 324788806240`.
+
+- [x] **Step 2: Generate the full model**
 
 Run:
 
@@ -587,7 +611,10 @@ Run:
 
 Expected: the tool writes the GGUF without size mismatches.
 
-- [ ] **Step 3: Record local artifact state**
+Completed: the tool wrote
+`gguf/DeepSeek-V4-Flash-Q8KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf`.
+
+- [x] **Step 3: Record local artifact state**
 
 Run:
 
@@ -599,13 +626,16 @@ git status --short
 
 Expected: the model exists locally and does not appear in `git status --short`.
 
+Completed: the Q8_K model is `302G`, disk has `258Gi` free, and `git status`
+shows the `gguf/` artifact as ignored rather than tracked.
+
 ## Task 6: Smoke Tests and Comparison
 
 **Files:**
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-05-21-q8-k-routed-experts.md`
 
-- [ ] **Step 1: CPU smoke**
+- [x] **Step 1: CPU smoke**
 
 Run:
 
@@ -623,7 +653,10 @@ DS4_LOCK_FILE=/tmp/ds4-q8k-smoke.lock ./ds4 \
 
 Expected: output contains `Paris` and the process exits with code 0.
 
-- [ ] **Step 2: Metal smoke**
+Completed: answered `The capital of France is Paris.` and exited 0.
+Throughput: prefill `7.03 t/s`, generation `6.01 t/s`.
+
+- [x] **Step 2: Metal smoke**
 
 Run:
 
@@ -641,7 +674,10 @@ DS4_LOCK_FILE=/tmp/ds4-q8k-smoke-metal.lock ./ds4 \
 
 Expected: output contains `Paris` and reports prefill/generation token rates.
 
-- [ ] **Step 3: Compare Q4, Q8_0, and Q8_K on the same smoke**
+Completed: answered `The capital of France is Paris.` and exited 0.
+Throughput: prefill `39.29 t/s`, generation `20.39 t/s`.
+
+- [x] **Step 3: Compare Q4, Q8_0, and Q8_K on the same smoke**
 
 Run the same Metal command shape for:
 
@@ -653,7 +689,15 @@ gguf/DeepSeek-V4-Flash-Q8KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared
 
 Record size, prefill t/s, generation t/s, and answer text in this plan.
 
-- [ ] **Step 4: Run targeted tests**
+Same prompt and command shape on Mac Studio M3 Ultra:
+
+| Local GGUF | Size | Prefill | Generation | Answer |
+| --- | ---: | ---: | ---: | --- |
+| Q4KExperts imatrix | 153G | 49.55 t/s | 25.88 t/s | Paris |
+| Q8_0Experts | 282G | 39.46 t/s | 20.94 t/s | Paris |
+| Q8KExperts | 302G | 39.29 t/s | 20.39 t/s | Paris |
+
+- [x] **Step 4: Run targeted tests**
 
 Run:
 
@@ -665,7 +709,11 @@ git diff --check
 
 Expected: `ds4 tests: ok`, and `git diff --check` produces no output.
 
-- [ ] **Step 5: Update README with Q8_K status**
+Completed: `make ds4_test`, `./ds4_test --server --metal-kernels`, and
+`git diff --check` passed. The test output included `metal-kernels: OK`,
+`server: OK`, and `ds4 tests: ok`.
+
+- [x] **Step 5: Update README with Q8_K status**
 
 Update `README.md` so the local experiment section contains both:
 
@@ -678,7 +726,10 @@ runnable high-precision checkpoint.
 each `q8_K` block stores per-block sums in addition to the quantized bytes.
 ```
 
-- [ ] **Step 6: Commit verification docs**
+Completed: README now documents Q8_0Experts, Q8KExperts, generation commands,
+and the Q4/Q8_0/Q8_K smoke comparison.
+
+- [x] **Step 6: Commit verification docs**
 
 Run:
 
