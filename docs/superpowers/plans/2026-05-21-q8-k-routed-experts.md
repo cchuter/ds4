@@ -743,7 +743,7 @@ git commit -m "docs: record q8_k routed expert verification"
 **Files:**
 - No code changes.
 
-- [ ] **Step 1: Final status check**
+- [x] **Step 1: Final status check**
 
 Run:
 
@@ -754,6 +754,10 @@ ls -lh gguf/DeepSeek-V4-Flash-Q8KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q
 ```
 
 Expected: the branch is clean, recent commits show Q8_K support, and the generated GGUF exists locally.
+
+Completed: branch `feat/q8-k-routed-experts` is clean, recent commits show the
+Q8_K quantizer/runtime/test/docs work, and the local generated Q8_K GGUF exists
+at `302G` under ignored `gguf/`.
 
 - [ ] **Step 2: Push when requested**
 
