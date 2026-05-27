@@ -1293,12 +1293,16 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
      * Driver semantics: cudaDeviceCanAccessPeer + cudaDeviceEnablePeerAccess
      * can both succeed even on hardware/drivers where cudaMemcpyPeerAsync
      * silently delivers wrong data (notably RTX 6000 Ada under recent
-     * NVIDIA drivers, per the v0 design doc). To guard against this, we
-     * also do a small in-process validation copy at init: write a known
-     * pattern on the source GPU, peer-copy it to the destination GPU,
-     * read it back, and only set peer_ok[i][j] if the bytes match. If
-     * validation fails, the entry stays at 0 and cross-device copies
-     * fall back to the pinned-host bounce path automatically. */
+     * NVIDIA drivers, per the v0 design doc). The corruption is
+     * non-deterministic and can affect either or both directions of a
+     * pair. To guard against this, we run a multi-size, multi-iteration
+     * validation at init (see the loop below): write distinct known
+     * patterns, peer-copy them to the destination, read back, and only
+     * set peer_ok[i][j] if every probe round-trips byte-perfect. A
+     * single small probe is not sufficient — it can pass while realistic
+     * activation-sized copies still corrupt. On any failure the entry
+     * stays at 0 and cross-device copies fall back to the pinned-host
+     * bounce path automatically. */
     for (int i = 0; i < g_n_gpus; i++) {
         for (int j = 0; j < g_n_gpus; j++) {
             if (i == j) { g_gpu_peer_ok[i][j] = 1; continue; }
