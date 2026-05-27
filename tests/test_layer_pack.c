@@ -112,20 +112,64 @@ static void test_oversized_entry_n2(void) {
 }
 
 static void test_mixed_n8(void) {
-    /* Eight GPUs, varied budgets, varied entries. */
+    /* Eight GPUs with VARIED budgets and VARIED entry sizes. Verify exact
+     * placements under greedy semantics so a buggy implementation that
+     * placed everything on the last device cannot pass. */
     const size_t entries[] = {
-        50, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 50
+        /* idx:  0    1    2    3    4    5    6    7    8    9   10   11   12 */
+                30,  60,  40,  50,  80,  20,  20,  10,  50,  70,  90,  10,  10
     };
+    const int n_entries = 13;
     ds4_layer_pack_config cfg = { .n_gpus = 8 };
-    for (int d = 0; d < 8; d++) cfg.gpu_budget_bytes[d] = 200;
-    /* Total = 50 + 14*100 + 50 = 1500. 8 budgets of 200 = 1600. Fits. */
-    int dev[16];
-    CHECK(ds4_compute_layer_placement(entries, 16, &cfg, dev) == 0, "rc 0");
-    CHECK(check_monotonic(dev, 16), "monotonic");
-    /* No entry exceeds 200 -> nothing on CPU. */
-    for (int i = 0; i < 16; i++) {
-        CHECK(dev[i] >= 0 && dev[i] < 8, "no CPU spill");
+    /* Budgets vary intentionally — small / medium / large mix. */
+    cfg.gpu_budget_bytes[0] = 100;
+    cfg.gpu_budget_bytes[1] =  80;
+    cfg.gpu_budget_bytes[2] =  50;
+    cfg.gpu_budget_bytes[3] =  90;
+    cfg.gpu_budget_bytes[4] =  60;
+    cfg.gpu_budget_bytes[5] =  30;
+    cfg.gpu_budget_bytes[6] =  80;
+    cfg.gpu_budget_bytes[7] =  40;
+    int dev[13];
+    CHECK(ds4_compute_layer_placement(entries, n_entries, &cfg, dev) == 0, "rc 0");
+
+    /* Hand-trace under strict greedy fill (advance once entry > current budget):
+     *
+     *  d=0 budget=100
+     *    e0 30  -> 30   fits (rem 70) ; dev[0]=0
+     *    e1 60  -> 60   fits (rem 10) ; dev[1]=0
+     *    e2 40  -> 40 > 10, advance to d=1 (rem 80)
+     *  d=1 budget=80
+     *    e2 40  -> 40 fits (rem 40) ; dev[2]=1
+     *    e3 50  -> 50 > 40, advance to d=2 (rem 50)
+     *  d=2 budget=50
+     *    e3 50  -> 50 fits exactly (rem 0) ; dev[3]=2
+     *    e4 80  -> 80 > 0, advance to d=3 (rem 90)
+     *  d=3 budget=90
+     *    e4 80  -> 80 fits (rem 10) ; dev[4]=3
+     *    e5 20  -> 20 > 10, advance to d=4 (rem 60)
+     *  d=4 budget=60
+     *    e5 20  -> 20 fits (rem 40) ; dev[5]=4
+     *    e6 20  -> 20 fits (rem 20) ; dev[6]=4
+     *    e7 10  -> 10 fits (rem 10) ; dev[7]=4
+     *    e8 50  -> 50 > 10, advance to d=5 (rem 30)
+     *  d=5 budget=30
+     *    e8 50  -> 50 > 30, advance to d=6 (rem 80)
+     *  d=6 budget=80
+     *    e8 50  -> 50 fits (rem 30) ; dev[8]=6
+     *    e9 70  -> 70 > 30, advance to d=7 (rem 40)
+     *  d=7 budget=40
+     *    e9 70  -> 70 > 40, advance to d=8 (out of GPUs)
+     *    e9..e12 all CPU
+     */
+    const int expected[13] = {0,0,1,2,3,4,4,4,6,DS4_LAYER_PACK_CPU,DS4_LAYER_PACK_CPU,DS4_LAYER_PACK_CPU,DS4_LAYER_PACK_CPU};
+    for (int i = 0; i < n_entries; i++) {
+        if (dev[i] != expected[i]) {
+            fprintf(stderr, "  mismatch e%d: got %d expected %d\n", i, dev[i], expected[i]);
+        }
+        CHECK(dev[i] == expected[i], "exact placement");
     }
+    CHECK(check_monotonic(dev, n_entries), "monotonic");
 }
 
 static void test_n16_stress(void) {
