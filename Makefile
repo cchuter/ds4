@@ -16,8 +16,8 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_metal.o ds4_layer_pack.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_layer_pack.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -28,8 +28,8 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_cuda.o ds4_layer_pack.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_layer_pack.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -157,6 +157,15 @@ linenoise.o: linenoise.c linenoise.h
 ds4_cpu.o: ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
+ds4_layer_pack.o: ds4_layer_pack.c ds4_layer_pack.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_layer_pack.c
+
+tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_layer_pack.c
+
+tests/test_layer_pack: tests/test_layer_pack.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
@@ -175,14 +184,20 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_kvstore.h linenoise.h
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-# Selective model cache test (mgpu-selective-model-cache). Linux/CUDA only.
+# Multi-GPU plumbing tests (Linux/CUDA only).
 ifneq ($(UNAME_S),Darwin)
+tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ tests/test_gpu_xdev.c
+
+tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ tests/test_gpu_model_cache.c
 
@@ -197,8 +212,9 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test
+test: ds4_test tests/test_layer_pack
 	./ds4_test
+	./tests/test_layer_pack
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_layer_pack tests/test_layer_pack.o
