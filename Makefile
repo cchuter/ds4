@@ -181,6 +181,15 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+# Selective model cache test (mgpu-selective-model-cache). Linux/CUDA only.
+ifneq ($(UNAME_S),Darwin)
+tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ tests/test_gpu_model_cache.c
+
+tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+endif
+
 ds4_test: ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)

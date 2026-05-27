@@ -41,6 +41,50 @@ int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+
+/* =========================================================================
+ * Per-device selective model cache (mgpu-selective-model-cache).
+ *
+ * Replaces the global "cache the entire model span on device 0" semantics
+ * of ds4_gpu_set_model_map_range with a per-device, selective range cache.
+ * The legacy API is preserved as a no-op-for-the-new-table compatibility
+ * shim — existing callers continue to use the chunk-aware machinery
+ * unchanged. New callers populate the per-device slab via
+ * ds4_gpu_device_cache_tensors and resolve offsets via
+ * ds4_gpu_lookup_cache.
+ * ========================================================================= */
+
+#ifndef DS4_MAX_GPUS
+#define DS4_MAX_GPUS 16
+#endif
+
+typedef struct {
+    uint64_t source_offset;   /* offset into the mmap'd model file */
+    uint64_t bytes;           /* range size */
+    int      target_device;   /* CUDA device this range should live on */
+} ds4_tensor_range;
+
+/* Copy each (target_device == device_id) range from the mmap'd source
+ * onto device_id's selective cache slab. Multiple calls grow the slab.
+ * Returns 0 on success. */
+int ds4_gpu_device_cache_tensors(int device_id,
+                                  const ds4_tensor_range *ranges,
+                                  int n_ranges);
+
+/* Resolve (source_offset, bytes) to (device_id, device_ptr). Subrange
+ * lookups inside a cached entry return device_ptr +
+ * (source_offset - entry_source_offset). When multiple selective
+ * entries cover the same range across devices, the entry whose
+ * device matches cudaGetDevice() wins. If no selective entry covers,
+ * the resolver falls back to the legacy chunk-aware path
+ * (cuda_model_range_ptr); that path always reports device 0.
+ *
+ * Returns 1 on a fully-covered hit; 0 on miss. Either out_* may be NULL. */
+int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
+                         int *out_device_id, void **out_device_ptr);
+
+/* Convenience: returns -1 on miss. */
+int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);

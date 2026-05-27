@@ -87,6 +87,25 @@ static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
 
+/* =========================================================================
+ * Per-device selective model cache (mgpu-selective-model-cache).
+ * ========================================================================= */
+
+struct cuda_device_cache {
+    void   *base;     /* device-side slab base */
+    size_t  bytes;
+    int     present;
+};
+static cuda_device_cache g_dev_cache[DS4_MAX_GPUS];
+
+struct cache_range_entry {
+    uint64_t source_offset;
+    uint64_t bytes;
+    int      device_id;
+    void    *device_ptr;
+};
+static std::vector<cache_range_entry> g_cache_ranges;
+
 struct cuda_model_range {
     const void *host_base;
     uint64_t offset;
@@ -1498,6 +1517,169 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
     }
     return 1;
+}
+
+/* =========================================================================
+ * Per-device selective model cache (mgpu-selective-model-cache).
+ *
+ * ds4_gpu_device_cache_tensors copies the listed source ranges from the
+ * host mmap onto device_id's selective slab and appends sorted lookup
+ * entries. The legacy chunked-copy machinery (cuda_model_range_*) is
+ * NOT disturbed — it continues to drive all existing callers. New
+ * lookups fall back to it when no selective entry covers the range.
+ *
+ * Caller-context preference for overlap: when the same source range is
+ * cached on multiple devices, ds4_gpu_lookup_cache returns the entry
+ * whose device matches cudaGetDevice().
+ * ========================================================================= */
+
+extern "C" int ds4_gpu_device_cache_tensors(int device_id,
+                                            const ds4_tensor_range *ranges,
+                                            int n_ranges) {
+    if (device_id < 0 || device_id >= DS4_MAX_GPUS) return 1;
+    if (n_ranges < 0 || (!ranges && n_ranges > 0)) return 2;
+    if (n_ranges == 0) return 0;
+
+    /* Sum bytes targeting this device. */
+    uint64_t want_bytes = 0;
+    for (int i = 0; i < n_ranges; i++) {
+        if (ranges[i].target_device == device_id) want_bytes += ranges[i].bytes;
+    }
+    if (want_bytes == 0) return 0;
+
+    if (!g_model_host_base) return 3;  /* set_model_map must have run */
+
+    cuda_device_cache &c = g_dev_cache[device_id];
+
+    int prev_device = -1;
+    if (cudaGetDevice(&prev_device) != cudaSuccess) prev_device = -1;
+    if (cudaSetDevice(device_id) != cudaSuccess) return 4;
+
+    /* Allocate or grow the slab via cudaMalloc + d2d copy. */
+    void *new_base = NULL;
+    size_t new_bytes = c.bytes + want_bytes;
+    if (!cuda_ok(cudaMalloc(&new_base, new_bytes), "device cache alloc")) {
+        if (prev_device >= 0) (void)cudaSetDevice(prev_device);
+        return 5;
+    }
+    if (c.present && c.bytes > 0) {
+        cudaError_t e = cudaMemcpy(new_base, c.base, c.bytes,
+                                   cudaMemcpyDeviceToDevice);
+        if (e != cudaSuccess) {
+            cuda_ok(e, "device cache grow d2d");
+            (void)cudaFree(new_base);
+            if (prev_device >= 0) (void)cudaSetDevice(prev_device);
+            return 6;
+        }
+        /* Re-base existing entries on this device. */
+        char *old_base = (char *)c.base;
+        char *grown    = (char *)new_base;
+        for (size_t k = 0; k < g_cache_ranges.size(); k++) {
+            if (g_cache_ranges[k].device_id == device_id) {
+                g_cache_ranges[k].device_ptr =
+                    grown + ((char *)g_cache_ranges[k].device_ptr - old_base);
+            }
+        }
+        (void)cudaFree(c.base);
+    }
+    c.base = new_base;
+    c.bytes = new_bytes;
+    c.present = 1;
+
+    /* Copy ranges and append entries. */
+    const char *host_base = (const char *)g_model_host_base;
+    size_t write_off = c.bytes - want_bytes;
+    for (int i = 0; i < n_ranges; i++) {
+        if (ranges[i].target_device != device_id) continue;
+        char *dev_ptr = (char *)c.base + write_off;
+        cudaError_t e = cudaMemcpy(dev_ptr,
+                                   host_base + ranges[i].source_offset,
+                                   (size_t)ranges[i].bytes,
+                                   cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) {
+            cuda_ok(e, "device cache range h2d");
+            if (prev_device >= 0) (void)cudaSetDevice(prev_device);
+            return 7;
+        }
+        cache_range_entry ent;
+        ent.source_offset = ranges[i].source_offset;
+        ent.bytes         = ranges[i].bytes;
+        ent.device_id     = device_id;
+        ent.device_ptr    = dev_ptr;
+        g_cache_ranges.push_back(ent);
+        write_off += ranges[i].bytes;
+    }
+
+    /* Keep sorted by source_offset for binary-search lookup. */
+    std::sort(g_cache_ranges.begin(), g_cache_ranges.end(),
+              [](const cache_range_entry &a, const cache_range_entry &b) {
+                  if (a.source_offset != b.source_offset)
+                      return a.source_offset < b.source_offset;
+                  return a.device_id < b.device_id;
+              });
+
+    if (prev_device >= 0) (void)cudaSetDevice(prev_device);
+    return 0;
+}
+
+extern "C" int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
+                                    int *out_device_id, void **out_device_ptr) {
+    int active_device = -1;
+    (void)cudaGetDevice(&active_device);
+
+    if (!g_cache_ranges.empty()) {
+        /* upper_bound: first entry with source_offset > query.
+         * Candidates are at strictly earlier positions; scan all of
+         * them rather than breaking on the first non-covering entry,
+         * because the table allows overlap across devices. */
+        auto it = std::upper_bound(
+            g_cache_ranges.begin(), g_cache_ranges.end(),
+            source_offset,
+            [](uint64_t off, const cache_range_entry &e) {
+                return off < e.source_offset;
+            });
+        const cache_range_entry *match_any  = NULL;
+        const cache_range_entry *match_pref = NULL;
+        while (it != g_cache_ranges.begin()) {
+            --it;
+            if (source_offset >= it->source_offset &&
+                source_offset + bytes <= it->source_offset + it->bytes) {
+                if (it->device_id == active_device) {
+                    match_pref = &*it;
+                    break;
+                }
+                if (!match_any) match_any = &*it;
+            }
+            /* Do NOT break on non-covering: an earlier entry may still
+             * cover if its bytes extend far enough. */
+        }
+        const cache_range_entry *m = match_pref ? match_pref : match_any;
+        if (m) {
+            if (out_device_id) *out_device_id = m->device_id;
+            if (out_device_ptr) {
+                *out_device_ptr =
+                    (char *)m->device_ptr + (source_offset - m->source_offset);
+            }
+            return 1;
+        }
+    }
+
+    /* Legacy chunk-aware fallback (device 0 only). */
+    const char *p = cuda_model_range_ptr_from_fd(g_model_host_base,
+                                                  source_offset, bytes,
+                                                  "lookup_cache");
+    if (p) {
+        if (out_device_id) *out_device_id = 0;
+        if (out_device_ptr) *out_device_ptr = (void *)p;
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes) {
+    int d = -1;
+    if (!ds4_gpu_lookup_cache(source_offset, bytes, &d, NULL)) return -1;
+    return d;
 }
 
 extern "C" int ds4_gpu_set_model_fd(int fd) {
