@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================
@@ -872,5 +876,9 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif
