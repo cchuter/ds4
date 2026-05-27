@@ -90,7 +90,7 @@ static int g_quality_mode;
  * Multi-GPU plumbing (mgpu-device-aware-cuda).
  * ========================================================================= */
 
-_Static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
+static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
 
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
