@@ -92,6 +92,38 @@ struct ds4_gpu_tensor {
 
 All tensor APIs (`ds4_gpu_tensor_alloc`, `_free`, `_read`, `_write`, `_copy`, slice/view operations) take the device id from the tensor where applicable, and call `cudaSetDevice` internally. `ds4_gpu_tensor_copy` between tensors of different devices uses the peer matrix (below); if the pair isn't peer-enabled, the copy stages through a pinned-host bounce buffer.
 
+Allocation gains an explicit device argument so callers don't depend on ambient CUDA state:
+
+```c
+// New primary API
+int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes);
+
+// Existing API kept as a single-device shim — equivalent to alloc_on(t, 0, bytes)
+int ds4_gpu_tensor_alloc(ds4_gpu_tensor *t, uint64_t bytes);
+```
+
+`alloc_on` internally does `cudaSetDevice(device_id)`, allocates on that device's slab pool, and records `t->device_id = device_id`. All callers that need to pick a tier explicitly use `alloc_on`. The legacy `alloc` exists only for source compatibility with paths that have not yet been threaded; new code must not use it.
+
+### Cross-device boundary synchronization
+
+`cudaMemcpyPeerAsync` (or the pinned-host bounce variant) issued on the source device's stream completes asynchronously — the destination device's stream must not consume the activation before the copy completes. v0 uses a per-boundary event:
+
+```c
+// At a (src_dev, dst_dev) boundary:
+WITH_DEVICE(src_dev) {
+    issue copy on g_gpu[src_dev].stream into dst tensor
+    cudaEventRecord(boundary_event, g_gpu[src_dev].stream);
+}
+WITH_DEVICE(dst_dev) {
+    cudaStreamWaitEvent(g_gpu[dst_dev].stream, boundary_event, 0);
+    // subsequent kernels on dst_dev.stream are safe
+}
+```
+
+A single reusable `cudaEvent_t boundary_event[DS4_MAX_GPUS]` per source device is allocated at init. The boundary cost is one `cudaEventRecord` + one `cudaStreamWaitEvent` — well under a microsecond. This pattern lets v0 stay correct without forcing a `cudaDeviceSynchronize` on every hop, and leaves the door open for v1 to overlap independent microbatches across the two streams.
+
+For GPU→CPU and CPU→GPU boundaries, the existing host-pinned path's synchronization remains in force (the CPU code only reads the destination after the relevant copy completes).
+
 Kernel-launch wrappers in `ds4_cuda.cu` either consume a device id from the input tensor or run inside a `WITH_DEVICE(d) { ... }` scope macro that does `cudaSetDevice(d)` + restore on exit.
 
 ### Selective per-device model cache
@@ -136,7 +168,7 @@ Boundary kinds and mechanisms:
 | Boundary | Mechanism |
 |---|---|
 | GPU → GPU, `peer_ok[src][dst]` | `cudaMemcpyPeerAsync` on the source's stream |
-| GPU → GPU, not peer-capable | Staged through per-pair pinned-host bounce buffer (`cudaMemcpyAsync` D→H then H→D) |
+| GPU → GPU, not peer-capable | Staged through per-pair pinned-host bounce buffer: `cudaMemcpyAsync` D→H on source stream, then `cudaStreamWaitEvent` on a source-recorded event to gate the H→D `cudaMemcpyAsync` on the destination stream — host memory must not be reused until the D→H completes |
 | GPU → CPU | Hidden state and any layer-boundary tensors materialized to host pinned; CPU path takes over from there |
 | CPU → GPU | Hidden state and any boundary tensors uploaded to destination device's pinned buffer |
 
@@ -150,6 +182,7 @@ CPU spill is an **execution-mode change**, not just a placement label.
 - **HC-shaped activations and ratio-4 indexer state:** at a GPU↔CPU boundary, the engine materializes the hidden state on the destination tier. For ratio-4 selective-compressed-attention layers, the indexer-side state stays on the layer's tier and is freshly computed there; it does not need to be transferred across the boundary because the boundary is between layers, not within a layer.
 - **Batch prefill buffers:** carried per-tier. When prefill crosses a tier boundary, the activation matrix is hopped using the same mechanism as decode, sized to `chunk_tokens × hidden × dtype`.
 - **Logits and output head:** logits are computed on the tier where the output head pseudo-layer lives. If that's CPU, logits are returned from CPU; otherwise they are read from the actual device that owns the output-head tier (which may or may not be device 0 depending on placement).
+- **MTP (multi-token prediction) second model:** the codebase supports an optional MTP head (`e->mtp_model`, `e->mtp_ready`) used for speculative decoding. **v0 disables MTP when the placement uses more than one tier** (i.e. when `n_gpus > 1` *or* any layer is on CPU while at least one is on GPU). In multi-tier mode, `e->mtp_ready` is forced to false at engine create time and the existing non-MTP code paths handle inference. Single-tier modes (`--cuda` alone, single-GPU `--gpu-vram N`, CPU-only `--gpu-vram 0`) keep MTP behavior unchanged. Multi-GPU + MTP co-design is deferred to v1 (it interacts directly with the microbatch scheduler).
 - **Session lifecycle:** sessions allocate per-layer state at the layer's assigned tier. `ds4_session_create` consults the placement table; existing CPU and GPU-graph session paths remain — v0 introduces a mixed-mode path that walks the placement table.
 
 ## Layer-packing algorithm
@@ -174,7 +207,7 @@ device_overhead_bytes =
   + global_scratch_bytes                // device-side scratch pool the model uses outside per-layer work
   + q8_batch_cache_bytes                // q8 f16/f32 caches used by prefill batch path
   + logits_buffer_bytes                 // only on the device that owns the output head
-  + (mtp_ready ? mtp_overhead_bytes : 0)
+  + (mtp_ready ? mtp_overhead_bytes : 0)        // mtp_ready is always false in multi-tier mode (see below); kept here for the single-tier case
   + (steering ? steering_tensors_bytes : 0)
   + safety_margin_bytes                 // default ~1 GB
 ```
@@ -227,6 +260,7 @@ ds4-cli MODEL.gguf --gpu-devices 0,2,5                  # restrict to listed dev
 ```
 
 - `--gpu-vram` accepts a comma-separated GB list, the literal `auto`, or a single number.
+- `--gpu-vram 0` is special-cased before any per-device setup: it sets `n_gpus = 0`, skips CUDA initialization entirely, and runs the existing CPU-only path. Per-device overhead validation (below) does not apply because there are no devices.
 - `--gpu-devices` is optional; default is "all visible per `cudaGetDeviceCount`".
 - `--cuda` backwards compatibility: **`--cuda` alone always selects device 0 only**, even on a multi-GPU box. This preserves existing behavior exactly. Multi-GPU is strictly opt-in via `--gpu-vram` (with `auto` or an explicit list) or `--gpu-devices`.
 - Same flags wired into `ds4-cli`, `ds4-server`, `ds4-agent`, `ds4-bench`. In `ds4-server` the layout is fixed at process start.
