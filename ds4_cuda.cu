@@ -1283,6 +1283,12 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
 
+    /* Per-device init publishes g_n_gpus incrementally: once context `i` is
+     * fully set up, g_n_gpus becomes `i + 1` so any subsequent failure can
+     * be unwound by ds4_gpu_cleanup() walking [0, g_n_gpus). Without this,
+     * a mid-loop failure would leak streams/events/cuBLAS handles allocated
+     * on devices 0..i-1 because cleanup only walks the first g_n_gpus
+     * entries. */
     for (int i = 0; i < cfg->n_gpus; i++) {
         ds4_gpu_ctx *c = &g_gpu[i];
         c->device_id = cfg->device_indices[i];
@@ -1316,8 +1322,10 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         c->used_bytes   = 0;
         c->scratch      = NULL;
         c->scratch_bytes = 0;
+        /* Context `i` is now fully initialized — publish it so cleanup can
+         * unwind on later failure. */
+        g_n_gpus = i + 1;
     }
-    g_n_gpus = cfg->n_gpus;
 
     /* NxN peer-access matrix.
      *

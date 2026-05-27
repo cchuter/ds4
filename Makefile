@@ -216,6 +216,12 @@ tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
 
 tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ tests/test_engine_mgpu_refusal.c
+
+tests/test_engine_mgpu_refusal: tests/test_engine_mgpu_refusal.o ds4_cuda.o ds4_kvstore.o rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 endif
 
 ds4_test: ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS)
