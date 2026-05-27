@@ -441,6 +441,23 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     return (const char *)dev;
 }
 
+/* Per-tier cuBLAS handle. Used by kernel-dispatch wrappers; returns the
+ * cuBLAS handle for the logical tier. The wrapper is expected to have
+ * cudaSetDevice'd to that tier's physical device already (kernels and
+ * cuBLAS calls ride the default stream and are naturally serialized).
+ *
+ * Single-tier (g_n_gpus <= 1): g_gpu[0].cublas is the same handle that the
+ * legacy g_cublas alias points at (set at ds4_gpu_init_multi line 1647).
+ * That preserves bit-identical N=1 behavior at every migrated callsite.
+ *
+ * Added for mgpu-graph-session-execution (wave 3a), sub-area 1. */
+static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
+    if (g_n_gpus <= 1 || logical_tier < 0 || logical_tier >= g_n_gpus) {
+        return (cublasHandle_t)g_gpu[0].cublas;
+    }
+    return (cublasHandle_t)g_gpu[logical_tier].cublas;
+}
+
 /* Multi-tier-aware weight pointer resolver.
  *
  * Used by kernel-dispatch wrappers in the per-layer execution path to
@@ -2516,12 +2533,21 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
-    if (g_cublas_ready) {
-        const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(g_cublas, math_mode);
+    const cublasMath_t math_mode =
+        (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+            ? CUBLAS_DEFAULT_MATH
+            : CUBLAS_TF32_TENSOR_OP_MATH;
+    /* Walk every initialized per-tier handle. Single-tier (g_n_gpus == 1)
+     * walks exactly one entry — g_gpu[0].cublas, which is the same handle
+     * the legacy g_cublas alias points at — so the SetMathMode call is
+     * bit-identical to the pre-task path. */
+    for (int i = 0; i < g_n_gpus; i++) {
+        if (!g_gpu[i].cublas_ready || !g_gpu[i].cublas) continue;
+        int prev = -1;
+        (void)cudaGetDevice(&prev);
+        (void)cudaSetDevice(g_gpu[i].device_id);
+        (void)cublasSetMathMode((cublasHandle_t)g_gpu[i].cublas, math_mode);
+        if (prev >= 0) (void)cudaSetDevice(prev);
     }
 }
 
@@ -6802,7 +6828,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         if (w_f32) {
             const float alpha = 1.0f;
             const float beta = 0.0f;
-            cublasStatus_t st = cublasSgemm(g_cublas,
+            cublasStatus_t st = cublasSgemm(cuda_cublas_for_tier(logical_tier),
                                             CUBLAS_OP_T,
                                             CUBLAS_OP_N,
                                             (int)out_dim,
@@ -6827,7 +6853,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
             const float alpha = 1.0f;
             const float beta = 0.0f;
-            cublasStatus_t st = cublasGemmEx(g_cublas,
+            cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
                                              CUBLAS_OP_T,
                                              CUBLAS_OP_N,
                                              (int)out_dim,
@@ -7072,7 +7098,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
-        cublasStatus_t st = cublasGemmEx(g_cublas,
+        cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
                                          CUBLAS_OP_T,
                                          CUBLAS_OP_N,
                                          (int)out_dim,
@@ -7174,7 +7200,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     if (g_cublas_ready && n_tok > 1) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemm(g_cublas,
+        cublasStatus_t st = cublasSgemm(cuda_cublas_for_tier(logical_tier),
                                         CUBLAS_OP_T,
                                         CUBLAS_OP_N,
                                         (int)out_dim,
@@ -7836,7 +7862,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         float *out_tmp = (float *)((char *)tmp + out_offset);
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
+        cublasStatus_t st = cublasSgemmStridedBatched(cuda_cublas_for_tier(logical_tier),
                                                       CUBLAS_OP_T,
                                                       CUBLAS_OP_N,
                                                       (int)n_keys,
@@ -7859,7 +7885,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         attention_prefill_raw_softmax_kernel<<<sgrid, 256>>>(scores, sinks, n_tokens, window, n_keys);
         if (!cuda_ok(cudaGetLastError(), "attention raw softmax launch")) return 0;
         const float one = 1.0f;
-        st = cublasSgemmStridedBatched(g_cublas,
+        st = cublasSgemmStridedBatched(cuda_cublas_for_tier(logical_tier),
                                        CUBLAS_OP_N,
                                        CUBLAS_OP_N,
                                        (int)head_dim,
@@ -8220,7 +8246,7 @@ static int attention_prefill_mixed_launch(
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
+        cublasStatus_t st = cublasSgemmStridedBatched(cuda_cublas_for_tier(logical_tier),
                                                       CUBLAS_OP_T,
                                                       CUBLAS_OP_N,
                                                       (int)n_keys,
@@ -8252,7 +8278,7 @@ static int attention_prefill_mixed_launch(
                 n_keys);
         if (!cuda_ok(cudaGetLastError(), "attention mixed softmax launch")) return 0;
         const float one = 1.0f;
-        st = cublasSgemmStridedBatched(g_cublas,
+        st = cublasSgemmStridedBatched(cuda_cublas_for_tier(logical_tier),
                                        CUBLAS_OP_N,
                                        CUBLAS_OP_N,
                                        (int)head_dim,
@@ -8406,7 +8432,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a pack launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
-        cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+        cublasStatus_t st = cublasGemmStridedBatchedEx(cuda_cublas_for_tier(logical_tier),
                                                        CUBLAS_OP_T,
                                                        CUBLAS_OP_N,
                                                        (int)rank,
