@@ -175,7 +175,7 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_kvstore.h linenoise.h
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
