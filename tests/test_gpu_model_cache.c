@@ -12,6 +12,7 @@
 #include "ds4_gpu.h"
 
 #include <cuda_runtime.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,6 +78,18 @@ int main(void) {
 
     /* Convenience wrapper. */
     CHECK(ds4_gpu_lookup_cache_device(0, 1024) == 0, "lookup_device range 0");
+
+    /* Bounds-check: ranges that overflow the model must be rejected
+     * before any allocation. */
+    ds4_tensor_range bad_overflow = { 0, total + 1, 0 };
+    CHECK(ds4_gpu_device_cache_tensors(0, &bad_overflow, 1) != 0,
+          "overflow range rejected");
+    ds4_tensor_range bad_offset = { total + 1, 16, 0 };
+    CHECK(ds4_gpu_device_cache_tensors(0, &bad_offset, 1) != 0,
+          "out-of-range offset rejected");
+    ds4_tensor_range bad_wrap = { total - 4, UINT64_MAX, 0 };
+    CHECK(ds4_gpu_device_cache_tensors(0, &bad_wrap, 1) != 0,
+          "wrap-around range rejected");
 
     /* Gap not covered by selective ranges. The legacy chunked path may
      * happen to cover it (it caches the whole model span); accept either

@@ -1263,6 +1263,20 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas_ready = 0;
         g_cublas = NULL;
     }
+    /* Per-device selective cache teardown (mgpu-selective-model-cache). */
+    for (int d = 0; d < DS4_MAX_GPUS; d++) {
+        if (!g_dev_cache[d].present) continue;
+        int prev = -1;
+        (void)cudaGetDevice(&prev);
+        (void)cudaSetDevice(d);
+        if (g_dev_cache[d].base) (void)cudaFree(g_dev_cache[d].base);
+        g_dev_cache[d].base = NULL;
+        g_dev_cache[d].bytes = 0;
+        g_dev_cache[d].present = 0;
+        if (prev >= 0) (void)cudaSetDevice(prev);
+    }
+    g_cache_ranges.clear();
+
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -1555,14 +1569,27 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
     if (n_ranges < 0 || (!ranges && n_ranges > 0)) return 2;
     if (n_ranges == 0) return 0;
 
-    /* Sum bytes targeting this device. */
+    if (!g_model_host_base || g_model_registered_size == 0) return 3;
+
+    /* Validate ranges against the mmap'd model bounds; reject ranges
+     * that overflow or extend past the mapped region. Done in a
+     * separate pass before any allocation so a bad input doesn't
+     * partially grow the slab. */
     uint64_t want_bytes = 0;
     for (int i = 0; i < n_ranges; i++) {
-        if (ranges[i].target_device == device_id) want_bytes += ranges[i].bytes;
+        if (ranges[i].target_device != device_id) continue;
+        const uint64_t off = ranges[i].source_offset;
+        const uint64_t nb  = ranges[i].bytes;
+        /* Overflow-safe upper bound: off + nb must not exceed model
+         * size, and the sum must not wrap. */
+        if (nb == 0) continue;
+        if (off > g_model_registered_size) return 8;
+        if (nb > g_model_registered_size - off) return 9;
+        /* Accumulate into want_bytes with overflow check. */
+        if (want_bytes > UINT64_MAX - nb) return 10;
+        want_bytes += nb;
     }
     if (want_bytes == 0) return 0;
-
-    if (!g_model_host_base) return 3;  /* set_model_map must have run */
 
     cuda_device_cache &c = g_dev_cache[device_id];
 
