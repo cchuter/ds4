@@ -230,6 +230,13 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
+
+/* Forward declaration: defined later in this file. The resolver wrapper
+ * below uses it for multi-tier dispatch. */
+extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
+                                            uint64_t bytes,
+                                            int      expected_device,
+                                            void   **out_device_ptr);
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
         const unsigned char *w,
@@ -378,6 +385,65 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return (const char *)dev;
+}
+
+/* Multi-tier-aware weight pointer resolver.
+ *
+ * Used by kernel-dispatch wrappers in the per-layer execution path to
+ * obtain a device pointer for a weight slice on the layer's logical
+ * tier. Behavior:
+ *
+ *   - When g_n_gpus <= 1 (single-tier engine), delegates to the existing
+ *     cuda_model_range_ptr path. This short-circuit guarantees byte-
+ *     identical behavior to pre-multi-tier code for the gpu_cfg == NULL
+ *     case.
+ *
+ *   - When g_n_gpus >= 2 (multi-tier engine), translates the logical
+ *     tier index to the corresponding physical CUDA device id via
+ *     g_gpu[logical_tier].device_id and looks up the slice strictly
+ *     in the per-device selective cache via ds4_gpu_lookup_cache_strict.
+ *     On miss, logs a diagnostic and returns NULL (no host-pointer
+ *     fallback — a miss here is a placement/install bug).
+ *
+ * The caller is responsible for cudaSetDevice'ing to the right physical
+ * device before launching the kernel that consumes the returned pointer.
+ * Wrappers in this file thread `int logical_tier` from the dispatch
+ * caller; single-tier callers pass 0, which hits the short-circuit.
+ *
+ * Added for mgpu-graph-session-execution (wave 3a), sub-area 3 of the
+ * spec. */
+/* __attribute__((unused)) is deliberate: this helper is introduced in
+ * step A2 of mgpu-graph-session-execution and its 38 in-wrapper callsites
+ * get migrated in follow-up commits. Marking unused suppresses the NVCC
+ * warning until the migration commit lands. */
+__attribute__((unused))
+static const char *cuda_resolve_weight_ptr(const void *model_map,
+                                            uint64_t offset,
+                                            uint64_t bytes,
+                                            int logical_tier,
+                                            const char *label) {
+    if (g_n_gpus <= 1) {
+        return cuda_model_range_ptr(model_map, offset, bytes, label);
+    }
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) {
+        fprintf(stderr,
+            "ds4: cuda_resolve_weight_ptr: bad tier %d (n_gpus=%d, label=%s)\n",
+            logical_tier, g_n_gpus, label ? label : "?");
+        return NULL;
+    }
+    const int physical_device = g_gpu[logical_tier].device_id;
+    void *dev_ptr = NULL;
+    if (!ds4_gpu_lookup_cache_strict(offset, bytes, physical_device, &dev_ptr)
+        || !dev_ptr) {
+        fprintf(stderr,
+            "ds4: selective-cache miss for offset=%llu bytes=%llu on "
+            "logical_tier=%d (physical_device=%d, label=%s); this is a "
+            "placement/cache-install bug\n",
+            (unsigned long long)offset, (unsigned long long)bytes,
+            logical_tier, physical_device, label ? label : "?");
+        return NULL;
+    }
+    return (const char *)dev_ptr;
 }
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
