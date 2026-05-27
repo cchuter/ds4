@@ -90,7 +90,21 @@ static int g_quality_mode;
 
 /* =========================================================================
  * Per-device selective model cache (mgpu-selective-model-cache).
- * ========================================================================= */
+ *
+ * The public API in ds4_gpu.h declares ds4_tensor_range and the
+ * device_cache_tensors / lookup_cache entry points. ds4_cuda.cu does NOT
+ * include ds4_gpu.h historically (a pre-existing project convention), so
+ * we redeclare the struct here with the same layout the header uses.
+ * The implementation links by C linkage; struct compatibility is by
+ * field layout. */
+typedef struct {
+    uint64_t source_offset;
+    uint64_t bytes;
+    int      target_device;
+} ds4_tensor_range;
+#ifndef DS4_MAX_GPUS
+#define DS4_MAX_GPUS 16
+#endif
 
 struct cuda_device_cache {
     void   *base;     /* device-side slab base */
