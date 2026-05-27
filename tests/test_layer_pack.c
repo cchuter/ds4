@@ -250,16 +250,21 @@ static void test_print_golden(void) {
     size_t used[2]   = {10ull * 1073741824ull, 10ull * 1073741824ull};
     size_t budget[2] = {20ull * 1073741824ull, 20ull * 1073741824ull};
 
+    /* Portable golden capture: tmpfile() + rewind + fread. fmemopen is
+     * a glibc extension and may not be available on every host that
+     * builds the CPU-only target. */
     char buf[1024];
-    FILE *f = fmemopen(buf, sizeof(buf), "w");
-    CHECK(f != NULL, "fmemopen");
+    memset(buf, 0, sizeof(buf));
+    FILE *f = tmpfile();
+    CHECK(f != NULL, "tmpfile");
     if (!f) return;
     ds4_layer_pack_print(f, dev, n_entries, n_layers, entry_bytes,
                           used, budget, 2);
     fflush(f);
-    long pos = ftell(f);
+    rewind(f);
+    size_t n_read = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n_read] = '\0';
     fclose(f);
-    buf[pos < (long)sizeof(buf) ? pos : (long)sizeof(buf) - 1] = '\0';
 
     const char *expected =
         "multi-GPU layout:\n"
