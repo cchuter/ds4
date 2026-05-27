@@ -14,3 +14,14 @@
 /misc/
 .*.swp
 .DS_Store
+
+# claude-dev-team (workspace + symlinks into it; never include in PRs)
+/.dev-team/
+/dev-team.json
+/tasks
+/.claude/skills/
+/.claude/agents
+/docs/plans
+/tests/ui
+/tests/api
+/tests/reports
