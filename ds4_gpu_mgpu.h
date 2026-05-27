@@ -44,9 +44,19 @@ struct ds4_gpu_tensor {
 };
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
-typedef struct {
+/* Tagged so headers (notably ds4.h) can forward-declare `struct
+ * ds4_gpu_config` without dragging in this entire header. */
+typedef struct ds4_gpu_config {
     int    device_indices[DS4_MAX_GPUS];   /* CUDA device IDs to use */
-    size_t vram_bytes[DS4_MAX_GPUS];       /* per-device budget; 0 = unset */
+    /* Explicit per-device budget in bytes. The engine does NOT auto-fill
+     * missing budgets - a value of 0 means "zero bytes of budget for
+     * this slot" and (combined with reserves) will push placement to
+     * CPU spill. Auto-detection (e.g. mapping --gpu-vram auto to
+     * cudaMemGetInfo) is the caller's job; see mgpu-cli-wiring for the
+     * canonical CLI path. The engine emits a clear stderr and refuses
+     * if n_gpus > 0 and every vram_bytes[] is 0 (almost certainly a
+     * caller bug from zero-initializing the struct). */
+    size_t vram_bytes[DS4_MAX_GPUS];
     int    n_gpus;
     size_t safety_margin_bytes;            /* per-device reserve */
 } ds4_gpu_config;
@@ -86,6 +96,30 @@ int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
 
 /* Returns the device_id recorded on the tensor; -1 if untagged. */
 int ds4_gpu_tensor_device(const ds4_gpu_tensor *t);
+
+/* Set the current CUDA device by LOGICAL tier index (0..g_n_gpus-1).
+ *
+ * This is the canonical shim for per-layer device routing in the
+ * multi-tier execution path. The caller passes a logical tier index;
+ * the shim internally indexes g_gpu[tier].device_id and calls
+ * cudaSetDevice. Returns 0 on success, nonzero on error or if the
+ * tier index is out of range.
+ *
+ * Wave-2 mgpu-graph-session-placement adds this shim but does not
+ * exercise the multi-tier execution path; mgpu-graph-session-execution
+ * (follow-up) is its first caller. */
+int ds4_gpu_set_current_device(int logical_tier);
+
+/* Register the mmap'd host model pointer for selective-cache lookups
+ * WITHOUT triggering any device-side copy. This bypasses the
+ * DS4_CUDA_COPY_MODEL environment-variable branch that
+ * ds4_gpu_set_model_map normally honors, which is essential for
+ * multi-tier startup: we want only per-device selective tensor caches,
+ * never the whole-model copy. Returns 1 on success, 0 on error.
+ *
+ * Added for mgpu-graph-session-placement (wave 2) per codex
+ * plan-review round 3 finding #1. */
+int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size);
 
 #ifdef __cplusplus
 } /* extern "C" */

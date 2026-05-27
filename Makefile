@@ -166,6 +166,19 @@ tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
 tests/test_layer_pack: tests/test_layer_pack.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+# Wave-2 mgpu-graph-session-placement test. Builds ds4.c with both
+# DS4_NO_GPU (no Metal/CUDA dependencies) and DS4_TEST_HOOKS (exposes
+# the placement-helper hooks). CPU-only build target so it runs on
+# both Mac and the box without GPU.
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
+
+tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_engine_mgpu_placement.c
+
+tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
@@ -203,6 +216,12 @@ tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
 
 tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ tests/test_engine_mgpu_refusal.c
+
+tests/test_engine_mgpu_refusal: tests/test_engine_mgpu_refusal.o ds4_cuda.o ds4_kvstore.o rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 endif
 
 ds4_test: ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -212,9 +231,10 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test tests/test_layer_pack
+test: ds4_test tests/test_layer_pack tests/test_engine_mgpu_placement
 	./ds4_test
 	./tests/test_layer_pack
+	./tests/test_engine_mgpu_placement
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_layer_pack tests/test_layer_pack.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_layer_pack tests/test_layer_pack.o tests/test_engine_mgpu_placement tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o
