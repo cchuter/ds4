@@ -48,7 +48,15 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
  * ds4_gpu_config` without dragging in this entire header. */
 typedef struct ds4_gpu_config {
     int    device_indices[DS4_MAX_GPUS];   /* CUDA device IDs to use */
-    size_t vram_bytes[DS4_MAX_GPUS];       /* per-device budget; 0 = unset */
+    /* Explicit per-device budget in bytes. The engine does NOT auto-fill
+     * missing budgets - a value of 0 means "zero bytes of budget for
+     * this slot" and (combined with reserves) will push placement to
+     * CPU spill. Auto-detection (e.g. mapping --gpu-vram auto to
+     * cudaMemGetInfo) is the caller's job; see mgpu-cli-wiring for the
+     * canonical CLI path. The engine emits a clear stderr and refuses
+     * if n_gpus > 0 and every vram_bytes[] is 0 (almost certainly a
+     * caller bug from zero-initializing the struct). */
+    size_t vram_bytes[DS4_MAX_GPUS];
     int    n_gpus;
     size_t safety_margin_bytes;            /* per-device reserve */
 } ds4_gpu_config;

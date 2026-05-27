@@ -87,6 +87,24 @@ static void test_tensor_to_entry(void) {
     memcpy(buf, "mtp.0.foo", 9);
     CHECK(ds4_test_tensor_to_entry(buf, 9) == 44, "mtp.* -> head");
 
+    /* "output_hc_*.weight" -> entry 44 (head bucket). Regression for review
+     * finding that the three output_hc_ tensors were falling through to
+     * entry 0 (embedding tier) instead of the head tier. */
+    memcpy(buf, "output_hc_base.weight", 21);
+    CHECK(ds4_test_tensor_to_entry(buf, 21) == 44, "output_hc_base.weight -> head");
+    memcpy(buf, "output_hc_fn.weight", 19);
+    CHECK(ds4_test_tensor_to_entry(buf, 19) == 44, "output_hc_fn.weight -> head");
+    memcpy(buf, "output_hc_scale.weight", 22);
+    CHECK(ds4_test_tensor_to_entry(buf, 22) == 44, "output_hc_scale.weight -> head");
+    /* "output.weight" / "output_norm.weight" still classified to head. */
+    memcpy(buf, "output.weight", 13);
+    CHECK(ds4_test_tensor_to_entry(buf, 13) == 44, "output.weight -> head");
+    memcpy(buf, "output_norm.weight", 18);
+    CHECK(ds4_test_tensor_to_entry(buf, 18) == 44, "output_norm.weight -> head");
+    /* "token_embd.weight" stays at embedding (entry 0). */
+    memcpy(buf, "token_embd.weight", 17);
+    CHECK(ds4_test_tensor_to_entry(buf, 17) == 0, "token_embd.weight -> embedding");
+
     /* Bounded parsing: pass a long buffer with garbage past name_len. */
     const char with_trailing[] = "blk.5.attn_norm.weightTRAILINGGARBAGE";
     CHECK(ds4_test_tensor_to_entry(with_trailing, 22) == 6,
@@ -232,11 +250,36 @@ static void test_cpu_spill(void) {
     CHECK(any_cpu, "at least one CPU spill entry");
 }
 
+static void test_zero_budget_guard(void) {
+    fprintf(stderr, "RUN: test_zero_budget_guard\n");
+    ds4_test_fake_tensor tensors[256];
+    int n = build_synthetic_model(tensors, 256);
+    if (n <= 0) return;
+
+    /* Regression for review finding: zero-init ds4_gpu_config with only
+     * n_gpus and device_indices populated must be rejected at classify
+     * time, not silently classified as all-CPU. */
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 0;
+    cfg.device_indices[1] = 1;
+    /* vram_bytes[] intentionally left at zero. */
+
+    int placement[DS4_N_ENTRIES];
+    int multi_tier = 0;
+    int n_entries = 0;
+    int rc = ds4_test_classify_multi_tier(tensors, n, &cfg,
+                                           placement, &multi_tier, &n_entries);
+    CHECK(rc != 0, "classify rejects all-zero vram_bytes");
+}
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
     test_forced_two_tier_no_spill();
     test_cpu_spill();
+    test_zero_budget_guard();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
             g_checks - g_failures, g_checks, g_failures);

@@ -18316,13 +18316,23 @@ static int tensor_to_entry(const ds4_tensor *t, int n_layer) {
         }
         return 0;
     }
-    /* "output.weight" / "output_norm.weight" -> head bucket. */
+    /* Output-head tensors -> head bucket. weights_bind() requires six
+     * top-level tensors: token_embd (embedding), and five head-tier
+     * tensors output, output_norm, plus three output_hc_* (the
+     * heavily-compressed head's base / fn / scale). All five live on the
+     * output-head tier; missing any of them here would mis-size the
+     * embedding bucket and the head bucket for the packer. */
     static const char k_output[] = "output.weight";
     static const char k_output_norm[] = "output_norm.weight";
+    static const char k_output_hc[] = "output_hc_";
     if (n == (int)sizeof(k_output) - 1 && memcmp(p, k_output, n) == 0) {
         return n_layer + 1;
     }
     if (n == (int)sizeof(k_output_norm) - 1 && memcmp(p, k_output_norm, n) == 0) {
+        return n_layer + 1;
+    }
+    if (n >= (int)sizeof(k_output_hc) - 1 &&
+        memcmp(p, k_output_hc, sizeof(k_output_hc) - 1) == 0) {
         return n_layer + 1;
     }
     /* "mtp." prefix -> head bucket (no current code path loads MTP into
@@ -18376,6 +18386,24 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
         return 0;
     }
     if (cfg->n_gpus <= 0 || cfg->n_gpus > DS4_LAYER_PACK_MAX_GPUS) return -1;
+
+    /* Caller-bug guard: ds4_gpu_config has no auto-detect; a zero-init
+     * struct with only n_gpus and device_indices populated would
+     * classify every entry as CPU spill and the engine would refuse.
+     * That outcome is never useful, so reject it loudly. Auto-detection
+     * belongs in the CLI layer (mgpu-cli-wiring maps --gpu-vram auto to
+     * cudaMemGetInfo before constructing the config). */
+    size_t total_budget = 0;
+    for (int d = 0; d < cfg->n_gpus; d++) total_budget += cfg->vram_bytes[d];
+    if (total_budget == 0) {
+        fprintf(stderr,
+                "ds4: ds4_gpu_config has n_gpus=%d but every vram_bytes[d]==0; "
+                "caller must populate explicit budgets (auto-detect is the CLI's "
+                "job, not the engine's)\n",
+                cfg->n_gpus);
+        return -1;
+    }
+
     e->gpu_cfg = *cfg;
 
     size_t entry_bytes[DS4_N_LAYER + 2];
