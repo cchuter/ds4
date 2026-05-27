@@ -1350,6 +1350,10 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
             (void)cudaFree(src_dev);
 
             g_gpu_peer_ok[i][j] = peer_validated;
+            fprintf(stderr,
+                "ds4: peer %d->%d: copy_status=%s validated=%d\n",
+                g_gpu[i].device_id, g_gpu[j].device_id,
+                cudaGetErrorString(pc), peer_validated);
             if (!peer_validated) {
                 fprintf(stderr,
                     "ds4: peer access %d->%d enabled but validation copy"
