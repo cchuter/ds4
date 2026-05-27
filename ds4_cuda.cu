@@ -1313,48 +1313,108 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
             (void)cudaGetLastError();
             if (!enabled) { g_gpu_peer_ok[i][j] = 0; continue; }
 
-            /* Runtime validation: round-trip 128 bytes. If they don't
-             * match, the driver is silently wrong about peer support. */
-            const size_t VBYTES = 128;
-            unsigned char host_src[VBYTES];
-            unsigned char host_dst[VBYTES];
-            for (size_t k = 0; k < VBYTES; k++) host_src[k] = (unsigned char)((k * 13 + 7) & 0xff);
+            /* Runtime validation: peer copies on RTX 6000 Ada under recent
+             * NVIDIA drivers silently corrupt at realistic sizes even though
+             * the API returns success. cudaDeviceCanAccessPeer and
+             * cudaDeviceEnablePeerAccess can both report success while
+             * cudaMemcpyPeer delivers wrong data non-deterministically.
+             * Probe with multiple sizes and iterations; ALL must round-trip
+             * byte-perfect or we disable peer for this pair and silently fall
+             * back to the pinned-host bounce path. */
+            static const size_t kValidateSizes[] = {
+                4u * 1024u,
+                256u * 1024u,
+                1u * 1024u * 1024u,
+                16u * 1024u * 1024u,
+            };
+            const int kValidateIters    = 4;
+            const int kNValidateSizes   = (int)(sizeof(kValidateSizes) /
+                                                sizeof(kValidateSizes[0]));
+            const size_t kMaxValidate   = kValidateSizes[kNValidateSizes - 1];
+
+            unsigned char *vh_src = (unsigned char *)malloc(kMaxValidate);
+            unsigned char *vh_dst = (unsigned char *)malloc(kMaxValidate);
+            if (!vh_src || !vh_dst) {
+                free(vh_src); free(vh_dst);
+                g_gpu_peer_ok[i][j] = 0; continue;
+            }
+
             void *src_dev = NULL; void *dst_dev = NULL;
             (void)cudaSetDevice(g_gpu[i].device_id);
-            if (cudaMalloc(&src_dev, VBYTES) != cudaSuccess) {
+            if (cudaMalloc(&src_dev, kMaxValidate) != cudaSuccess) {
                 (void)cudaGetLastError();
+                free(vh_src); free(vh_dst);
                 g_gpu_peer_ok[i][j] = 0; continue;
             }
             (void)cudaSetDevice(g_gpu[j].device_id);
-            if (cudaMalloc(&dst_dev, VBYTES) != cudaSuccess) {
+            if (cudaMalloc(&dst_dev, kMaxValidate) != cudaSuccess) {
                 (void)cudaGetLastError();
                 (void)cudaSetDevice(g_gpu[i].device_id);
                 (void)cudaFree(src_dev);
+                free(vh_src); free(vh_dst);
                 g_gpu_peer_ok[i][j] = 0; continue;
             }
-            (void)cudaSetDevice(g_gpu[i].device_id);
-            (void)cudaMemcpy(src_dev, host_src, VBYTES, cudaMemcpyHostToDevice);
-            cudaError_t pc = cudaMemcpyPeer(dst_dev, g_gpu[j].device_id,
-                                            src_dev, g_gpu[i].device_id, VBYTES);
-            int peer_validated = 0;
-            if (pc == cudaSuccess) {
-                (void)cudaSetDevice(g_gpu[j].device_id);
-                if (cudaMemcpy(host_dst, dst_dev, VBYTES, cudaMemcpyDeviceToHost)
-                    == cudaSuccess) {
-                    peer_validated = (memcmp(host_src, host_dst, VBYTES) == 0);
+
+            int    peer_validated = 1;
+            size_t failed_bytes   = 0;
+            int    failed_iter    = -1;
+            for (int s_idx = 0;
+                 s_idx < kNValidateSizes && peer_validated;
+                 s_idx++) {
+                size_t n = kValidateSizes[s_idx];
+                for (int it = 0; it < kValidateIters && peer_validated; it++) {
+                    for (size_t k = 0; k < n; k++) {
+                        vh_src[k] = (unsigned char)
+                            ((k * 31u + (size_t)it * 17u +
+                              (size_t)s_idx * 53u + 11u) & 0xffu);
+                    }
+                    (void)cudaSetDevice(g_gpu[i].device_id);
+                    if (cudaMemcpy(src_dev, vh_src, n,
+                                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        peer_validated = 0; failed_bytes = n; failed_iter = it;
+                        break;
+                    }
+                    cudaError_t pc = cudaMemcpyPeer(
+                        dst_dev, g_gpu[j].device_id,
+                        src_dev, g_gpu[i].device_id, n);
+                    if (pc != cudaSuccess) {
+                        peer_validated = 0; failed_bytes = n; failed_iter = it;
+                        break;
+                    }
+                    (void)cudaSetDevice(g_gpu[j].device_id);
+                    if (cudaMemcpy(vh_dst, dst_dev, n,
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        peer_validated = 0; failed_bytes = n; failed_iter = it;
+                        break;
+                    }
+                    if (memcmp(vh_src, vh_dst, n) != 0) {
+                        peer_validated = 0; failed_bytes = n; failed_iter = it;
+                        break;
+                    }
                 }
             }
+
             (void)cudaSetDevice(g_gpu[j].device_id);
             (void)cudaFree(dst_dev);
             (void)cudaSetDevice(g_gpu[i].device_id);
             (void)cudaFree(src_dev);
+            free(vh_src);
+            free(vh_dst);
 
             g_gpu_peer_ok[i][j] = peer_validated;
-            if (!peer_validated) {
+            if (peer_validated) {
                 fprintf(stderr,
-                    "ds4: peer access %d->%d enabled but validation copy"
-                    " produced wrong data; falling back to pinned-host bounce\n",
-                    g_gpu[i].device_id, g_gpu[j].device_id);
+                    "ds4: peer access %d->%d validated across %d sizes x %d"
+                    " iterations (max %zu MiB)\n",
+                    g_gpu[i].device_id, g_gpu[j].device_id,
+                    kNValidateSizes, kValidateIters,
+                    kMaxValidate / (1024u * 1024u));
+            } else {
+                fprintf(stderr,
+                    "ds4: peer access %d->%d FAILED validation at"
+                    " size=%zu iter=%d; falling back to pinned-host bounce\n",
+                    g_gpu[i].device_id, g_gpu[j].device_id,
+                    failed_bytes, failed_iter);
             }
         }
     }
@@ -1665,8 +1725,12 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return ok;
 }
 
-/* Cross-device copy primitive. Honors DS4_FORCE_HOST_BOUNCE=1 to force the
- * pinned-host bounce path even when peer access is available. */
+/* Cross-device copy primitive. Path selection (highest priority first):
+ *   DS4_FORCE_HOST_BOUNCE=1  -> always pinned-host bounce
+ *   DS4_FORCE_CUDA_PEER=1    -> always cudaMemcpyPeerAsync (manual-testing
+ *                               override; bypasses g_gpu_peer_ok)
+ *   otherwise                -> peer if validation passed at init, else
+ *                               pinned-host bounce. */
 extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
                                         const ds4_gpu_tensor *src,
                                         uint64_t bytes) {
@@ -1691,6 +1755,7 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
     }
 
     int peer = g_gpu_peer_ok[sd][dd];
+    if (getenv("DS4_FORCE_CUDA_PEER"))   peer = 1;
     if (getenv("DS4_FORCE_HOST_BOUNCE")) peer = 0;
 
     if (peer) {
