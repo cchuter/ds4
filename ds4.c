@@ -36,8 +36,70 @@
 
 #include "ds4.h"
 
+/* Wave-2 multi-GPU types are needed in every build because the engine
+ * struct embeds ds4_gpu_config and the placement table. ds4_layer_pack.h
+ * is included unconditionally for the same reason (engine helpers call
+ * the packer in multi-tier mode, but the headers are tiny and C-safe). */
+#include "ds4_layer_pack.h"
+#include "ds4_gpu_mgpu.h"
+
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#endif
+
+/* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
+ * stubs for the wave-1/2 multi-GPU functions and globals declared in
+ * ds4_gpu_mgpu.h. These keep the linker happy on Mac/Metal and on CPU
+ * builds. None of these are reached at runtime in non-CUDA builds
+ * because multi_tier == 1 requires graph_backend == true which on
+ * non-CUDA paths means Metal, and the multi-tier branch only fires
+ * when the caller supplied a non-NULL gpu_cfg — which only the new
+ * ds4_engine_create_with_gpu_config can do, and no Metal caller does.
+ *
+ * We key off __APPLE__ + DS4_NO_GPU rather than the inverse of CUDA
+ * because there's no positive "is CUDA build" macro and ds4_cuda.cu
+ * is only compiled in the non-Apple, non-DS4_NO_GPU configuration. */
+/* Apple (Metal) build: ds4_cuda.cu is not linked, but the engine compiles
+ * code referencing some wave-2 symbols inside dead multi-tier branches.
+ * Provide stubs so the linker is happy. CPU-only (DS4_NO_GPU) builds
+ * never reach the multi-tier branches and never include ds4_gpu.h, so
+ * we cannot reference ds4_tensor_range there — those stubs are guarded
+ * by !DS4_NO_GPU below. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_set_current_device(int logical_tier) { (void)logical_tier; return -1; }
+int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
+    (void)model_map; (void)model_size; return 0;
+}
+int ds4_gpu_device_cache_tensors(int device_id,
+                                  const ds4_tensor_range *ranges,
+                                  int n_ranges) {
+    (void)device_id; (void)ranges; (void)n_ranges; return 1;
+}
+int ds4_gpu_init_multi(const ds4_gpu_config *cfg) { (void)cfg; return -1; }
+int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes) {
+    (void)t; (void)device_id; (void)bytes; return -1;
+}
+void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) { (void)t; }
+int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
+                              const ds4_gpu_tensor *src,
+                              uint64_t bytes) {
+    (void)dst; (void)src; (void)bytes; return -1;
+}
+int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) { (void)t; return -1; }
+ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
+int         g_n_gpus = 0;
+int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+#endif
+
+#if defined(DS4_NO_GPU)
+/* CPU-only build: even though no multi-tier code is reached, the engine
+ * struct still embeds ds4_gpu_config and the global decls in
+ * ds4_gpu_mgpu.h need matching definitions. We do not stub the
+ * function symbols here because no caller references them in CPU
+ * builds (every callsite is inside !DS4_NO_GPU). */
+ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
+int         g_n_gpus = 0;
+int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -15420,6 +15482,16 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+
+    /* Wave-2 mgpu-graph-session-placement: optional multi-GPU placement
+     * state. Zero-initialized for every existing caller (gpu_cfg == NULL)
+     * via xcalloc, so the single-tier path observes identical engine
+     * state to pre-wave-2 main. multi_tier == 1 is the gate for all
+     * new code paths. */
+    ds4_gpu_config gpu_cfg;
+    int            placement[DS4_N_LAYER + 2];
+    int            n_placement_entries;
+    int            multi_tier;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -18206,7 +18278,379 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+/* =========================================================================
+ * Wave-2 mgpu-graph-session-placement: engine placement helpers.
+ * =========================================================================
+ *
+ * These helpers compute and install the multi-GPU layer placement table.
+ * They are reached only when ds4_engine_create_with_gpu_config is called
+ * with a non-NULL ds4_gpu_config. When the caller passes NULL (every
+ * existing caller — ds4_engine_open shim, ds4_test, ds4_cli, ds4_server,
+ * ds4_bench, ds4_eval, ds4_agent), these helpers are not invoked and the
+ * engine state is byte-equivalent to the pre-wave-2 main branch.
+ */
+
+/* Classify each model tensor by its placement entry.
+ *
+ * Tensor names live in ds4_str slices (ptr+len), NOT NUL-terminated.
+ * We bound every comparison by name.len to avoid out-of-buffer reads
+ * (codex plan-review round 2 finding #5). */
+static int tensor_to_entry(const ds4_tensor *t, int n_layer) {
+    const char *p = t->name.ptr;
+    int n = (int)t->name.len;
+    if (n <= 0 || !p) return 0;
+
+    /* "blk.<digits>." prefix -> entry il + 1. */
+    if (n >= 5 && memcmp(p, "blk.", 4) == 0) {
+        int i = 4;
+        int il = 0;
+        int digits = 0;
+        while (i < n && p[i] >= '0' && p[i] <= '9') {
+            if (digits >= 4) return 0;
+            il = il * 10 + (p[i] - '0');
+            digits++;
+            i++;
+        }
+        if (digits > 0 && i < n && p[i] == '.' && il >= 0 && il < n_layer) {
+            return il + 1;
+        }
+        return 0;
+    }
+    /* "output.weight" / "output_norm.weight" -> head bucket. */
+    static const char k_output[] = "output.weight";
+    static const char k_output_norm[] = "output_norm.weight";
+    if (n == (int)sizeof(k_output) - 1 && memcmp(p, k_output, n) == 0) {
+        return n_layer + 1;
+    }
+    if (n == (int)sizeof(k_output_norm) - 1 && memcmp(p, k_output_norm, n) == 0) {
+        return n_layer + 1;
+    }
+    /* "mtp." prefix -> head bucket (no current code path loads MTP into
+     * e->model, but harmless). */
+    if (n >= 4 && memcmp(p, "mtp.", 4) == 0) return n_layer + 1;
+
+    /* token_embd.weight and everything else falls into entry 0. */
+    return 0;
+}
+
+/* Compute per-entry byte footprint estimates. Walks the tensor table once
+ * and adds each tensor's bytes to its entry bucket. Also adds a per-layer
+ * KV/scratch estimate so the packer's budget math reflects runtime
+ * requirements (not just weight bytes). Returns 0 on success. */
+static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
+    const int n_entries = DS4_N_LAYER + 2;
+    for (int i = 0; i < n_entries; i++) out[i] = 0;
+
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const ds4_tensor *t = &e->model.tensors[i];
+        if (t->bytes == 0) continue;
+        int entry = tensor_to_entry(t, DS4_N_LAYER);
+        if (entry < 0 || entry >= n_entries) entry = 0;
+        out[entry] += t->bytes;
+    }
+
+    /* Per-layer KV/scratch estimate at a conservative context size.
+     * mgpu-bench-qa will tune this; the packer just needs the per-entry
+     * numbers to be self-consistent. */
+    const int est_ctx = 4096;
+    ds4_context_memory mem = ds4_context_memory_estimate(DS4_BACKEND_CUDA, est_ctx);
+    if (mem.total_bytes > 0) {
+        const size_t per_layer_kv = (size_t)(mem.total_bytes / (uint64_t)DS4_N_LAYER);
+        for (int i = 1; i <= DS4_N_LAYER; i++) out[i] += per_layer_kv;
+    } else {
+        /* Fallback: 128 MiB per layer as a static estimate. */
+        const size_t fallback_per_layer = (size_t)128ull * 1024ull * 1024ull;
+        for (int i = 1; i <= DS4_N_LAYER; i++) out[i] += fallback_per_layer;
+    }
+    return 0;
+}
+
+/* Phase A: classify multi-tier on a freshly-opened engine (model loaded,
+ * weights bound). Pure CPU — no GPU init required. Sets e->multi_tier,
+ * e->n_placement_entries, e->placement[], and e->gpu_cfg. Returns 0 on
+ * success. NULL config is a no-op. */
+static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) {
+    if (!cfg) {
+        e->multi_tier = 0;
+        e->n_placement_entries = 0;
+        return 0;
+    }
+    if (cfg->n_gpus <= 0 || cfg->n_gpus > DS4_LAYER_PACK_MAX_GPUS) return -1;
+    e->gpu_cfg = *cfg;
+
+    size_t entry_bytes[DS4_N_LAYER + 2];
+    if (engine_compute_entry_bytes(e, entry_bytes) != 0) return -1;
+
+    ds4_layer_pack_config pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.n_gpus = cfg->n_gpus;
+    const size_t cublas_workspace_overhead = (size_t)64ull * 1024ull * 1024ull;
+    for (int d = 0; d < cfg->n_gpus; d++) {
+        size_t budget = cfg->vram_bytes[d];
+        size_t reserve = cfg->safety_margin_bytes + cublas_workspace_overhead;
+        pcfg.gpu_budget_bytes[d] = budget > reserve ? budget - reserve : 0;
+    }
+
+    if (ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg,
+                                     e->placement) != 0) {
+        return -1;
+    }
+    e->n_placement_entries = DS4_N_LAYER + 2;
+
+    int first_tier = e->placement[0];
+    int multi_tier = 0;
+    for (int i = 1; i < e->n_placement_entries; i++) {
+        if (e->placement[i] != first_tier) { multi_tier = 1; break; }
+    }
+    if (!multi_tier) {
+        for (int i = 0; i < e->n_placement_entries; i++) {
+            if (e->placement[i] == DS4_LAYER_PACK_CPU) { multi_tier = 1; break; }
+        }
+    }
+    e->multi_tier = multi_tier;
+    return 0;
+}
+
+#ifndef DS4_NO_GPU
+/* Install per-device selective caches for GPU-placed tensors. Skips any
+ * tensor whose entry is placed on CPU — that case must be rejected at a
+ * higher level for this PR (execution wiring not yet shipped). */
+static int engine_install_per_device_caches(ds4_engine *e) {
+    /* Prereq: register the host model map so ds4_gpu_device_cache_tensors
+     * can resolve g_model_host_base. We use the no-copy variant so
+     * DS4_CUDA_COPY_MODEL cannot reintroduce a full-model copy that would
+     * defeat the per-device selective cache (codex plan-review round 3
+     * finding #1). */
+    if (!ds4_gpu_register_model_map_no_copy(e->model.map, e->model.size)) return -1;
+
+    /* Per-logical-tier dynamic range lists. */
+    ds4_tensor_range *per_dev_ranges[DS4_MAX_GPUS] = {0};
+    int per_dev_n[DS4_MAX_GPUS] = {0};
+    int per_dev_cap[DS4_MAX_GPUS] = {0};
+
+    int rc = -1;
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const ds4_tensor *t = &e->model.tensors[i];
+        if (t->bytes == 0) continue;
+        int entry = tensor_to_entry(t, DS4_N_LAYER);
+        if (entry < 0 || entry >= e->n_placement_entries) entry = 0;
+        int logical_tier = e->placement[entry];
+        if (logical_tier == DS4_LAYER_PACK_CPU) continue;        /* CPU spill: skip here. */
+        if (logical_tier < 0 || logical_tier >= e->gpu_cfg.n_gpus) {
+            fprintf(stderr,
+                    "ds4: placement tier %d out of range for tensor %.*s\n",
+                    logical_tier,
+                    (int)t->name.len, t->name.ptr ? t->name.ptr : "");
+            goto cleanup;
+        }
+        const int physical_device = g_gpu[logical_tier].device_id;
+        if (per_dev_n[logical_tier] >= per_dev_cap[logical_tier]) {
+            int new_cap = per_dev_cap[logical_tier] == 0 ? 64 : per_dev_cap[logical_tier] * 2;
+            ds4_tensor_range *grow = realloc(per_dev_ranges[logical_tier],
+                                              (size_t)new_cap * sizeof(*grow));
+            if (!grow) {
+                fprintf(stderr, "ds4: out of memory growing per-device range list\n");
+                goto cleanup;
+            }
+            per_dev_ranges[logical_tier] = grow;
+            per_dev_cap[logical_tier] = new_cap;
+        }
+        per_dev_ranges[logical_tier][per_dev_n[logical_tier]].source_offset = t->abs_offset;
+        per_dev_ranges[logical_tier][per_dev_n[logical_tier]].bytes = t->bytes;
+        per_dev_ranges[logical_tier][per_dev_n[logical_tier]].target_device = physical_device;
+        per_dev_n[logical_tier]++;
+    }
+
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        if (per_dev_n[d] == 0) continue;
+        const int physical_device = g_gpu[d].device_id;
+        int cache_rc = ds4_gpu_device_cache_tensors(physical_device,
+                                                     per_dev_ranges[d],
+                                                     per_dev_n[d]);
+        if (cache_rc != 0) {
+            fprintf(stderr,
+                    "ds4: ds4_gpu_device_cache_tensors failed for tier %d "
+                    "(physical device %d, %d ranges) rc=%d\n",
+                    d, physical_device, per_dev_n[d], cache_rc);
+            goto cleanup;
+        }
+    }
+    rc = 0;
+
+cleanup:
+    for (int d = 0; d < DS4_MAX_GPUS; d++) free(per_dev_ranges[d]);
+    return rc;
+}
+
+/* Pretty-print the layout via the wave-1 helper, then emit a peer-access
+ * summary by walking g_gpu_peer_ok[][]. Always called in multi-tier
+ * mode so the operator sees what the packer decided. */
+static void engine_print_layout(const ds4_engine *e) {
+    size_t entry_bytes[DS4_N_LAYER + 2];
+    (void)engine_compute_entry_bytes(e, entry_bytes);
+
+    size_t used[DS4_LAYER_PACK_MAX_GPUS] = {0};
+    size_t budget[DS4_LAYER_PACK_MAX_GPUS] = {0};
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        budget[d] = e->gpu_cfg.vram_bytes[d];
+    }
+    for (int i = 0; i < e->n_placement_entries; i++) {
+        int dev = e->placement[i];
+        if (dev >= 0 && dev < e->gpu_cfg.n_gpus) used[dev] += entry_bytes[i];
+    }
+
+    ds4_layer_pack_print(stderr,
+                          e->placement,
+                          e->n_placement_entries,
+                          DS4_N_LAYER,
+                          entry_bytes,
+                          used,
+                          budget,
+                          e->gpu_cfg.n_gpus);
+
+    fprintf(stderr, "ds4: peer access matrix (validated):");
+    int peer_any = 0;
+    for (int i = 0; i < g_n_gpus; i++) {
+        for (int j = 0; j < g_n_gpus; j++) {
+            if (i == j) continue;
+            peer_any = 1;
+            const char *mode = g_gpu_peer_ok[i][j] ? "DIRECT" : "BOUNCE";
+            fprintf(stderr, " %d->%d %s", i, j, mode);
+        }
+    }
+    if (!peer_any) fprintf(stderr, " (single-device)");
+    fputc('\n', stderr);
+}
+
+/* Phase B: install GPU-side placement state.
+ *
+ * Ordering (codex plan-review round 2 issue #3):
+ *   1. Print layout FIRST so it is always visible to the operator,
+ *      even if subsequent steps fail.
+ *   2. Detect any CPU-spill placement; this PR refuses to open
+ *      multi-tier engines with CPU spill because the execution-side
+ *      wiring (CPU↔GPU boundary materialization) lands in the
+ *      follow-up mgpu-graph-session-execution task.
+ *   3. Register host model map and install per-device selective
+ *      caches.
+ *
+ * Returns 0 on success. */
+static int engine_install_gpu_placement(ds4_engine *e) {
+    if (!e->multi_tier) return 0;
+
+    engine_print_layout(e);
+
+    int has_cpu_spill = 0;
+    for (int i = 0; i < e->n_placement_entries; i++) {
+        if (e->placement[i] == DS4_LAYER_PACK_CPU) { has_cpu_spill = 1; break; }
+    }
+    if (has_cpu_spill) {
+        fprintf(stderr,
+            "ds4: CPU-spill placement detected; execution wiring for CPU-tier\n"
+            "ds4: layers lands in mgpu-graph-session-execution. Aborting engine\n"
+            "ds4: creation. (mgpu-graph-session-placement ships layout-only.)\n");
+        return -1;
+    }
+
+    if (engine_install_per_device_caches(e) != 0) return -1;
+    return 0;
+}
+#endif /* !DS4_NO_GPU */
+
+#ifdef DS4_TEST_HOOKS
+/* Test-only hooks for exercising the wave-2 placement logic without
+ * needing a real GGUF. The unit test in tests/test_engine_mgpu_placement.c
+ * builds a synthetic "fake tensor list", invokes ds4_test_classify, and
+ * asserts on the resulting placement table.
+ *
+ * Compiled in only when DS4_TEST_HOOKS is defined; never reaches release
+ * builds. Caller-supplied struct:
+ *
+ *   typedef struct {
+ *       const char *name;   // NUL-terminated for caller convenience
+ *       uint64_t    bytes;
+ *   } ds4_test_fake_tensor;
+ */
+typedef struct {
+    const char *name;
+    uint64_t    bytes;
+} ds4_test_fake_tensor;
+
+int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
+                                  int n_tensors,
+                                  const ds4_gpu_config *cfg,
+                                  int placement_out[DS4_N_LAYER + 2],
+                                  int *out_multi_tier,
+                                  int *out_n_entries);
+int ds4_test_tensor_to_entry(const char *name, int name_len);
+
+/* Implementation below — kept inside the file so it can call the
+ * static helpers directly without exposing them in a public header. */
+int ds4_test_tensor_to_entry(const char *name, int name_len) {
+    ds4_tensor fake;
+    memset(&fake, 0, sizeof(fake));
+    fake.name.ptr = name;
+    fake.name.len = (uint64_t)(name_len > 0 ? name_len : 0);
+    return tensor_to_entry(&fake, DS4_N_LAYER);
+}
+
+int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
+                                  int n_tensors,
+                                  const ds4_gpu_config *cfg,
+                                  int placement_out[DS4_N_LAYER + 2],
+                                  int *out_multi_tier,
+                                  int *out_n_entries) {
+    /* Build a synthetic ds4_engine just enough to drive the helpers. */
+    ds4_engine eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.model.fd = -1;
+    eng.model.n_tensors = (uint64_t)(n_tensors > 0 ? n_tensors : 0);
+    eng.model.tensors = NULL;
+    if (n_tensors > 0) {
+        eng.model.tensors = calloc((size_t)n_tensors, sizeof(*eng.model.tensors));
+        if (!eng.model.tensors) return -1;
+        for (int i = 0; i < n_tensors; i++) {
+            eng.model.tensors[i].name.ptr = tensors[i].name;
+            eng.model.tensors[i].name.len = tensors[i].name
+                ? (uint64_t)strlen(tensors[i].name) : 0;
+            eng.model.tensors[i].bytes = tensors[i].bytes;
+        }
+    }
+
+    int rc = engine_classify_multi_tier(&eng, cfg);
+    if (rc == 0) {
+        if (out_multi_tier) *out_multi_tier = eng.multi_tier;
+        if (out_n_entries) *out_n_entries = eng.n_placement_entries;
+        if (placement_out) {
+            for (int i = 0; i < DS4_N_LAYER + 2; i++) placement_out[i] = eng.placement[i];
+        }
+    }
+    free(eng.model.tensors);
+    return rc;
+}
+#endif /* DS4_TEST_HOOKS */
+
+/* Internal engine-open helper carrying today's body verbatim plus three
+ * gated branch points (only reachable when gpu_cfg != NULL). When the
+ * caller passes NULL — which every existing caller does via ds4_engine_open
+ * — the function is byte-equivalent to pre-wave-2 main. */
+static int ds4_engine_open_internal(ds4_engine **out,
+                                     const ds4_engine_options *opt,
+                                     const ds4_gpu_config *gpu_cfg);
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    return ds4_engine_open_internal(out, opt, NULL);
+}
+
+int ds4_engine_create_with_gpu_config(ds4_engine **out,
+                                       const ds4_engine_options *opt,
+                                       const struct ds4_gpu_config *gpu_cfg) {
+    return ds4_engine_open_internal(out, opt, gpu_cfg);
+}
+
+static int ds4_engine_open_internal(ds4_engine **out,
+                                     const ds4_engine_options *opt,
+                                     const ds4_gpu_config *gpu_cfg) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -18242,7 +18686,23 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
-    if (opt->mtp_path && opt->mtp_path[0]) {
+    /* Wave-2: classify multi-tier BEFORE opening the MTP model so we can
+     * suppress MTP load entirely in multi-tier mode (codex round-2 #8).
+     * NULL gpu_cfg leaves e->multi_tier == 0 and is bit-equivalent to
+     * pre-wave-2 main. */
+    if (engine_classify_multi_tier(e, gpu_cfg) != 0) {
+        fprintf(stderr, "ds4: failed to classify multi-tier placement\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (e->multi_tier && opt->mtp_path && opt->mtp_path[0]) {
+        fprintf(stderr,
+            "ds4: MTP disabled in multi-tier mode (wave-1 design constraint; "
+            "re-enabled in v1).\n");
+        /* Do not open the MTP model. e->mtp_ready stays false, so every
+         * MTP-gated code path is dormant. */
+    } else if (opt->mtp_path && opt->mtp_path[0]) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
@@ -18269,6 +18729,44 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
     }
     if (graph_backend) {
+        if (e->multi_tier) {
+            /* Wave-2 multi-tier branch.
+             *
+             * 1. Initialize all configured CUDA devices via ds4_gpu_init_multi
+             *    (the wave-1 multi-device init that populates g_gpu[]).
+             * 2. Skip the legacy ds4_gpu_set_model_map_range / accelerator
+             *    cache calls — those are single-tier behavior.
+             * 3. Install per-device selective caches per the placement.
+             * 4. Refuse engine creation with the documented notice: this PR
+             *    ships scaffolding only; execution wiring lands in
+             *    mgpu-graph-session-execution. */
+            if (ds4_gpu_init_multi(gpu_cfg) != 0) {
+                fprintf(stderr, "ds4: ds4_gpu_init_multi failed; aborting multi-tier startup\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            e->metal_ready = true;
+            ds4_gpu_set_quality(e->quality);
+            (void)ds4_gpu_set_model_fd(e->model.fd);
+
+            if (engine_install_gpu_placement(e) != 0) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            fprintf(stderr,
+                "ds4: multi-tier layout computed and per-device weight caches installed,\n"
+                "ds4: but execution wiring for multi-tier (per-tier cuBLAS, graph scratch,\n"
+                "ds4: boundary hops) lands in mgpu-graph-session-execution. This PR\n"
+                "ds4: ships dry-run layout only. Aborting engine creation.\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+
+        /* Single-tier path (every existing caller). Body is byte-equivalent
+         * to pre-wave-2 main. */
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",

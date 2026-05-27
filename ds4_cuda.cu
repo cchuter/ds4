@@ -1949,6 +1949,83 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
+/* Register the mmap'd host model pointer for selective-cache lookups WITHOUT
+ * triggering any device-side copy. Used by mgpu-graph-session-placement's
+ * multi-tier path so DS4_CUDA_COPY_MODEL cannot reintroduce a full-model
+ * copy that defeats the per-device selective cache.
+ *
+ * This is the no-copy subset of ds4_gpu_set_model_map: same bookkeeping
+ * for the host pointer plus cudaHostRegister, but skipping the
+ * DS4_CUDA_COPY_MODEL branch that allocates and copies the entire model. */
+extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
+    if (!model_map || model_size == 0) return 0;
+    if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+
+    cuda_model_range_release_all();
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
+    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
+        (void)cudaFree(r.device_ptr);
+    }
+    g_q8_f32_ranges.clear();
+    g_q8_f32_by_offset.clear();
+    g_q8_f32_bytes = 0;
+    if (g_model_device_owned && g_model_device_base) {
+        (void)cudaFree((void *)g_model_device_base);
+        g_model_device_owned = 0;
+    }
+    if (g_model_registered && g_model_host_base) {
+        (void)cudaHostUnregister((void *)g_model_host_base);
+        g_model_registered = 0;
+    }
+    g_model_host_base = model_map;
+    g_model_device_base = (const char *)model_map;
+    g_model_registered_size = model_size;
+    g_model_range_mapping_supported = 1;
+    g_model_hmm_direct = 0;
+    g_model_cache_full = 0;
+    if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
+        g_model_fd_host_base = model_map;
+    }
+
+    /* No DS4_CUDA_COPY_MODEL branch — that is the entire point. */
+
+    cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
+                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+    if (err == cudaSuccess) {
+        void *dev = NULL;
+        err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
+        if (err == cudaSuccess && dev) {
+            g_model_device_base = (const char *)dev;
+            g_model_registered = 1;
+            fprintf(stderr,
+                    "ds4: CUDA (no-copy) registered %.2f GiB model mapping for multi-tier selective cache\n",
+                    (double)model_size / 1073741824.0);
+        } else {
+            fprintf(stderr,
+                    "ds4: CUDA (no-copy) host registration pointer lookup failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+        }
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA (no-copy) host registration skipped: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+    }
+    return 1;
+}
+
+/* Set the current CUDA device by LOGICAL tier index (0..g_n_gpus-1).
+ * Maps to the physical CUDA device id stored in g_gpu[].device_id.
+ * Added for mgpu-graph-session-placement (wave 2); first executed by
+ * mgpu-graph-session-execution (follow-up). */
+extern "C" int ds4_gpu_set_current_device(int logical_tier) {
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
+    return cudaSetDevice(g_gpu[logical_tier].device_id) == cudaSuccess ? 0 : -1;
+}
+
 /* =========================================================================
  * Per-device selective model cache (mgpu-selective-model-cache).
  *
