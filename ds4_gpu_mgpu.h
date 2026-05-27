@@ -30,15 +30,19 @@ extern "C" {
 
 #define DS4_MAX_GPUS 16
 
-/* Complete definition of the previously-opaque ds4_gpu_tensor.
- * Callers that include this header can stack-allocate or struct-embed
- * tensors and pass `ds4_gpu_tensor *t` to ds4_gpu_tensor_alloc_on. */
+/* Complete definition of the previously-opaque ds4_gpu_tensor, plus a
+ * typedef so the new API prototypes below can use the bare name
+ * `ds4_gpu_tensor *` in both C and C++ without forcing callers to
+ * include ds4_gpu.h first. Callers that include this header can
+ * stack-allocate or struct-embed tensors and pass to
+ * ds4_gpu_tensor_alloc_on. */
 struct ds4_gpu_tensor {
     void    *ptr;
     uint64_t bytes;
     int      owner;
     int      device_id;   /* -1 means legacy/untagged → treat as device 0 */
 };
+typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
 typedef struct {
     int    device_indices[DS4_MAX_GPUS];   /* CUDA device IDs to use */

@@ -7,6 +7,11 @@
  *   - ds4_gpu_tensor_copy_xdev peer-auto and DS4_FORCE_HOST_BOUNCE paths
  *     (when 2+ GPUs are visible). */
 
+/* ds4_gpu_mgpu.h is standalone-C-compatible — it now provides the
+ * complete ds4_gpu_tensor struct + typedef so callers can use the
+ * bare type name. ds4_gpu.h is also included here only for the
+ * legacy ds4_gpu_init / _cleanup / _tensor_read / _tensor_write
+ * prototypes the test uses; the mgpu header does not duplicate them. */
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 
