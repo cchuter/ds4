@@ -8,6 +8,7 @@
  *     (when 2+ GPUs are visible). */
 
 #include "ds4_gpu.h"
+#include "ds4_gpu_mgpu.h"
 
 #include <cuda_runtime.h>
 #include <stdio.h>

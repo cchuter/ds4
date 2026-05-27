@@ -2,96 +2,26 @@
 #define DS4_GPU_H
 
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================
  *
- * Device tensor used by the DS4-specific GPU executor.
+ * Opaque device tensor used by the DS4-specific GPU executor.
  *
  * The public GPU API is tensor-resident: activations, KV state, and scratch
  * buffers stay device-owned across the whole prefill/decode command sequence.
- *
- * As of the multi-GPU plumbing PR (mgpu-device-aware-cuda), the struct is
- * defined here (no longer opaque) so that ds4_gpu_tensor_alloc_on can take
- * a caller-supplied struct. The CUDA-specific resource handles
- * (cudaStream_t, cublasHandle_t, etc.) referenced from ds4_gpu_ctx remain
- * void * here to keep the header free of CUDA includes; ds4_cuda.cu casts
- * them to the real CUDA types internally. Metal and CPU builds therefore
- * compile this header unchanged.
  */
-struct ds4_gpu_tensor {
-    void    *ptr;
-    uint64_t bytes;
-    int      owner;
-    int      device_id;   /* -1 means legacy/untagged → treat as device 0 */
-};
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
-/* =========================================================================
- * Multi-GPU device configuration and per-device context table.
- * =========================================================================
- *
- * v0 plumbing: callers configure N CUDA devices via ds4_gpu_init_multi.
- * The existing single-device ds4_gpu_init is a shim that initialises device 0.
- *
- * DS4_MAX_GPUS bounds NxN stack tables; static_assert in ds4_cuda.cu.
- */
-#define DS4_MAX_GPUS 16
-
-typedef struct {
-    int    device_indices[DS4_MAX_GPUS];   /* CUDA device IDs to use */
-    size_t vram_bytes[DS4_MAX_GPUS];       /* per-device budget; 0 = unset */
-    int    n_gpus;
-    size_t safety_margin_bytes;            /* per-device reserve */
-} ds4_gpu_config;
-
-typedef struct {
-    int    device_id;
-    void  *stream;             /* cudaStream_t under CUDA, NULL elsewhere */
-    void  *cublas;             /* cublasHandle_t under CUDA, NULL elsewhere */
-    int    cublas_ready;
-    void  *scratch;
-    size_t scratch_bytes;
-    size_t budget_bytes;
-    size_t used_bytes;
-    void  *boundary_event;     /* cudaEvent_t under CUDA, NULL elsewhere */
-} ds4_gpu_ctx;
-
-extern ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
-extern int         g_n_gpus;
-extern int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
-
-int  ds4_gpu_init(void);
-int  ds4_gpu_init_multi(const ds4_gpu_config *cfg);
+int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
-
-/* Allocate on a specific device into a caller-provided struct. Matches the
- * mgpu spec exactly. Returns 0 on success, nonzero on error. The struct
- * memory itself is caller-owned; pair with ds4_gpu_tensor_free_in_place. */
-int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes);
-void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t);
-
-/* Cross-device tensor copy. Same-device → cudaMemcpyAsync; peer-capable
- * cross-device → cudaMemcpyPeerAsync with event sync; non-peer → pinned
- * host bounce (per src→dst pair). Honors DS4_FORCE_HOST_BOUNCE=1. */
-int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
-                              const ds4_gpu_tensor *src,
-                              uint64_t bytes);
-
-/* Returns the device_id recorded on the tensor; -1 if untagged. */
-int ds4_gpu_tensor_device(const ds4_gpu_tensor *t);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
@@ -876,9 +806,5 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
-
-#ifdef __cplusplus
-} /* extern "C" */
-#endif
 
 #endif

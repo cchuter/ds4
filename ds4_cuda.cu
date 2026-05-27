@@ -64,7 +64,7 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
-#include "ds4_gpu.h"
+#include "ds4_gpu_mgpu.h"
 #include "ds4_iq2_tables_cuda.inc"
 
 static const void *g_model_host_base;
