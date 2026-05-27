@@ -2220,6 +2220,51 @@ extern "C" int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t byte
     return d;
 }
 
+/* Strict per-device selective-cache lookup.
+ *
+ * Returns 1 only if a covering entry exists whose device_id matches the
+ * caller-supplied expected_device. Otherwise returns 0 with *out_device_ptr
+ * untouched. Unlike ds4_gpu_lookup_cache, this variant performs NO host-
+ * pointer fallback (no FD-cache, no model_range_ptr_from_fd) and NO
+ * different-device fallback. It is the canonical lookup for multi-tier
+ * dispatch where consuming a different device's pointer would be a
+ * correctness bug. expected_device is a PHYSICAL CUDA device id (the
+ * value stored in g_gpu[logical_tier].device_id, not the logical tier
+ * index). The caller is expected to have cudaSetDevice'd to
+ * expected_device before invoking; the returned pointer is valid to
+ * consume from that device's kernel. Added for
+ * mgpu-graph-session-execution (wave 3a). */
+extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
+                                            uint64_t bytes,
+                                            int      expected_device,
+                                            void   **out_device_ptr) {
+    if (g_cache_ranges.empty()) return 0;
+
+    auto it = std::upper_bound(
+        g_cache_ranges.begin(), g_cache_ranges.end(),
+        source_offset,
+        [](uint64_t off, const cache_range_entry &e) {
+            return off < e.source_offset;
+        });
+    while (it != g_cache_ranges.begin()) {
+        --it;
+        if (source_offset < it->source_offset) {
+            /* Should not happen given upper_bound semantics, but defensive. */
+            continue;
+        }
+        uint64_t into = source_offset - it->source_offset;
+        if (into > it->bytes) continue;
+        if (bytes > it->bytes - into) continue;
+        if (it->device_id != expected_device) continue;
+        if (out_device_ptr) {
+            *out_device_ptr =
+                (char *)it->device_ptr + (source_offset - it->source_offset);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
