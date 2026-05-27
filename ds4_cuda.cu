@@ -271,6 +271,58 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     return g_cuda_tmp;
 }
 
+/* Per-tier scratch accessor.
+ *
+ * Behavior:
+ *   - At g_n_gpus <= 1 (single-tier), delegates to cuda_tmp_alloc which
+ *     manages the legacy g_cuda_tmp slab. This guarantees byte-identical
+ *     behavior to pre-task code for the gpu_cfg == NULL case.
+ *   - For multi-tier, grows the per-device g_gpu[logical_tier].scratch
+ *     slab on the corresponding physical device. Cleanup is already
+ *     handled by ds4_gpu_cleanup (which walks g_gpu[i].scratch).
+ *
+ * The legacy g_cuda_tmp slab is untouched: init-time / preload callers
+ * still use cuda_tmp_alloc directly. No aliasing between g_cuda_tmp
+ * and g_gpu[0].scratch — they are independently owned and freed.
+ *
+ * Added for mgpu-graph-session-execution (wave 3a), step A3 of the
+ * spec (sub-area 2). */
+static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *what) {
+    if (bytes == 0) return NULL;
+    if (g_n_gpus <= 1) {
+        return cuda_tmp_alloc(bytes, what);
+    }
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) {
+        fprintf(stderr, "ds4: cuda_tmp_alloc_on: bad tier %d (n_gpus=%d, what=%s)\n",
+                logical_tier, g_n_gpus, what ? what : "?");
+        return NULL;
+    }
+    ds4_gpu_ctx *ctx = &g_gpu[logical_tier];
+    if (ctx->scratch_bytes >= bytes) return ctx->scratch;
+    int prev = -1;
+    (void)cudaGetDevice(&prev);
+    (void)cudaSetDevice(ctx->device_id);
+    if (ctx->scratch) {
+        (void)cudaFree(ctx->scratch);
+        ctx->scratch = NULL;
+        ctx->scratch_bytes = 0;
+    }
+    void *p = NULL;
+    cudaError_t err = cudaMalloc(&p, (size_t)bytes);
+    if (prev >= 0) (void)cudaSetDevice(prev);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA scratch alloc on tier %d (dev=%d) failed for %s (%.2f MiB): %s\n",
+                logical_tier, ctx->device_id, what ? what : "scratch",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    ctx->scratch = p;
+    ctx->scratch_bytes = (size_t)bytes;
+    return p;
+}
+
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
     return n_comp <= DS4_CUDA_ATTENTION_SCORE_CAP - DS4_CUDA_ATTENTION_RAW_SCORE_CAP;
 }
@@ -6590,7 +6642,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         }
         if (scratch_u32_per_token > UINT64_MAX / n_tokens / sizeof(uint32_t)) return 0;
         const uint64_t tmp_bytes = (uint64_t)n_tokens * scratch_u32_per_token * sizeof(uint32_t);
-        uint32_t *scratch = (uint32_t *)cuda_tmp_alloc(tmp_bytes, "indexer topk tree");
+        const int logical_tier = ds4_tensor_device_idx(selected);
+        uint32_t *scratch = (uint32_t *)cuda_tmp_alloc_on(logical_tier, tmp_bytes, "indexer topk tree");
         if (!scratch) return 0;
 
         uint32_t *cur = scratch;
@@ -6697,7 +6750,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f16) {
             const uint64_t xh_count = n_tok * in_dim;
-            __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "q8 f16 gemm activations");
+            __half *xh = (__half *)cuda_tmp_alloc_on(logical_tier, xh_count * sizeof(__half), "q8 f16 gemm activations");
             if (!xh) return 0;
             f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
@@ -6734,7 +6787,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
-    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 prequant");
+    void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "q8_0 prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
@@ -6827,7 +6880,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     const uint64_t xq_bytes = blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
-    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair prequant");
+    void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "q8_0 pair prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
@@ -6892,7 +6945,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     const uint64_t xq_bytes = blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
-    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 hc expand prequant");
+    void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "q8_0 hc expand prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
@@ -6942,7 +6995,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
     if (!serial_f16 && g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
-        __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
+        __half *xh = (__half *)cuda_tmp_alloc_on(logical_tier, xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
@@ -7706,7 +7759,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         const uint64_t score_bytes = score_count * sizeof(float);
         const uint64_t out_offset = (score_bytes + 255u) & ~255ull;
         const uint64_t tmp_bytes = out_offset + out_count * sizeof(float);
-        float *tmp = (float *)cuda_tmp_alloc(tmp_bytes, "attention raw cublas");
+        float *tmp = (float *)cuda_tmp_alloc_on(logical_tier, tmp_bytes, "attention raw cublas");
         if (!tmp) return 0;
         float *scores = tmp;
         float *out_tmp = (float *)((char *)tmp + out_offset);
@@ -7952,7 +8005,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
-        int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
+        int32_t *sorted = (int32_t *)cuda_tmp_alloc_on(logical_tier, sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;
         indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
@@ -8081,7 +8134,7 @@ static int attention_prefill_mixed_launch(
         const uint64_t score_bytes = score_count * sizeof(float);
         const uint64_t out_offset = score_offset + ((score_bytes + 255u) & ~255ull);
         const uint64_t tmp_bytes = out_offset + out_count * sizeof(float);
-        float *tmp = (float *)cuda_tmp_alloc(tmp_bytes, "attention mixed cublas");
+        float *tmp = (float *)cuda_tmp_alloc_on(logical_tier, tmp_bytes, "attention mixed cublas");
         if (!tmp) return 0;
         float *kv = tmp;
         float *scores = (float *)((char *)tmp + score_offset);
@@ -8266,7 +8319,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
         const uint64_t low_tmp_offset = (heads_h_bytes + 255u) & ~255ull;
         const uint64_t tmp_bytes = low_tmp_offset + low_tmp_count * sizeof(float);
-        void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output a cublas");
+        void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "attention output a cublas");
         if (!tmp) return 0;
         __half *heads_h = (__half *)tmp;
         float *low_packed = (float *)((char *)tmp + low_tmp_offset);
@@ -8315,7 +8368,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         const uint64_t xq_bytes = x_rows * blocks_a * 32u;
         const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
         const uint64_t tmp_bytes = scale_offset + x_rows * blocks_a * sizeof(float);
-        void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output a q8 prequant");
+        void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "attention output a q8 prequant");
         if (!tmp) return 0;
         int8_t *xq = (int8_t *)tmp;
         float *xscale = (float *)((char *)tmp + scale_offset);
@@ -8382,7 +8435,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     const uint64_t xq_bytes = x_rows * blocks_a * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + x_rows * blocks_a * sizeof(float);
-    void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output low q8 prequant");
+    void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "attention output low q8 prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
@@ -10867,8 +10920,8 @@ static int routed_moe_launch(
             const uint64_t tile16_experts_off = tile16_total_off + tile16_total_bytes;
             const uint64_t tile16_starts_off = tile16_experts_off + tile16_experts_bytes;
             const uint64_t scratch_bytes = tile16_starts_off + tile16_starts_bytes;
-            uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(scratch_bytes,
-                                                         "routed_moe sorted pairs");
+            uint8_t *scratch = (uint8_t *)cuda_tmp_alloc_on(logical_tier, scratch_bytes,
+                                                             "routed_moe sorted pairs");
             if (!scratch) {
                 ok = 0;
             } else {
