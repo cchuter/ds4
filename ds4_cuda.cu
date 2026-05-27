@@ -318,6 +318,7 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
                 ctx->device_id, logical_tier, what ? what : "scratch",
                 cudaGetErrorString(derr));
         (void)cudaGetLastError();
+        if (prev >= 0) (void)cudaSetDevice(prev);
         return NULL;
     }
     if (ctx->scratch) {
@@ -836,6 +837,7 @@ static const __half *cuda_q8_f16_ptr(
             fprintf(stderr, "ds4: cudaSetDevice(%d) failed before q8 fp16 alloc: %s\n",
                     expected_device, cudaGetErrorString(derr));
             (void)cudaGetLastError();
+            if (prev >= 0) (void)cudaSetDevice(prev);
             return NULL;
         }
     }
@@ -942,6 +944,7 @@ static float *cuda_q8_f32_ptr(
             fprintf(stderr, "ds4: cudaSetDevice(%d) failed before q8 fp32 alloc: %s\n",
                     expected_device, cudaGetErrorString(derr));
             (void)cudaGetLastError();
+            if (prev >= 0) (void)cudaSetDevice(prev);
             return NULL;
         }
     }
@@ -2641,6 +2644,7 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
                 "%s; skipping\n",
                 g_gpu[i].device_id, i, cudaGetErrorString(derr));
             (void)cudaGetLastError();
+            if (prev >= 0) (void)cudaSetDevice(prev);
             continue;
         }
         cublasStatus_t st = cublasSetMathMode((cublasHandle_t)g_gpu[i].cublas, math_mode);
