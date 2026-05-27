@@ -35,11 +35,9 @@ enum {
     DS4_CUDA_TOPK_MERGE_GROUP = 8u
 };
 
-struct ds4_gpu_tensor {
-    void *ptr;
-    uint64_t bytes;
-    int owner;
-};
+/* struct ds4_gpu_tensor is defined in ds4_gpu.h (no longer opaque as of
+ * the mgpu-device-aware-cuda PR). Field layout includes the new device_id
+ * tag and is read by the WITH_DEVICE-wrapped tensor APIs below. */
 
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
@@ -66,6 +64,7 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+#include "ds4_gpu_mgpu.h"
 #include "ds4_iq2_tables_cuda.inc"
 
 static const void *g_model_host_base;
@@ -86,6 +85,54 @@ static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
+
+/* =========================================================================
+ * Multi-GPU plumbing (mgpu-device-aware-cuda).
+ * ========================================================================= */
+
+static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
+
+ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
+int         g_n_gpus = 0;
+int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+
+/* Per-pair pinned-host bounce buffers, indexed [src][dst]. Lazily grown
+ * to the largest copy seen for that pair. Each pair is its own allocation
+ * so concurrent fan-out copies from a single source GPU to multiple
+ * destinations cannot race for staging memory. */
+static void   *g_xdev_bounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
+static size_t  g_xdev_bounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
+
+/* Internal helper: resolve a tensor's device index. -1 (untagged) is
+ * treated as device 0 for legacy callers. */
+static inline int ds4_tensor_device_idx(const ds4_gpu_tensor *t) {
+    if (!t) return 0;
+    int d = t->device_id;
+    if (d < 0) return 0;
+    return d;
+}
+
+/* WITH_DEVICE(d) { ... } scope macro.
+ *
+ * Save the calling thread's current CUDA device, switch to device `d`,
+ * run the body exactly once, then restore the previous device. If the
+ * required CUDA calls fail, the body still runs (we don't have a clean
+ * way to early-exit a containing function from a macro), but the next
+ * CUDA call inside the body will surface the error naturally.
+ *
+ * Implementation: a for-loop with two synthetic variables. Iter 0 runs
+ * the body; on iter 1, the iteration step restores the previous device
+ * via cudaSetDevice and sets _wd_first = 0 so the loop exits. The
+ * single-statement-body restriction of for-loops is removed by the
+ * required `{ ... }` block in the call site.
+ */
+#define WITH_DEVICE(d)                                                      \
+    for (int _wd_prev = -1, _wd_first = 1;                                  \
+         _wd_first;                                                          \
+         _wd_first = 0,                                                      \
+         (_wd_prev >= 0 ? (void)cudaSetDevice(_wd_prev) : (void)0))         \
+        if (cudaGetDevice(&_wd_prev) != cudaSuccess) { /* leave */ } else   \
+        if (cudaSetDevice(d)           != cudaSuccess) { /* leave */ } else
 
 struct cuda_model_range {
     const void *host_base;
@@ -1202,33 +1249,236 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
-extern "C" int ds4_gpu_init(void) {
-    int dev = 0;
-    if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
-    cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
-                prop.name, prop.major, prop.minor);
-    }
-    if (!g_cublas_ready) {
-        if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
+extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
+    if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
+
+    for (int i = 0; i < cfg->n_gpus; i++) {
+        ds4_gpu_ctx *c = &g_gpu[i];
+        c->device_id = cfg->device_indices[i];
+        if (c->device_id < 0) return 0;
+        if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
+                    prop.name, prop.major, prop.minor, c->device_id);
+        }
+        /* Per-device stream. */
+        cudaStream_t s = NULL;
+        if (!cuda_ok(cudaStreamCreate(&s), "init stream")) return 0;
+        c->stream = (void *)s;
+        /* Per-device boundary event (reusable, no timing). */
+        cudaEvent_t ev = NULL;
+        if (!cuda_ok(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
+                      "init event")) return 0;
+        c->boundary_event = (void *)ev;
+        /* Per-device cuBLAS handle. */
+        cublasHandle_t h = NULL;
+        if (!cublas_ok(cublasCreate(&h), "init cublas")) return 0;
+        c->cublas = (void *)h;
         const cublasMath_t math_mode =
             (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(g_cublas, math_mode);
-        g_cublas_ready = 1;
+        (void)cublasSetMathMode(h, math_mode);
+        c->cublas_ready = 1;
+        c->budget_bytes = cfg->vram_bytes[i];
+        c->used_bytes   = 0;
+        c->scratch      = NULL;
+        c->scratch_bytes = 0;
     }
+    g_n_gpus = cfg->n_gpus;
+
+    /* NxN peer-access matrix.
+     *
+     * Driver semantics: cudaDeviceCanAccessPeer + cudaDeviceEnablePeerAccess
+     * can both succeed even on hardware/drivers where cudaMemcpyPeerAsync
+     * silently delivers wrong data (notably RTX 6000 Ada under recent
+     * NVIDIA drivers, per the v0 design doc). The corruption is
+     * non-deterministic and can affect either or both directions of a
+     * pair. To guard against this, we run a multi-size, multi-iteration
+     * validation at init (see the loop below): write distinct known
+     * patterns, peer-copy them to the destination, read back, and only
+     * set peer_ok[i][j] if every probe round-trips byte-perfect. A
+     * single small probe is not sufficient — it can pass while realistic
+     * activation-sized copies still corrupt. On any failure the entry
+     * stays at 0 and cross-device copies fall back to the pinned-host
+     * bounce path automatically. */
+    for (int i = 0; i < g_n_gpus; i++) {
+        for (int j = 0; j < g_n_gpus; j++) {
+            if (i == j) { g_gpu_peer_ok[i][j] = 1; continue; }
+            int can = 0;
+            (void)cudaDeviceCanAccessPeer(&can, g_gpu[i].device_id,
+                                          g_gpu[j].device_id);
+            if (!can) { g_gpu_peer_ok[i][j] = 0; continue; }
+            (void)cudaSetDevice(g_gpu[i].device_id);
+            cudaError_t e = cudaDeviceEnablePeerAccess(g_gpu[j].device_id, 0);
+            int enabled = (e == cudaSuccess ||
+                           e == cudaErrorPeerAccessAlreadyEnabled);
+            (void)cudaGetLastError();
+            if (!enabled) { g_gpu_peer_ok[i][j] = 0; continue; }
+
+            /* Runtime validation: peer copies on RTX 6000 Ada under recent
+             * NVIDIA drivers silently corrupt at realistic sizes even though
+             * the API returns success. cudaDeviceCanAccessPeer and
+             * cudaDeviceEnablePeerAccess can both report success while
+             * cudaMemcpyPeer delivers wrong data non-deterministically.
+             * Probe with multiple sizes and iterations; ALL must round-trip
+             * byte-perfect or we disable peer for this pair and silently fall
+             * back to the pinned-host bounce path. */
+            static const size_t kValidateSizes[] = {
+                4u * 1024u,
+                256u * 1024u,
+                1u * 1024u * 1024u,
+                16u * 1024u * 1024u,
+            };
+            const int kValidateIters    = 4;
+            const int kNValidateSizes   = (int)(sizeof(kValidateSizes) /
+                                                sizeof(kValidateSizes[0]));
+            const size_t kMaxValidate   = kValidateSizes[kNValidateSizes - 1];
+
+            unsigned char *vh_src = (unsigned char *)malloc(kMaxValidate);
+            unsigned char *vh_dst = (unsigned char *)malloc(kMaxValidate);
+            if (!vh_src || !vh_dst) {
+                free(vh_src); free(vh_dst);
+                g_gpu_peer_ok[i][j] = 0; continue;
+            }
+
+            void *src_dev = NULL; void *dst_dev = NULL;
+            (void)cudaSetDevice(g_gpu[i].device_id);
+            if (cudaMalloc(&src_dev, kMaxValidate) != cudaSuccess) {
+                (void)cudaGetLastError();
+                free(vh_src); free(vh_dst);
+                g_gpu_peer_ok[i][j] = 0; continue;
+            }
+            (void)cudaSetDevice(g_gpu[j].device_id);
+            if (cudaMalloc(&dst_dev, kMaxValidate) != cudaSuccess) {
+                (void)cudaGetLastError();
+                (void)cudaSetDevice(g_gpu[i].device_id);
+                (void)cudaFree(src_dev);
+                free(vh_src); free(vh_dst);
+                g_gpu_peer_ok[i][j] = 0; continue;
+            }
+
+            int    peer_validated = 1;
+            size_t failed_bytes   = 0;
+            int    failed_iter    = -1;
+            for (int s_idx = 0;
+                 s_idx < kNValidateSizes && peer_validated;
+                 s_idx++) {
+                size_t n = kValidateSizes[s_idx];
+                for (int it = 0; it < kValidateIters && peer_validated; it++) {
+                    for (size_t k = 0; k < n; k++) {
+                        vh_src[k] = (unsigned char)
+                            ((k * 31u + (size_t)it * 17u +
+                              (size_t)s_idx * 53u + 11u) & 0xffu);
+                    }
+                    (void)cudaSetDevice(g_gpu[i].device_id);
+                    if (cudaMemcpy(src_dev, vh_src, n,
+                                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        peer_validated = 0; failed_bytes = n; failed_iter = it;
+                        break;
+                    }
+                    cudaError_t pc = cudaMemcpyPeer(
+                        dst_dev, g_gpu[j].device_id,
+                        src_dev, g_gpu[i].device_id, n);
+                    if (pc != cudaSuccess) {
+                        peer_validated = 0; failed_bytes = n; failed_iter = it;
+                        break;
+                    }
+                    (void)cudaSetDevice(g_gpu[j].device_id);
+                    if (cudaMemcpy(vh_dst, dst_dev, n,
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        peer_validated = 0; failed_bytes = n; failed_iter = it;
+                        break;
+                    }
+                    if (memcmp(vh_src, vh_dst, n) != 0) {
+                        peer_validated = 0; failed_bytes = n; failed_iter = it;
+                        break;
+                    }
+                }
+            }
+
+            (void)cudaSetDevice(g_gpu[j].device_id);
+            (void)cudaFree(dst_dev);
+            (void)cudaSetDevice(g_gpu[i].device_id);
+            (void)cudaFree(src_dev);
+            free(vh_src);
+            free(vh_dst);
+
+            g_gpu_peer_ok[i][j] = peer_validated;
+            if (peer_validated) {
+                fprintf(stderr,
+                    "ds4: peer access %d->%d validated across %d sizes x %d"
+                    " iterations (max %zu MiB)\n",
+                    g_gpu[i].device_id, g_gpu[j].device_id,
+                    kNValidateSizes, kValidateIters,
+                    kMaxValidate / (1024u * 1024u));
+            } else {
+                fprintf(stderr,
+                    "ds4: peer access %d->%d FAILED validation at"
+                    " size=%zu iter=%d; falling back to pinned-host bounce\n",
+                    g_gpu[i].device_id, g_gpu[j].device_id,
+                    failed_bytes, failed_iter);
+            }
+        }
+    }
+
+    /* Legacy alias: at N=1, g_cublas points at g_gpu[0]'s handle so every
+     * existing cuBLAS callsite continues to use the same handle (physical
+     * identity, bit-identical N=1 behavior). */
+    g_cublas = (cublasHandle_t)g_gpu[0].cublas;
+    g_cublas_ready = 1;
     return 1;
+}
+
+extern "C" int ds4_gpu_init(void) {
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.device_indices[0] = 0;
+    cfg.n_gpus = 1;
+    return ds4_gpu_init_multi(&cfg);
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
-    if (g_cublas_ready) {
-        (void)cublasDestroy(g_cublas);
-        g_cublas_ready = 0;
-        g_cublas = NULL;
+
+    /* Multi-GPU teardown: events, streams, cublas handles, scratch
+     * slabs, per-pair bounce buffers. */
+    for (int i = 0; i < g_n_gpus; i++) {
+        ds4_gpu_ctx *c = &g_gpu[i];
+        (void)cudaSetDevice(c->device_id);
+        if (c->boundary_event) {
+            (void)cudaEventDestroy((cudaEvent_t)c->boundary_event);
+            c->boundary_event = NULL;
+        }
+        if (c->stream) {
+            (void)cudaStreamDestroy((cudaStream_t)c->stream);
+            c->stream = NULL;
+        }
+        if (c->cublas) {
+            (void)cublasDestroy((cublasHandle_t)c->cublas);
+            c->cublas = NULL;
+            c->cublas_ready = 0;
+        }
+        if (c->scratch) {
+            (void)cudaFree(c->scratch);
+            c->scratch = NULL;
+            c->scratch_bytes = 0;
+        }
     }
+    for (int i = 0; i < DS4_MAX_GPUS; i++) {
+        for (int j = 0; j < DS4_MAX_GPUS; j++) {
+            if (g_xdev_bounce[i][j]) {
+                (void)cudaFreeHost(g_xdev_bounce[i][j]);
+                g_xdev_bounce[i][j] = NULL;
+                g_xdev_bounce_bytes[i][j] = 0;
+            }
+        }
+    }
+    g_n_gpus = 0;
+    g_cublas = NULL;
+    g_cublas_ready = 0;
+    /* Continue with legacy global teardown below. */
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -1289,16 +1539,43 @@ extern "C" void ds4_gpu_cleanup(void) {
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
+                                       uint64_t bytes) {
+    if (!t) return 1;
+    if (device_id < 0 || device_id >= g_n_gpus) return 2;
     if (bytes == 0) bytes = 1;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[device_id].device_id) {
+        ok = cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc");
+    }
+    if (!ok) return 3;
+    t->bytes = bytes;
+    t->owner = 1;
+    t->device_id = device_id;
+    g_gpu[device_id].used_bytes += bytes;
+    return 0;
+}
+
+extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
+    if (!t) return;
+    int d = ds4_tensor_device_idx(t);
+    if (t->owner && t->ptr) {
+        WITH_DEVICE(g_gpu[d].device_id) {
+            (void)cudaFree(t->ptr);
+        }
+    }
+    t->ptr = NULL;
+    t->bytes = 0;
+    t->owner = 0;
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
+    if (ds4_gpu_tensor_alloc_on(t, 0, bytes) != 0) {
         free(t);
         return NULL;
     }
-    t->bytes = bytes;
-    t->owner = 1;
     return t;
 }
 
@@ -1306,13 +1583,22 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc")) {
-        free(t);
-        return NULL;
+    int ok = 0;
+    /* Managed memory is not device-bound, but we record device 0 so that
+     * subsequent ds4_gpu_tensor_free pairs with WITH_DEVICE(0) safely. */
+    WITH_DEVICE(g_gpu[0].device_id) {
+        ok = cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes),
+                     "managed tensor alloc");
     }
+    if (!ok) { free(t); return NULL; }
     t->bytes = bytes;
     t->owner = 1;
+    t->device_id = 0;
     return t;
+}
+
+extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) {
+    return t ? t->device_id : -1;
 }
 
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
@@ -1358,12 +1644,18 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
+    t->device_id = base->device_id;  /* inherit owning device */
     return t;
 }
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    int d = ds4_tensor_device_idx(tensor);
+    if (tensor->owner && tensor->ptr) {
+        WITH_DEVICE(g_gpu[d].device_id) {
+            (void)cudaFree(tensor->ptr);
+        }
+    }
     free(tensor);
 }
 
@@ -1373,6 +1665,7 @@ extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
 
 extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
+    /* Full-device sync preserves legacy semantics. */
     (void)cudaDeviceSynchronize();
     return tensor->ptr;
 }
@@ -1380,18 +1673,37 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;
-    fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
-    return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
+        ok = cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
-    return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
+                                cudaMemcpyHostToDevice),
+                     "tensor write");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
-    return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
+                                cudaMemcpyDeviceToHost),
+                     "tensor read");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -1402,11 +1714,101 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         return 0;
     }
     if (bytes == 0) return 1;
-    return cuda_ok(cudaMemcpy((char *)dst->ptr + dst_offset,
-                              (const char *)src->ptr + src_offset,
-                              (size_t)bytes,
-                              cudaMemcpyDeviceToDevice),
-                   "tensor copy");
+    /* Same-device fast path; for cross-device, callers should use
+     * ds4_gpu_tensor_copy_xdev. We still tolerate cross-device callers
+     * here by routing to D2D copy on the destination's device. */
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpy((char *)dst->ptr + dst_offset,
+                                (const char *)src->ptr + src_offset,
+                                (size_t)bytes,
+                                cudaMemcpyDeviceToDevice),
+                     "tensor copy");
+    }
+    return ok;
+}
+
+/* Cross-device copy primitive. Path selection (highest priority first):
+ *   DS4_FORCE_HOST_BOUNCE=1  -> always pinned-host bounce
+ *   DS4_FORCE_CUDA_PEER=1    -> always cudaMemcpyPeerAsync (manual-testing
+ *                               override; bypasses g_gpu_peer_ok)
+ *   otherwise                -> peer if validation passed at init, else
+ *                               pinned-host bounce. */
+extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
+                                        const ds4_gpu_tensor *src,
+                                        uint64_t bytes) {
+    if (!dst || !src) return 0;
+    if (bytes == 0) return 1;
+    if (bytes > dst->bytes || bytes > src->bytes) return 0;
+    int sd = ds4_tensor_device_idx(src);
+    int dd = ds4_tensor_device_idx(dst);
+
+    /* Same-device fast path. */
+    if (sd == dd) {
+        int ok = 0;
+        WITH_DEVICE(g_gpu[sd].device_id) {
+            cudaStream_t s = (cudaStream_t)g_gpu[sd].stream;
+            ok = cuda_ok(cudaMemcpyAsync(dst->ptr, src->ptr, bytes,
+                                         cudaMemcpyDeviceToDevice, s),
+                          "xdev same-device copy");
+            if (ok) ok = cuda_ok(cudaStreamSynchronize(s),
+                                 "xdev same-device sync");
+        }
+        return ok;
+    }
+
+    int peer = g_gpu_peer_ok[sd][dd];
+    if (getenv("DS4_FORCE_CUDA_PEER"))   peer = 1;
+    if (getenv("DS4_FORCE_HOST_BOUNCE")) peer = 0;
+
+    if (peer) {
+        int ok = 0;
+        WITH_DEVICE(g_gpu[sd].device_id) {
+            cudaStream_t s = (cudaStream_t)g_gpu[sd].stream;
+            cudaEvent_t  e = (cudaEvent_t)g_gpu[sd].boundary_event;
+            ok = cuda_ok(cudaMemcpyPeerAsync(
+                            dst->ptr, g_gpu[dd].device_id,
+                            src->ptr, g_gpu[sd].device_id,
+                            bytes, s),
+                          "peer copy");
+            if (ok) ok = cuda_ok(cudaEventRecord(e, s), "peer event record");
+        }
+        if (!ok) return 0;
+        WITH_DEVICE(g_gpu[dd].device_id) {
+            cudaStream_t s2 = (cudaStream_t)g_gpu[dd].stream;
+            (void)cudaStreamWaitEvent(s2, (cudaEvent_t)g_gpu[sd].boundary_event, 0);
+            ok = cuda_ok(cudaStreamSynchronize(s2), "peer dst sync");
+        }
+        return ok;
+    }
+
+    /* Per-pair pinned-host bounce buffer. */
+    if (g_xdev_bounce_bytes[sd][dd] < bytes) {
+        if (g_xdev_bounce[sd][dd]) (void)cudaFreeHost(g_xdev_bounce[sd][dd]);
+        if (!cuda_ok(cudaMallocHost(&g_xdev_bounce[sd][dd], (size_t)bytes),
+                     "bounce alloc")) return 0;
+        g_xdev_bounce_bytes[sd][dd] = bytes;
+    }
+    int ok = 0;
+    WITH_DEVICE(g_gpu[sd].device_id) {
+        cudaStream_t s = (cudaStream_t)g_gpu[sd].stream;
+        cudaEvent_t  e = (cudaEvent_t)g_gpu[sd].boundary_event;
+        ok = cuda_ok(cudaMemcpyAsync(g_xdev_bounce[sd][dd], src->ptr, bytes,
+                                     cudaMemcpyDeviceToHost, s),
+                      "bounce d2h");
+        if (ok) ok = cuda_ok(cudaEventRecord(e, s), "bounce event record");
+    }
+    if (!ok) return 0;
+    WITH_DEVICE(g_gpu[dd].device_id) {
+        cudaStream_t s2 = (cudaStream_t)g_gpu[dd].stream;
+        (void)cudaStreamWaitEvent(s2, (cudaEvent_t)g_gpu[sd].boundary_event, 0);
+        ok = cuda_ok(cudaMemcpyAsync(dst->ptr, g_xdev_bounce[sd][dd], bytes,
+                                     cudaMemcpyHostToDevice, s2),
+                      "bounce h2d");
+        if (ok) ok = cuda_ok(cudaStreamSynchronize(s2), "bounce dst sync");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }

@@ -184,11 +184,20 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_kvstore.h linenoise.h
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+# Cross-device tensor copy test (mgpu-device-aware-cuda). Linux/CUDA only.
+ifneq ($(UNAME_S),Darwin)
+tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ tests/test_gpu_xdev.c
+
+tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+endif
 
 ds4_test: ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
