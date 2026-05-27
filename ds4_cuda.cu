@@ -1288,21 +1288,73 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     }
     g_n_gpus = cfg->n_gpus;
 
-    /* NxN peer-access matrix. */
+    /* NxN peer-access matrix.
+     *
+     * Driver semantics: cudaDeviceCanAccessPeer + cudaDeviceEnablePeerAccess
+     * can both succeed even on hardware/drivers where cudaMemcpyPeerAsync
+     * silently delivers wrong data (notably RTX 6000 Ada under recent
+     * NVIDIA drivers, per the v0 design doc). To guard against this, we
+     * also do a small in-process validation copy at init: write a known
+     * pattern on the source GPU, peer-copy it to the destination GPU,
+     * read it back, and only set peer_ok[i][j] if the bytes match. If
+     * validation fails, the entry stays at 0 and cross-device copies
+     * fall back to the pinned-host bounce path automatically. */
     for (int i = 0; i < g_n_gpus; i++) {
         for (int j = 0; j < g_n_gpus; j++) {
             if (i == j) { g_gpu_peer_ok[i][j] = 1; continue; }
             int can = 0;
             (void)cudaDeviceCanAccessPeer(&can, g_gpu[i].device_id,
                                           g_gpu[j].device_id);
-            if (can) {
-                (void)cudaSetDevice(g_gpu[i].device_id);
-                cudaError_t e = cudaDeviceEnablePeerAccess(g_gpu[j].device_id, 0);
-                g_gpu_peer_ok[i][j] = (e == cudaSuccess ||
-                                       e == cudaErrorPeerAccessAlreadyEnabled);
+            if (!can) { g_gpu_peer_ok[i][j] = 0; continue; }
+            (void)cudaSetDevice(g_gpu[i].device_id);
+            cudaError_t e = cudaDeviceEnablePeerAccess(g_gpu[j].device_id, 0);
+            int enabled = (e == cudaSuccess ||
+                           e == cudaErrorPeerAccessAlreadyEnabled);
+            (void)cudaGetLastError();
+            if (!enabled) { g_gpu_peer_ok[i][j] = 0; continue; }
+
+            /* Runtime validation: round-trip 128 bytes. If they don't
+             * match, the driver is silently wrong about peer support. */
+            const size_t VBYTES = 128;
+            unsigned char host_src[VBYTES];
+            unsigned char host_dst[VBYTES];
+            for (size_t k = 0; k < VBYTES; k++) host_src[k] = (unsigned char)((k * 13 + 7) & 0xff);
+            void *src_dev = NULL; void *dst_dev = NULL;
+            (void)cudaSetDevice(g_gpu[i].device_id);
+            if (cudaMalloc(&src_dev, VBYTES) != cudaSuccess) {
                 (void)cudaGetLastError();
-            } else {
-                g_gpu_peer_ok[i][j] = 0;
+                g_gpu_peer_ok[i][j] = 0; continue;
+            }
+            (void)cudaSetDevice(g_gpu[j].device_id);
+            if (cudaMalloc(&dst_dev, VBYTES) != cudaSuccess) {
+                (void)cudaGetLastError();
+                (void)cudaSetDevice(g_gpu[i].device_id);
+                (void)cudaFree(src_dev);
+                g_gpu_peer_ok[i][j] = 0; continue;
+            }
+            (void)cudaSetDevice(g_gpu[i].device_id);
+            (void)cudaMemcpy(src_dev, host_src, VBYTES, cudaMemcpyHostToDevice);
+            cudaError_t pc = cudaMemcpyPeer(dst_dev, g_gpu[j].device_id,
+                                            src_dev, g_gpu[i].device_id, VBYTES);
+            int peer_validated = 0;
+            if (pc == cudaSuccess) {
+                (void)cudaSetDevice(g_gpu[j].device_id);
+                if (cudaMemcpy(host_dst, dst_dev, VBYTES, cudaMemcpyDeviceToHost)
+                    == cudaSuccess) {
+                    peer_validated = (memcmp(host_src, host_dst, VBYTES) == 0);
+                }
+            }
+            (void)cudaSetDevice(g_gpu[j].device_id);
+            (void)cudaFree(dst_dev);
+            (void)cudaSetDevice(g_gpu[i].device_id);
+            (void)cudaFree(src_dev);
+
+            g_gpu_peer_ok[i][j] = peer_validated;
+            if (!peer_validated) {
+                fprintf(stderr,
+                    "ds4: peer access %d->%d enabled but validation copy"
+                    " produced wrong data; falling back to pinned-host bounce\n",
+                    g_gpu[i].device_id, g_gpu[j].device_id);
             }
         }
     }
