@@ -1283,16 +1283,21 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
 
-    /* Per-device init publishes g_n_gpus incrementally: once context `i` is
-     * fully set up, g_n_gpus becomes `i + 1` so any subsequent failure can
-     * be unwound by ds4_gpu_cleanup() walking [0, g_n_gpus). Without this,
-     * a mid-loop failure would leak streams/events/cuBLAS handles allocated
-     * on devices 0..i-1 because cleanup only walks the first g_n_gpus
-     * entries. */
+    /* g_n_gpus is published incrementally so ds4_gpu_cleanup() can unwind
+     * partial state on failure. We publish `i + 1` BEFORE allocating any
+     * resources for context `i`, so even if (e.g.) stream creation
+     * succeeds but event creation fails, cleanup still walks device `i`
+     * and destroys the stream. ds4_gpu_cleanup is null-safe per field —
+     * partial state is OK. */
     for (int i = 0; i < cfg->n_gpus; i++) {
         ds4_gpu_ctx *c = &g_gpu[i];
         c->device_id = cfg->device_indices[i];
         if (c->device_id < 0) return 0;
+        /* Publish the in-progress device id so cleanup can target it on
+         * any later failure. cudaSetDevice is also required before
+         * cleanup's cudaEventDestroy / cudaStreamDestroy / cublasDestroy
+         * calls hit the right context. */
+        g_n_gpus = i + 1;
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
@@ -1322,9 +1327,6 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         c->used_bytes   = 0;
         c->scratch      = NULL;
         c->scratch_bytes = 0;
-        /* Context `i` is now fully initialized — publish it so cleanup can
-         * unwind on later failure. */
-        g_n_gpus = i + 1;
     }
 
     /* NxN peer-access matrix.
