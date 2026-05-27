@@ -302,8 +302,24 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
     ds4_gpu_ctx *ctx = &g_gpu[logical_tier];
     if (ctx->scratch_bytes >= bytes) return ctx->scratch;
     int prev = -1;
-    (void)cudaGetDevice(&prev);
-    (void)cudaSetDevice(ctx->device_id);
+    cudaError_t derr = cudaGetDevice(&prev);
+    if (derr != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: cudaGetDevice failed before scratch alloc on tier %d (dev=%d, what=%s): %s\n",
+                logical_tier, ctx->device_id, what ? what : "scratch",
+                cudaGetErrorString(derr));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    derr = cudaSetDevice(ctx->device_id);
+    if (derr != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: cudaSetDevice(%d) failed before scratch alloc on tier %d (what=%s): %s\n",
+                ctx->device_id, logical_tier, what ? what : "scratch",
+                cudaGetErrorString(derr));
+        (void)cudaGetLastError();
+        return NULL;
+    }
     if (ctx->scratch) {
         (void)cudaFree(ctx->scratch);
         ctx->scratch = NULL;
@@ -777,7 +793,29 @@ static const __half *cuda_q8_f16_ptr(
     }
     if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
 
-    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
+    /* Source Q8 bytes:
+     *  - Single-tier (g_n_gpus <= 1): cuda_model_range_ptr — preserves the
+     *    legacy behavior (FD cache, host-register, or cudaMalloc-and-copy).
+     *  - Multi-tier (g_n_gpus > 1): the per-device selective cache must
+     *    already contain the weight on expected_device. Use the strict
+     *    lookup; on miss this is a placement bug and we hard-fail.
+     */
+    const char *q8;
+    if (g_n_gpus <= 1) {
+        q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
+    } else {
+        void *strict_ptr = NULL;
+        if (!ds4_gpu_lookup_cache_strict(offset, weight_bytes, expected_device, &strict_ptr) ||
+            !strict_ptr) {
+            fprintf(stderr,
+                "ds4: q8 fp16 cache miss: source bytes not in selective cache for "
+                "offset=%llu bytes=%llu device=%d (label=%s); placement bug\n",
+                (unsigned long long)offset, (unsigned long long)weight_bytes,
+                expected_device, label ? label : "?");
+            return NULL;
+        }
+        q8 = (const char *)strict_ptr;
+    }
     if (!q8) return NULL;
 
     if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
@@ -786,8 +824,20 @@ static const __half *cuda_q8_f16_ptr(
 
     int prev = -1;
     if (g_n_gpus > 1) {
-        (void)cudaGetDevice(&prev);
-        (void)cudaSetDevice(expected_device);
+        cudaError_t derr = cudaGetDevice(&prev);
+        if (derr != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaGetDevice failed before q8 fp16 alloc on device %d: %s\n",
+                    expected_device, cudaGetErrorString(derr));
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        derr = cudaSetDevice(expected_device);
+        if (derr != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaSetDevice(%d) failed before q8 fp16 alloc: %s\n",
+                    expected_device, cudaGetErrorString(derr));
+            (void)cudaGetLastError();
+            return NULL;
+        }
     }
     __half *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
@@ -857,14 +907,43 @@ static float *cuda_q8_f32_ptr(
     }
     if (!cuda_q8_f32_cache_allowed(label, in_dim, out_dim)) return NULL;
 
-    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, label ? label : "q8_0");
+    /* Source Q8 bytes: legacy path in single-tier; strict per-device lookup
+     * in multi-tier (same rationale as cuda_q8_f16_ptr). */
+    const char *q8;
+    if (g_n_gpus <= 1) {
+        q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, label ? label : "q8_0");
+    } else {
+        void *strict_ptr = NULL;
+        if (!ds4_gpu_lookup_cache_strict(offset, weight_bytes, expected_device, &strict_ptr) ||
+            !strict_ptr) {
+            fprintf(stderr,
+                "ds4: q8 fp32 cache miss: source bytes not in selective cache for "
+                "offset=%llu bytes=%llu device=%d (label=%s); placement bug\n",
+                (unsigned long long)offset, (unsigned long long)weight_bytes,
+                expected_device, label ? label : "?");
+            return NULL;
+        }
+        q8 = (const char *)strict_ptr;
+    }
     if (!q8) return NULL;
 
     const uint64_t out_bytes = in_dim * out_dim * sizeof(float);
     int prev = -1;
     if (g_n_gpus > 1) {
-        (void)cudaGetDevice(&prev);
-        (void)cudaSetDevice(expected_device);
+        cudaError_t derr = cudaGetDevice(&prev);
+        if (derr != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaGetDevice failed before q8 fp32 alloc on device %d: %s\n",
+                    expected_device, cudaGetErrorString(derr));
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        derr = cudaSetDevice(expected_device);
+        if (derr != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaSetDevice(%d) failed before q8 fp32 alloc: %s\n",
+                    expected_device, cudaGetErrorString(derr));
+            (void)cudaGetLastError();
+            return NULL;
+        }
     }
     float *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
@@ -2540,13 +2619,37 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
     /* Walk every initialized per-tier handle. Single-tier (g_n_gpus == 1)
      * walks exactly one entry — g_gpu[0].cublas, which is the same handle
      * the legacy g_cublas alias points at — so the SetMathMode call is
-     * bit-identical to the pre-task path. */
+     * bit-identical to the pre-task path. On any device-switch failure,
+     * skip the tier and continue — the function is void and the math-mode
+     * setting is advisory, but log so misconfiguration is visible. */
     for (int i = 0; i < g_n_gpus; i++) {
         if (!g_gpu[i].cublas_ready || !g_gpu[i].cublas) continue;
         int prev = -1;
-        (void)cudaGetDevice(&prev);
-        (void)cudaSetDevice(g_gpu[i].device_id);
-        (void)cublasSetMathMode((cublasHandle_t)g_gpu[i].cublas, math_mode);
+        cudaError_t derr = cudaGetDevice(&prev);
+        if (derr != cudaSuccess) {
+            fprintf(stderr,
+                "ds4: ds4_gpu_set_quality: cudaGetDevice failed before tier %d "
+                "(dev=%d): %s; skipping\n",
+                i, g_gpu[i].device_id, cudaGetErrorString(derr));
+            (void)cudaGetLastError();
+            continue;
+        }
+        derr = cudaSetDevice(g_gpu[i].device_id);
+        if (derr != cudaSuccess) {
+            fprintf(stderr,
+                "ds4: ds4_gpu_set_quality: cudaSetDevice(%d) failed for tier %d: "
+                "%s; skipping\n",
+                g_gpu[i].device_id, i, cudaGetErrorString(derr));
+            (void)cudaGetLastError();
+            continue;
+        }
+        cublasStatus_t st = cublasSetMathMode((cublasHandle_t)g_gpu[i].cublas, math_mode);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr,
+                "ds4: ds4_gpu_set_quality: cublasSetMathMode failed on tier %d "
+                "(dev=%d): status %d\n",
+                i, g_gpu[i].device_id, (int)st);
+        }
         if (prev >= 0) (void)cudaSetDevice(prev);
     }
 }
