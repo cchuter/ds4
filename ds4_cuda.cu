@@ -1684,13 +1684,21 @@ extern "C" int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
         const cache_range_entry *match_pref = NULL;
         while (it != g_cache_ranges.begin()) {
             --it;
-            if (source_offset >= it->source_offset &&
-                source_offset + bytes <= it->source_offset + it->bytes) {
-                if (it->device_id == active_device) {
-                    match_pref = &*it;
-                    break;
+            /* Overflow-safe coverage check:
+             *   1. source_offset >= it->source_offset
+             *   2. bytes <= it->bytes - (source_offset - it->source_offset)
+             * The second form computes only the remaining capacity inside
+             * the entry, so neither side can overflow even with bytes ==
+             * UINT64_MAX. */
+            if (source_offset >= it->source_offset) {
+                uint64_t into = source_offset - it->source_offset;
+                if (into <= it->bytes && bytes <= it->bytes - into) {
+                    if (it->device_id == active_device) {
+                        match_pref = &*it;
+                        break;
+                    }
+                    if (!match_any) match_any = &*it;
                 }
-                if (!match_any) match_any = &*it;
             }
             /* Do NOT break on non-covering: an earlier entry may still
              * cover if its bytes extend far enough. */

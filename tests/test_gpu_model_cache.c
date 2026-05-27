@@ -79,6 +79,14 @@ int main(void) {
     /* Convenience wrapper. */
     CHECK(ds4_gpu_lookup_cache_device(0, 1024) == 0, "lookup_device range 0");
 
+    /* Lookup must be overflow-safe: a query with bytes=UINT64_MAX must
+     * not wrap around into a false hit. */
+    int dev_overflow = -1; void *ptr_overflow = NULL;
+    int hit = ds4_gpu_lookup_cache(100, UINT64_MAX, &dev_overflow, &ptr_overflow);
+    /* Either miss (preferred), or hit but the path must NOT have wrapped.
+     * Accept miss only — a wrap-induced hit would be a bug. */
+    CHECK(hit == 0, "lookup with bytes=UINT64_MAX does not wrap into a false hit");
+
     /* Bounds-check: ranges that overflow the model must be rejected
      * before any allocation. */
     ds4_tensor_range bad_overflow = { 0, total + 1, 0 };
