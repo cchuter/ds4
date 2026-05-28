@@ -19,6 +19,7 @@
 
 #include "ds4.h"
 #include "ds4_gpu_mgpu.h"
+#include "ds4_layer_pack.h"   /* DS4_LAYER_PACK_CPU */
 
 #include <cuda_runtime.h>
 #include <math.h>
@@ -28,6 +29,12 @@
 
 #ifndef DS4_N_VOCAB
 #define DS4_N_VOCAB 129280
+#endif
+
+/* DS4_N_LAYER is an internal enum in ds4.c. Hardcoded here for the test
+ * placement-size assertion; matches the constant in ds4.c. */
+#ifndef DS4_TEST_N_LAYER
+#define DS4_TEST_N_LAYER 43
 #endif
 
 /* Declared in ds4.c under DS4_TEST_HOOKS. */
@@ -103,13 +110,13 @@ static int argmax_f32(const float *a, size_t n) {
  * The test needs a prompt long enough to exercise prefill but short
  * enough to run in seconds. We tokenize a hard-coded UTF-8 string via
  * ds4_tokenize. */
-static int build_prompt(ds4_engine *e, ds4_tokens *out) {
+static void build_prompt(ds4_engine *e, ds4_tokens *out) {
     /* A short English-only prompt with enough tokens to exercise prefill.
      * Tokenizer is deterministic. */
     const char *text = "The quick brown fox jumps over the lazy dog. " \
                        "It was a dark and stormy night, and the wind " \
                        "howled across the empty fields beyond the village.";
-    return ds4_tokenize(e, text, out);
+    ds4_tokenize_text(e, text, out);
 }
 
 int main(void) {
@@ -149,7 +156,8 @@ int main(void) {
     CHECKF(rc == 0 && e1 != NULL, "single-tier engine_open failed (rc=%d)", rc);
 
     ds4_tokens prompt1 = {0};
-    CHECK(build_prompt(e1, &prompt1) == 0 && prompt1.len > 0, "tokenize prompt");
+    build_prompt(e1, &prompt1);
+    CHECK(prompt1.len > 0, "tokenize prompt");
 
     ds4_session *s1 = NULL;
     rc = ds4_session_create(&s1, e1, 4096);
@@ -206,7 +214,7 @@ int main(void) {
     const int *placement = ds4_test_engine_placement(e2);
     CHECK(placement != NULL, "engine placement should be exposed");
     int any_tier_1 = 0;
-    int n_entries = DS4_N_LAYER + 2; /* embedding, per-layer, head */
+    int n_entries = DS4_TEST_N_LAYER + 2; /* embedding, per-layer, head */
     for (int i = 0; i < n_entries; i++) {
         if (placement[i] == DS4_LAYER_PACK_CPU) {
             fprintf(stderr, "FAIL: placement crossed to CPU at entry %d (test budget too tight?)\n", i);
@@ -218,7 +226,8 @@ int main(void) {
     CHECK(any_tier_1, "test budgets should force at least one entry on tier 1");
 
     ds4_tokens prompt2 = {0};
-    CHECK(build_prompt(e2, &prompt2) == 0 && prompt2.len > 0, "tokenize prompt (multi-tier)");
+    build_prompt(e2, &prompt2);
+    CHECK(prompt2.len > 0, "tokenize prompt (multi-tier)");
 
     ds4_session *s2 = NULL;
     rc = ds4_session_create(&s2, e2, 4096);
