@@ -16740,6 +16740,13 @@ struct ds4_engine {
     int            placement[DS4_MAX_LAYER + 2];
     int            n_placement_entries;
     int            multi_tier;
+
+    /* mgpu-auto-vram-fix: max-context hint copied from
+     * ds4_engine_options.placement_ctx_hint. Used by
+     * engine_compute_entry_bytes for per-layer KV estimation.
+     * Zero / negative = legacy 4096 fallback (single-tier paths and any
+     * caller that doesn't set the option observe the prior behavior). */
+    int            placement_ctx_hint;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -17975,6 +17982,107 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
     return m;
 }
 #endif
+
+/* mgpu-auto-vram-fix: per-layer KV+scratch byte estimate at a given
+ * context size for the CUDA / Metal graph backend. Mirrors the per-layer
+ * accounting the graph backend uses at allocation time, so the multi-GPU
+ * layer packer (engine_compute_entry_bytes) can price each layer
+ * individually instead of dividing a global total uniformly across all
+ * layers. Heterogeneous attention compression (raw / ratio-4 /
+ * ratio-128) is then represented faithfully in the placement plan.
+ *
+ * Visible in both GPU and DS4_NO_GPU builds so the placement-test
+ * harness (which builds ds4.c with -DDS4_NO_GPU) can exercise the same
+ * packer code paths.
+ *
+ * Accounting (matches the graph branch of ds4_context_memory_estimate):
+ *   raw_bytes_per_layer       = raw_cap * DS4_N_HEAD_DIM * sizeof(float)
+ *                               applied to EVERY layer (the GPU graph
+ *                               allocates a raw entry for every layer,
+ *                               with the sliding-window cap applied at
+ *                               execution time, not at planning time).
+ *   compressed_bytes_per_layer = ratio==0 -> 0
+ *                                ratio!=0 -> (ctx/ratio + 2) * DS4_N_HEAD_DIM *
+ *                                            sizeof(float)
+ *                                            (uses sizeof(float) rather
+ *                                             than the F16/F32 choice
+ *                                             made at GPU build time —
+ *                                             over-estimates on Apple
+ *                                             Metal (F16 cache) which is
+ *                                             the desired conservative
+ *                                             posture for the planner).
+ *                                            + (ratio==4 ? (ctx/ratio + 2) *
+ *                                                          DS4_N_INDEXER_HEAD_DIM *
+ *                                                          sizeof(float)
+ *                                                        : 0)
+ *   scratch_share_per_layer   = global scratch_bytes / DS4_N_LAYER
+ *                               (scratch is allocated per-tier at
+ *                               execution time, so charging a share to
+ *                               every layer ensures every tier that owns
+ *                               layers gets a proportional scratch
+ *                               charge).
+ *
+ * Invariant (by construction): sum over il of
+ * engine_per_layer_kv_bytes_planner(il, ctx) ==
+ *   DS4_N_LAYER * raw_cap * DS4_N_HEAD_DIM * sizeof(float)
+ *   + sum_over_ratio_layers(compressed_per_layer)
+ *   + scratch_bytes
+ * which is the F32-sizing equivalent of
+ * ds4_context_memory_estimate(CUDA, ctx).total_bytes (>= the F16 build's
+ * total).
+ */
+static size_t engine_per_layer_kv_bytes_planner(uint32_t il, int ctx_size) {
+    if (ctx_size <= 0) return 0;
+    if (il >= DS4_N_LAYER) return 0;
+    const uint32_t ctx = (uint32_t)ctx_size;
+
+    /* Raw KV cache: every layer gets a raw entry sized at the steady-state
+     * sliding-window cap. The graph backend pads this to 256-row multiples
+     * and may add a prefill-cap delta at execution time; the planner uses
+     * the steady-state value as a conservative lower bound (over-estimate
+     * vs. F16 storage handled by always using sizeof(float)). */
+    uint32_t raw_cap = DS4_N_SWA;
+    if (raw_cap > ctx) raw_cap = ctx;
+    if (raw_cap == 0) raw_cap = 1;
+    size_t bytes = (size_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+
+    /* Compressed + indexer for ratio != 0 layers. */
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio != 0) {
+        const uint32_t layer_comp_cap = ctx / ratio + 2u;
+        bytes += (size_t)layer_comp_cap * DS4_N_HEAD_DIM * sizeof(float);
+        if (ratio == 4) {
+            bytes += (size_t)layer_comp_cap * DS4_N_INDEXER_HEAD_DIM *
+                     sizeof(float);
+        }
+    }
+
+    /* Scratch share: divide the global scratch_bytes evenly across all
+     * layers so every tier that owns layers gets a proportional scratch
+     * charge. Scratch math mirrors the graph branch of
+     * ds4_context_memory_estimate: 2 * comp_cap * prefill_cap floats +
+     * attn_stage_cap * DS4_N_HEAD_DIM floats. */
+    uint32_t prefill_cap = (uint32_t)ctx;
+    if (prefill_cap > 4096u) prefill_cap = 4096u;
+    if (prefill_cap == 0) prefill_cap = 1;
+    uint32_t min_ratio = UINT32_MAX;
+    for (uint32_t l = 0; l < DS4_N_LAYER; l++) {
+        const uint32_t r = ds4_layer_compress_ratio(l);
+        if (r != 0 && r < min_ratio) min_ratio = r;
+    }
+    if (min_ratio == UINT32_MAX) min_ratio = ctx;
+    if (min_ratio == 0) min_ratio = 1;
+    uint32_t comp_cap = ctx / min_ratio + 2u;
+    if (comp_cap < 2u) comp_cap = 2u;
+    uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
+    if (attn_stage_cap < 2u) attn_stage_cap = 2u;
+    const uint64_t scratch_bytes =
+        2ull * (uint64_t)comp_cap * (uint64_t)prefill_cap * sizeof(float) +
+        attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
+    bytes += (size_t)(scratch_bytes / (uint64_t)DS4_N_LAYER);
+
+    return bytes;
+}
 
 /* =========================================================================
  * Engine API and Process Lock.
@@ -19744,14 +19852,24 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
         out[entry] += t->bytes;
     }
 
-    /* Per-layer KV/scratch estimate at a conservative context size.
-     * bench harness will tune this; the packer just needs the per-entry
-     * numbers to be self-consistent. */
-    const int est_ctx = 4096;
+    /* Per-layer KV/scratch estimate. The CTX hint is plumbed from the CLI
+     * (--ctx, --ctx-max, etc.) so the packer accounts for the actual
+     * session size the user intends to allocate. Zero/unset falls back to
+     * the legacy 4096 value for back-compat with callers that don't
+     * populate the option (single-tier paths, tests). */
+    const int est_ctx = (e->placement_ctx_hint > 0) ? e->placement_ctx_hint : 4096;
     ds4_context_memory mem = ds4_context_memory_estimate(DS4_BACKEND_CUDA, est_ctx);
     if (mem.total_bytes > 0) {
-        const size_t per_layer_kv = (size_t)(mem.total_bytes / (uint64_t)DS4_N_LAYER);
-        for (int i = 1; i <= DS4_N_LAYER; i++) out[i] += per_layer_kv;
+        /* Per-layer KV by attention type. The planner helper returns raw
+         * + compressed + scratch_share for each layer; summing across all
+         * layers reproduces the planner's F32-sized total_bytes
+         * by construction (see invariant comment on
+         * engine_per_layer_kv_bytes_planner). mem.total_bytes is used
+         * only as a sentinel — its value is intentionally re-derived per
+         * layer by the planner helper to avoid F16/F32 build-time skew. */
+        for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+            out[il + 1] += engine_per_layer_kv_bytes_planner(il, est_ctx);
+        }
     } else {
         /* Fallback: 128 MiB per layer as a static estimate. */
         const size_t fallback_per_layer = (size_t)128ull * 1024ull * 1024ull;
@@ -20116,6 +20234,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
+    e->placement_ctx_hint = opt->placement_ctx_hint;
     ds4_acquire_instance_lock();
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);

@@ -425,6 +425,13 @@ int main(int argc, char **argv) {
     }
     log_context_memory(cfg.backend, cfg.ctx_alloc);
 
+    /* mgpu-auto-vram-fix: hint the packer at the largest ctx this bench
+     * run will exercise so per-layer KV bytes are priced for the real
+     * session size, not a stale 4096 default. Single-tier and CPU paths
+     * ignore this. */
+    int placement_ctx_hint = cfg.ctx_max;
+    if (cfg.ctx_alloc > placement_ctx_hint) placement_ctx_hint = cfg.ctx_alloc;
+
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .backend = cfg.backend,
@@ -432,6 +439,7 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .placement_ctx_hint = placement_ctx_hint,
     };
     ds4_engine *engine = NULL;
     /* CLI flag wiring: route through ds4_engine_create_with_gpu_config
