@@ -18031,22 +18031,85 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
  * ds4_context_memory_estimate(CUDA, ctx).total_bytes (>= the F16 build's
  * total).
  */
+/* Planner equivalents of metal_graph_prefill_cap_for_prompt and
+ * metal_graph_raw_cap_for_context. The graph variants live inside
+ * `#ifndef DS4_NO_GPU` blocks (they share the env knob plumbing with
+ * the GPU execution path); these inline copies replicate the same
+ * numeric math so the planner can be called from both build flavors.
+ *
+ * If the env-knob behavior in the graph helpers ever changes, update
+ * these two helpers in lockstep. Tested via:
+ *   sum(engine_per_layer_kv_bytes_planner(il, ctx) for il in 0..N) ==
+ *   F32-sized ds4_context_memory_estimate(CUDA, ctx).total_bytes.
+ */
+static uint32_t engine_planner_prefill_cap(int prompt_len) {
+    if (prompt_len <= 0) return 1;
+    uint32_t cap = (uint32_t)prompt_len;
+    const char *env = getenv("DS4_METAL_PREFILL_CHUNK");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const long v = strtol(env, &endp, 10);
+        if (endp != env) {
+            if (v <= 0) return cap;
+            cap = (uint32_t)v;
+        }
+    } else if (prompt_len > 4096) {
+        cap = 4096u;
+    }
+    if (cap == 0) cap = 1;
+    if (cap > (uint32_t)prompt_len) cap = (uint32_t)prompt_len;
+    return cap;
+}
+
+static uint32_t engine_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
+    if (ctx_size <= 0) return 1;
+    uint32_t raw_window = DS4_N_SWA;
+    if (raw_window > (uint32_t)ctx_size) raw_window = (uint32_t)ctx_size;
+    if (raw_window == 0) raw_window = 1;
+
+    /* Pad to 256-row multiple so the planner matches the graph layout. */
+    uint64_t wanted = (uint64_t)raw_window + prefill_cap;
+    if (wanted > (uint32_t)ctx_size) wanted = (uint32_t)ctx_size;
+    if (wanted == 0) wanted = 1;
+    /* align_up to 256 — inline since align_up is defined upstream. */
+    const uint64_t align = 256u;
+    wanted = (wanted + align - 1u) & ~(align - 1u);
+    if (wanted > 8192u) wanted = 8192u;
+    uint32_t raw_cap = (uint32_t)wanted;
+    if (raw_cap < raw_window) raw_cap = raw_window;
+
+    /* Env override (matches metal_graph_raw_cap_for_context behavior). */
+    const char *env = getenv("DS4_METAL_GRAPH_RAW_CAP");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const long v = strtol(env, &endp, 10);
+        if (endp != env && v > 0) {
+            raw_cap = (uint32_t)v;
+            if (raw_cap > (uint32_t)ctx_size) raw_cap = (uint32_t)ctx_size;
+            if (raw_cap > 8192u) raw_cap = 8192u;
+            if (raw_cap < raw_window) raw_cap = raw_window;
+        }
+    }
+    return raw_cap;
+}
+
 static size_t engine_per_layer_kv_bytes_planner(uint32_t il, int ctx_size) {
     if (ctx_size <= 0) return 0;
     if (il >= DS4_N_LAYER) return 0;
     const uint32_t ctx = (uint32_t)ctx_size;
 
-    /* Raw KV cache: every layer gets a raw entry sized at the steady-state
-     * sliding-window cap. The graph backend pads this to 256-row multiples
-     * and may add a prefill-cap delta at execution time; the planner uses
-     * the steady-state value as a conservative lower bound (over-estimate
-     * vs. F16 storage handled by always using sizeof(float)). */
-    uint32_t raw_cap = DS4_N_SWA;
-    if (raw_cap > ctx) raw_cap = ctx;
-    if (raw_cap == 0) raw_cap = 1;
+    /* Raw KV cache: every layer gets a raw entry sized by raw_cap, the
+     * same value the GPU graph requests per layer at
+     * metal_graph_alloc_kv_cache_tensor_on(. , raw_cap * DS4_N_HEAD_DIM *
+     * sizeof(float)). raw_cap factors in raw_window padding + prefill_cap
+     * and clamps to [raw_window, 8192]. */
+    const uint32_t prefill_cap = engine_planner_prefill_cap((int)ctx);
+    const uint32_t raw_cap = engine_planner_raw_cap((int)ctx, prefill_cap);
     size_t bytes = (size_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float);
 
-    /* Compressed + indexer for ratio != 0 layers. */
+    /* Compressed + indexer for ratio != 0 layers. Uses sizeof(float)
+     * unconditionally (over-estimates on Apple Metal F16 cache, which
+     * is the desired conservative posture per spec criterion 8). */
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     if (ratio != 0) {
         const uint32_t layer_comp_cap = ctx / ratio + 2u;
@@ -18059,12 +18122,8 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il, int ctx_size) {
 
     /* Scratch share: divide the global scratch_bytes evenly across all
      * layers so every tier that owns layers gets a proportional scratch
-     * charge. Scratch math mirrors the graph branch of
-     * ds4_context_memory_estimate: 2 * comp_cap * prefill_cap floats +
-     * attn_stage_cap * DS4_N_HEAD_DIM floats. */
-    uint32_t prefill_cap = (uint32_t)ctx;
-    if (prefill_cap > 4096u) prefill_cap = 4096u;
-    if (prefill_cap == 0) prefill_cap = 1;
+     * charge. Math mirrors the graph branch of
+     * ds4_context_memory_estimate at ds4.c:16362-16368. */
     uint32_t min_ratio = UINT32_MAX;
     for (uint32_t l = 0; l < DS4_N_LAYER; l++) {
         const uint32_t r = ds4_layer_compress_ratio(l);
