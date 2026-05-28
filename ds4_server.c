@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_gpu_args.h"
+#include "ds4_gpu_mgpu.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -10914,6 +10916,9 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    /* mgpu-cli-wiring: raw --gpu-vram / --gpu-devices argv values. */
+    const char *gpu_vram_arg;
+    const char *gpu_devices_arg;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11017,6 +11022,9 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "  --gpu-vram N[,N,...]   Per-device VRAM budget in GB (comma-separated for\n"
+        "                         multi-GPU). \"auto\" detects free VRAM. \"0\" forces CPU.\n"
+        "  --gpu-devices N[,N,...] Restrict to listed CUDA device indices.\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
         "\n"
@@ -11179,6 +11187,10 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--gpu-vram")) {
+            c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-devices")) {
+            c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
@@ -11220,7 +11232,40 @@ int main(int argc, char **argv) {
     }
 
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+    /* mgpu-cli-wiring: route through ds4_engine_create_with_gpu_config
+     * when --gpu-vram / --gpu-devices was supplied. Layout is fixed at
+     * process start; no per-request placement. */
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        ds4_gpu_config gpu_cfg = (ds4_gpu_config){0};
+        bool skip_cuda = false;
+        char errbuf[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                                &gpu_cfg, &skip_cuda,
+                                errbuf, sizeof(errbuf)) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: %s", errbuf);
+            return 2;
+        }
+        if (skip_cuda) {
+            cfg.engine.backend = DS4_BACKEND_CPU;
+            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+        } else {
+            /* Auto-detect runs in two cases: explicit `--gpu-vram auto`,
+             * OR `--gpu-devices X` alone (parser auto-promotes to auto). */
+            const bool was_auto =
+                (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto"))
+                || (cfg.gpu_vram_arg == NULL && cfg.gpu_devices_arg != NULL);
+            char layout[256];
+            if (format_gpu_layout_line(&gpu_cfg, was_auto, layout, sizeof(layout)) > 0) {
+                fprintf(stdout, "%s\n", layout);
+                fflush(stdout);
+            }
+            cfg.engine.backend = DS4_BACKEND_CUDA;
+            if (ds4_engine_create_with_gpu_config(&engine, &cfg.engine,
+                                                    &gpu_cfg) != 0) return 1;
+        }
+    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+        return 1;
+    }
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
 

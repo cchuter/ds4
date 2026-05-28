@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_gpu_args.h"
+#include "ds4_gpu_mgpu.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -36,6 +38,9 @@ typedef struct {
     double step_mul;
     bool warm_weights;
     bool quality;
+    /* mgpu-cli-wiring: raw --gpu-vram / --gpu-devices argv values. */
+    const char *gpu_vram_arg;
+    const char *gpu_devices_arg;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -65,6 +70,10 @@ static void usage(FILE *fp) {
         "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
+        "      --cuda is device-0-only; use --gpu-vram for multi-GPU.\n"
+        "  --gpu-vram N[,N,...]   Per-device VRAM budget in GB (comma-separated for\n"
+        "                         multi-GPU). \"auto\" detects free VRAM. \"0\" forces CPU.\n"
+        "  --gpu-devices N[,N,...] Restrict to listed CUDA device indices.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
@@ -215,6 +224,10 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--gpu-vram")) {
+            c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-devices")) {
+            c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
@@ -285,6 +298,14 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
+    /* mgpu-cli-wiring: resolve backend before logging context-memory. */
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        if (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "0")) {
+            cfg.backend = DS4_BACKEND_CPU;
+        } else {
+            cfg.backend = DS4_BACKEND_CUDA;
+        }
+    }
     log_context_memory(cfg.backend, cfg.ctx_alloc);
 
     ds4_engine_options opt = {
@@ -295,7 +316,40 @@ int main(int argc, char **argv) {
         .quality = cfg.quality,
     };
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &opt) != 0) return 1;
+    /* mgpu-cli-wiring: route through ds4_engine_create_with_gpu_config
+     * when --gpu-vram or --gpu-devices was supplied. See
+     * docs/plans/mgpu-cli-wiring.md for the single-source-of-truth
+     * routing rule. */
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        ds4_gpu_config gpu_cfg = (ds4_gpu_config){0};
+        bool skip_cuda = false;
+        char errbuf[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                                &gpu_cfg, &skip_cuda,
+                                errbuf, sizeof(errbuf)) != 0) {
+            fprintf(stderr, "ds4-bench: %s\n", errbuf);
+            return 2;
+        }
+        if (skip_cuda) {
+            opt.backend = DS4_BACKEND_CPU;
+            if (ds4_engine_open(&engine, &opt) != 0) return 1;
+        } else {
+            /* Auto-detect runs in two cases: explicit `--gpu-vram auto`,
+             * OR `--gpu-devices X` alone (parser auto-promotes to auto). */
+            const bool was_auto =
+                (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto"))
+                || (cfg.gpu_vram_arg == NULL && cfg.gpu_devices_arg != NULL);
+            char layout[256];
+            if (format_gpu_layout_line(&gpu_cfg, was_auto, layout, sizeof(layout)) > 0) {
+                fprintf(stdout, "%s\n", layout);
+                fflush(stdout);
+            }
+            opt.backend = DS4_BACKEND_CUDA;
+            if (ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) return 1;
+        }
+    } else if (ds4_engine_open(&engine, &opt) != 0) {
+        return 1;
+    }
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};

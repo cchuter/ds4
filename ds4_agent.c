@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_gpu_args.h"
+#include "ds4_gpu_mgpu.h"
 #include "ds4_kvstore.h"
 #include "linenoise.h"
 
@@ -60,6 +62,9 @@ typedef struct {
 typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
+    /* mgpu-cli-wiring: raw --gpu-vram / --gpu-devices argv values. */
+    const char *gpu_vram_arg;
+    const char *gpu_devices_arg;
 } agent_config;
 
 typedef enum {
@@ -394,6 +399,9 @@ static void usage(FILE *fp) {
         "  --nothink              Disable thinking.\n"
         "  --backend NAME         metal, cuda, or cpu.\n"
         "  --metal, --cuda, --cpu Select backend explicitly.\n"
+        "  --gpu-vram N[,N,...]   Per-device VRAM budget in GB (comma-separated for\n"
+        "                         multi-GPU). \"auto\" detects free VRAM. \"0\" forces CPU.\n"
+        "  --gpu-devices N[,N,...] Restrict to listed CUDA device indices.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where available.\n"
         "  --warm-weights         Touch mapped tensor pages before generation.\n"
@@ -483,6 +491,10 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--gpu-vram")) {
+            c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-devices")) {
+            c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -7165,10 +7177,50 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    /* mgpu-cli-wiring: resolve backend before logging context-memory. */
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        if (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "0")) {
+            cfg.engine.backend = DS4_BACKEND_CPU;
+        } else {
+            cfg.engine.backend = DS4_BACKEND_CUDA;
+        }
+    }
     log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
 
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+    /* mgpu-cli-wiring: route through ds4_engine_create_with_gpu_config
+     * when the user opted in via --gpu-vram / --gpu-devices. */
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        ds4_gpu_config gpu_cfg = (ds4_gpu_config){0};
+        bool skip_cuda = false;
+        char errbuf[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                                &gpu_cfg, &skip_cuda,
+                                errbuf, sizeof(errbuf)) != 0) {
+            fprintf(stderr, "ds4-agent: %s\n", errbuf);
+            return 2;
+        }
+        if (skip_cuda) {
+            cfg.engine.backend = DS4_BACKEND_CPU;
+            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+        } else {
+            /* Auto-detect runs in two cases: explicit `--gpu-vram auto`,
+             * OR `--gpu-devices X` alone (parser auto-promotes to auto). */
+            const bool was_auto =
+                (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto"))
+                || (cfg.gpu_vram_arg == NULL && cfg.gpu_devices_arg != NULL);
+            char layout[256];
+            if (format_gpu_layout_line(&gpu_cfg, was_auto, layout, sizeof(layout)) > 0) {
+                fprintf(stdout, "%s\n", layout);
+                fflush(stdout);
+            }
+            cfg.engine.backend = DS4_BACKEND_CUDA;
+            if (ds4_engine_create_with_gpu_config(&engine, &cfg.engine,
+                                                    &gpu_cfg) != 0) return 1;
+        }
+    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+        return 1;
+    }
 
     struct sigaction old_int;
     struct sigaction sa;
