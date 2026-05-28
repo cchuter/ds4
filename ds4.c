@@ -20339,11 +20339,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
         int spilled = 0;
         size_t spilled_bytes = 0;
         size_t entry_bytes_buf[DS4_MAX_LAYER + 2];
-        if (engine_compute_entry_bytes(e, entry_bytes_buf) == 0) {
+        size_t used_bytes[DS4_LAYER_PACK_MAX_GPUS] = {0};
+        size_t budget_bytes[DS4_LAYER_PACK_MAX_GPUS] = {0};
+        int have_entry_bytes = (engine_compute_entry_bytes(e, entry_bytes_buf) == 0);
+        if (have_entry_bytes) {
+            for (int d = 0; d < gpu_cfg->n_gpus; d++) {
+                budget_bytes[d] = gpu_cfg->vram_bytes[d];
+            }
             for (int i = 0; i < e->n_placement_entries; i++) {
-                if (e->placement[i] == DS4_LAYER_PACK_CPU) {
+                int dev = e->placement[i];
+                if (dev == DS4_LAYER_PACK_CPU) {
                     spilled++;
                     spilled_bytes += entry_bytes_buf[i];
+                } else if (dev >= 0 && dev < gpu_cfg->n_gpus) {
+                    used_bytes[dev] += entry_bytes_buf[i];
                 }
             }
         }
@@ -20352,6 +20361,29 @@ static int ds4_engine_open_internal(ds4_engine **out,
             for (int d = 0; d < gpu_cfg->n_gpus; d++) {
                 total_budget += gpu_cfg->vram_bytes[d];
             }
+            /* Print the attempted layout so the user can see WHY the
+             * placement spilled. ds4_layer_pack_print emits the
+             * "multi-GPU layout:" header expected by the refusal regression
+             * test. We skip the peer-access matrix because that requires
+             * GPU init state which is intentionally not run on this
+             * early-refusal path. */
+            if (have_entry_bytes) {
+                ds4_layer_pack_print(stderr,
+                                      e->placement,
+                                      e->n_placement_entries,
+                                      DS4_N_LAYER,
+                                      entry_bytes_buf,
+                                      used_bytes,
+                                      budget_bytes,
+                                      gpu_cfg->n_gpus);
+            }
+            /* Keep the legacy diagnostic strings the refusal regression
+             * test in tests/test_engine_mgpu_refusal looks for. The
+             * "mgpu-graph-session-cpu-spill" name refers to the wave-3b
+             * CPU-spill execution follow-up task. */
+            fprintf(stderr,
+                "ds4: CPU-spill placement detected; CPU-tier execution wiring "
+                "is the wave-3b mgpu-graph-session-cpu-spill follow-up.\n");
             fprintf(stderr,
                 "ds4: --gpu-vram placement does not fit at the requested "
                 "context (ctx hint = %d):\n"
