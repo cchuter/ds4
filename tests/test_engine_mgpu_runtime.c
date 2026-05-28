@@ -197,11 +197,12 @@ int main(void) {
     cfg.n_gpus = 2;
     cfg.device_indices[0] = 0;
     cfg.device_indices[1] = 1;
-    /* GPU0 has ~the full free VRAM on the test box; GPU1 has ~17 GiB free
-     * because unrelated workloads occupy ~30 GiB. Budget {40, 8} GiB after
-     * a 1 GiB safety margin, per plan §8. */
-    cfg.vram_bytes[0] = (size_t)40ull * 1024ull * 1024ull * 1024ull;
-    cfg.vram_bytes[1] = (size_t)8ull  * 1024ull * 1024ull * 1024ull;
+    /* GPU0 has ~48 GiB free on the test box; GPU1 has ~17 GiB free
+     * because unrelated workloads occupy ~30 GiB. Budget {44, 14} GiB
+     * after a 1 GiB safety margin — enough headroom to fit the entire
+     * model across two GPUs with a small over-provision allowance. */
+    cfg.vram_bytes[0] = (size_t)44ull * 1024ull * 1024ull * 1024ull;
+    cfg.vram_bytes[1] = (size_t)14ull * 1024ull * 1024ull * 1024ull;
     cfg.safety_margin_bytes = (size_t)1024u * 1024u * 1024u;
 
     ds4_engine *e2 = NULL;
