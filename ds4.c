@@ -79,6 +79,12 @@ int ds4_gpu_init_multi(const ds4_gpu_config *cfg) { (void)cfg; return -1; }
 int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes) {
     (void)t; (void)device_id; (void)bytes; return -1;
 }
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes) {
+    (void)tier; (void)bytes; return NULL;
+}
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes) {
+    (void)tier; (void)bytes; return NULL;
+}
 void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) { (void)t; }
 int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
                               const ds4_gpu_tensor *src,
@@ -9628,8 +9634,32 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     return kv_cache_bytes + 2ull * comp_cap * prefill_cap * sizeof(float);
 }
 
+/* Half-B (B1): tier-aware KV-cache tensor allocator.
+ *
+ * For multi-tier (g_n_gpus > 1), the per-layer KV cache must live on the
+ * layer's tier. The non-managed path uses ds4_gpu_tensor_alloc_ptr_on;
+ * the managed path uses ds4_gpu_tensor_alloc_managed_on. Single-tier
+ * (g_n_gpus <= 1) is byte-equivalent to the legacy helpers because
+ * tier 0 is the only choice and the legacy alloc maps to alloc_on(0).
+ *
+ * For backward compatibility we keep a 2-arg shim (delegates to tier 0)
+ * — used by the MTP raw-cache callsite that stays single-tier in
+ * multi-tier mode (MTP disabled). The 3-arg form is what the per-layer
+ * KV migration in B2 calls. */
+static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor_on(bool managed,
+                                                              int  tier,
+                                                              uint64_t bytes) {
+    if (g_n_gpus <= 1) {
+        /* Single-tier path: byte-equivalent to legacy. tier must be 0. */
+        return managed ? ds4_gpu_tensor_alloc_managed(bytes)
+                       : ds4_gpu_tensor_alloc(bytes);
+    }
+    return managed ? ds4_gpu_tensor_alloc_managed_on(tier, bytes)
+                   : ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
+}
+
 static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
-    return managed ? ds4_gpu_tensor_alloc_managed(bytes) : ds4_gpu_tensor_alloc(bytes);
+    return metal_graph_alloc_kv_cache_tensor_on(managed, 0, bytes);
 }
 
 /* =========================================================================
