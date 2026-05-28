@@ -83,10 +83,19 @@ static char *decode_tokens(ds4_engine *e, const int *tokens, int n) {
     return buf;
 }
 
-/* Greedy-decode N_GEN_TOKENS tokens from a session, storing token IDs
- * into `out_tokens`. Returns 0 on success. */
-static int greedy_decode(ds4_session *s, int *out_tokens) {
+/* Greedy-decode up to N_GEN_TOKENS tokens from a session, stopping at
+ * EOS (which is what real inference does). Stores generated token IDs
+ * into `out_tokens` and returns the actual count via `*out_count`
+ * (always <= N_GEN_TOKENS). On error returns 1.
+ *
+ * Continuing past EOS pushes the engine into post-EOS states whose
+ * deterministic behavior across single-tier and multi-tier is harder
+ * to reason about; stopping mirrors production inference. */
+static int greedy_decode(ds4_engine *e, ds4_session *s, int *out_tokens,
+                          int *out_count) {
     char err[256] = {0};
+    const int eos = ds4_token_eos(e);
+    *out_count = 0;
     for (int i = 0; i < N_GEN_TOKENS; i++) {
         int t = ds4_session_argmax(s);
         if (t < 0) {
@@ -94,6 +103,8 @@ static int greedy_decode(ds4_session *s, int *out_tokens) {
             return 1;
         }
         out_tokens[i] = t;
+        (*out_count)++;
+        if (t == eos) break;
         if (ds4_session_eval(s, t, err, sizeof(err)) != 0) {
             fprintf(stderr, "eval failed at step %d: %s\n", i, err);
             return 1;
@@ -148,13 +159,14 @@ int main(void) {
     CHECKF(rc == 0, "single-tier session_sync rc=%d err=%s", rc, err);
 
     int tokens_a[N_GEN_TOKENS];
-    CHECK(greedy_decode(s1, tokens_a) == 0, "single-tier greedy decode");
+    int n_a = 0;
+    CHECK(greedy_decode(e1, s1, tokens_a, &n_a) == 0, "single-tier greedy decode");
 
-    char *text_a = decode_tokens(e1, tokens_a, N_GEN_TOKENS);
+    char *text_a = decode_tokens(e1, tokens_a, n_a);
     CHECK(text_a != NULL, "decode single-tier tokens to text");
-    fprintf(stderr, "  single-tier output: \"%s\"\n", text_a);
+    fprintf(stderr, "  single-tier output (%d tokens): \"%s\"\n", n_a, text_a);
     fprintf(stderr, "  single-tier token IDs:");
-    for (int i = 0; i < N_GEN_TOKENS; i++) fprintf(stderr, " %d", tokens_a[i]);
+    for (int i = 0; i < n_a; i++) fprintf(stderr, " %d", tokens_a[i]);
     fprintf(stderr, "\n");
 
     ds4_session_free(s1);
@@ -214,19 +226,26 @@ int main(void) {
     CHECKF(rc == 0, "multi-tier session_sync rc=%d err=%s", rc, err);
 
     int tokens_b[N_GEN_TOKENS];
-    CHECK(greedy_decode(s2, tokens_b) == 0, "multi-tier greedy decode");
+    int n_b = 0;
+    CHECK(greedy_decode(e2, s2, tokens_b, &n_b) == 0, "multi-tier greedy decode");
 
-    char *text_b = decode_tokens(e2, tokens_b, N_GEN_TOKENS);
+    char *text_b = decode_tokens(e2, tokens_b, n_b);
     CHECK(text_b != NULL, "decode multi-tier tokens to text");
-    fprintf(stderr, "  multi-tier  output: \"%s\"\n", text_b);
+    fprintf(stderr, "  multi-tier  output (%d tokens): \"%s\"\n", n_b, text_b);
     fprintf(stderr, "  multi-tier  token IDs:");
-    for (int i = 0; i < N_GEN_TOKENS; i++) fprintf(stderr, " %d", tokens_b[i]);
+    for (int i = 0; i < n_b; i++) fprintf(stderr, " %d", tokens_b[i]);
     fprintf(stderr, "\n");
 
-    /* The actual correctness assertion: every greedy token ID must match. */
+    /* The actual correctness assertion: same number of tokens AND every
+     * greedy token ID matches. A length mismatch (e.g., multi-tier hits
+     * EOS earlier or later) is itself a divergence. */
     int mismatch_at = -1;
-    for (int i = 0; i < N_GEN_TOKENS; i++) {
-        if (tokens_a[i] != tokens_b[i]) { mismatch_at = i; break; }
+    if (n_a != n_b) {
+        mismatch_at = (n_a < n_b) ? n_a : n_b;
+    } else {
+        for (int i = 0; i < n_a; i++) {
+            if (tokens_a[i] != tokens_b[i]) { mismatch_at = i; break; }
+        }
     }
 
     ds4_session_free(s2);
@@ -236,12 +255,18 @@ int main(void) {
     free(text_b);
 
     if (mismatch_at >= 0) {
-        fprintf(stderr,
-                "FAIL: token sequences diverge at index %d (single=%d multi=%d)\n",
-                mismatch_at, tokens_a[mismatch_at], tokens_b[mismatch_at]);
+        if (n_a != n_b) {
+            fprintf(stderr,
+                    "FAIL: gen length differs (single=%d multi=%d)\n",
+                    n_a, n_b);
+        } else {
+            fprintf(stderr,
+                    "FAIL: token sequences diverge at index %d (single=%d multi=%d)\n",
+                    mismatch_at, tokens_a[mismatch_at], tokens_b[mismatch_at]);
+        }
         return 1;
     }
 
-    fprintf(stderr, "test_engine_correctness PASS (%d tokens identical)\n", N_GEN_TOKENS);
+    fprintf(stderr, "test_engine_correctness PASS (%d tokens identical incl EOS)\n", n_a);
     return 0;
 }
