@@ -103,47 +103,58 @@ Engine-reported vs nvidia-smi snapshot per split:
 
 ### single-gpu (--gpu-vram 48)
 
-Engine layout:
+Engine layout (planned):
 ```
 GPU0: layers 0-24 + embedding  (47.2 / 48.0 GB)
 CPU : layers 25-42 + output head
 ```
 
-nvidia-smi at engine-init (post-load, pre-bench): single-device
-mode; only GPU0 was touched. The bench script captured a snapshot
-immediately after engine reported ready. Engine refused so no
-bench-time snapshot.
+The engine ABORTED at the CPU-spill check before allocating any
+device memory. nvidia-smi captured by the harness shows GPU0=4 MiB
+(pre-alloc). No bench-time snapshot.
 
 ### split-24-24 (--gpu-vram 24,24)
 
-Engine layout:
+Engine layout (planned):
 ```
 GPU0: layers 0-11 + embedding  (23.1 / 24.0 GB)
 GPU1: layers 12-23  (22.2 / 24.0 GB)
 CPU : layers 24-42 + output head
 ```
 
-nvidia-smi at engine-init showed GPU0 + GPU1 both at full usage
-plus the persistent miner load on GPU1.
+The engine ABORTED at the CPU-spill check before allocating any
+device memory. The nvidia-smi snapshot captured by the harness
+(see delta table below) shows GPU0=4 MiB (pre-alloc) and GPU1=30851
+MiB (miners only). The layout above is what the placement
+algorithm WOULD have allocated had the engine accepted the
+CPU-spill placement; the actual allocation never happened.
 
 ### split-40-12 (--gpu-vram 40,12)
 
-Engine layout:
+Engine layout (planned):
 ```
 GPU0: layers 0-19 + embedding  (37.9 / 40.0 GB)
 GPU1: layers 20-25  (11.1 / 12.0 GB)
 CPU : layers 26-42 + output head
 ```
 
+The engine ABORTED at the CPU-spill check before allocating. The
+delta table below reflects pre-alloc nvidia-smi state.
+
 ### auto (--gpu-vram auto)
 
-Engine layout (auto-resolved to 47,17 GB — close to actual free
-VRAM minus 512 MB safety margin):
+Engine layout (planned; auto-resolved to 47,17 GB — close to
+actual free VRAM minus 512 MB safety margin):
 ```
 GPU0: layers 0-23 + embedding  (45.3 / 46.7 GB)
 GPU1: layers 24-31  (14.8 / 16.6 GB)
 CPU : layers 32-42 + output head
 ```
+
+Unlike the explicit-budget runs, the auto run began the model
+mmap registration on GPU0 (15.3 GiB) before the engine hit the
+CPU-spill refusal. This is visible in the delta table below
+(GPU0=15668 MiB vs the other splits showing GPU0=4 MiB).
 
 ### Engine-vs-nvidia-smi delta table (snapshots at engine init)
 
