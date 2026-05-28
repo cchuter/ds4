@@ -33,13 +33,20 @@ static void errbuf_setf(char *out, size_t outlen, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* Maximum per-entry values. Generous, but small enough to keep all
+ * downstream arithmetic safely inside size_t/int. */
+#define DS4_GPU_ARGS_MAX_VRAM_GB        16384   /* 16 TiB per device */
+#define DS4_GPU_ARGS_MAX_DEVICE_INDEX   1023    /* CUDA visible-device ID cap */
+
 /* Parse a comma-separated list of nonnegative integers into out_count
  * entries of out[]. Returns 0 on success, nonzero on parse error.
- * Empty entries (",,") or trailing/leading commas error. */
+ * Empty entries (",,") or trailing/leading commas error. Per-entry
+ * upper bound enforced via max_value (use LONG_MAX for "no cap"). */
 static int parse_csv_int_list(const char *s,
                               long       *out,
                               int        *out_count,
                               int         max_count,
+                              long        max_value,
                               char       *errbuf,
                               size_t      errbuflen,
                               const char *what) {
@@ -59,8 +66,10 @@ static int parse_csv_int_list(const char *s,
             errbuf_setf(errbuf, errbuflen, "%s: not a number: '%s'", what, p);
             return 1;
         }
-        if (errno != 0 || v < 0) {
-            errbuf_setf(errbuf, errbuflen, "%s: out-of-range value: '%s'", what, p);
+        if (errno != 0 || v < 0 || v > max_value) {
+            errbuf_setf(errbuf, errbuflen,
+                        "%s: out-of-range value: '%s' (allowed 0..%ld)",
+                        what, p, max_value);
             return 1;
         }
         if (*out_count >= max_count) {
@@ -109,7 +118,9 @@ int parse_gpu_vram_arg(const char     *vram_arg,
     int  dev_count = 0;
     if (devices_arg) {
         if (parse_csv_int_list(devices_arg, dev_list, &dev_count,
-                                DS4_MAX_GPUS, errbuf, errbuflen,
+                                DS4_MAX_GPUS,
+                                DS4_GPU_ARGS_MAX_DEVICE_INDEX,
+                                errbuf, errbuflen,
                                 "--gpu-devices") != 0) {
             return 1;
         }
@@ -163,7 +174,9 @@ int parse_gpu_vram_arg(const char     *vram_arg,
     long vram_list[DS4_MAX_GPUS] = {0};
     int  vram_count = 0;
     if (parse_csv_int_list(vram_arg, vram_list, &vram_count,
-                            DS4_MAX_GPUS, errbuf, errbuflen,
+                            DS4_MAX_GPUS,
+                            DS4_GPU_ARGS_MAX_VRAM_GB,
+                            errbuf, errbuflen,
                             "--gpu-vram") != 0) {
         return 1;
     }

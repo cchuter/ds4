@@ -122,7 +122,24 @@ int main(void) {
         PASS_FAIL("parse 40, (trailing comma) errors", rc != 0);
     }
 
-    /* 10: format_gpu_layout_line */
+    /* 10: huge value rejected (overflow guard) */
+    {
+        ds4_gpu_config cfg = (ds4_gpu_config){0};
+        bool skip = false;
+        int rc = parse_gpu_vram_arg("9999999", NULL, &cfg, &skip, err, sizeof(err));
+        PASS_FAIL("parse huge vram rejected (overflow guard)", rc != 0);
+    }
+
+    /* 11: huge device index rejected */
+    {
+        ds4_gpu_config cfg = (ds4_gpu_config){0};
+        bool skip = false;
+        int rc = parse_gpu_vram_arg("40,12", "0,99999",
+                                     &cfg, &skip, err, sizeof(err));
+        PASS_FAIL("parse huge device index rejected", rc != 0);
+    }
+
+    /* 12: format_gpu_layout_line */
     {
         ds4_gpu_config cfg = (ds4_gpu_config){0};
         cfg.n_gpus = 2;
