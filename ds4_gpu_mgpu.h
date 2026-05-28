@@ -121,6 +121,23 @@ int ds4_gpu_set_current_device(int logical_tier);
  * plan-review round 3 finding #1. */
 int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size);
 
+/* Strict per-device selective-cache lookup (no fallback).
+ *
+ * Returns 1 only if a covering entry exists whose device_id matches the
+ * caller-supplied expected_device (a PHYSICAL CUDA device id). Otherwise
+ * returns 0 — no host-pointer fallback, no different-device match. The
+ * caller is expected to have cudaSetDevice'd to expected_device before
+ * invoking; the returned pointer is valid to consume from that device's
+ * kernel.
+ *
+ * Used by multi-tier kernel-dispatch resolvers in
+ * mgpu-graph-session-execution (wave 3a). Single-tier callers should
+ * keep using ds4_gpu_lookup_cache for back-compat behavior. */
+int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
+                                 uint64_t bytes,
+                                 int      expected_device,
+                                 void   **out_device_ptr);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
