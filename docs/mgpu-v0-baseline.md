@@ -205,7 +205,7 @@ directions is expected and produces better cross-device latency.
 |---|---|---|
 | `./ds4_test --tool-call-quality` | **PASS** | Both fast-path and exact-path subtests passed on box. |
 | `./ds4_test --server` | **PASS** | Server end-to-end OK. |
-| `./ds4_test --long-context` | (re-running in isolation) | First run was concurrent with the CPU-only bench (load avg 10+; ds4-bench at 1000% CPU) and produced 19 fact-recall failures — the model was being starved of cycles. Re-running standalone; result updated to PR when complete. The expected pre-existing failure `--logprob-vectors short_code_completion` step 1 is documented and not blocking. |
+| `./ds4_test --long-context` | **PASS** (standalone) | First run failed with 19 fact-recall misses while the CPU-only bench was concurrently saturating the 128-core box (load avg 10+). Re-running standalone PASSED ("long-context: OK", "ds4 tests: ok") — 30474-token prefill completed and the fact-recall subtest accepted all assignments. |
 
 Concurrent test execution caveat: the first `--long-context` run
 overlapped with the CPU-only bench (which is a multi-hour process
@@ -213,7 +213,7 @@ saturating the box's 128-core CPU). That produced spurious
 fact-recall misses. The harness should be re-run with isolation
 in normal use, OR the CPU-only bench should be scheduled separately
 from regression tests on shared hardware. This is operational, not a
-code regression.
+code regression. Standalone re-run produced a clean PASS.
 
 ## Notable / pre-existing issues
 
@@ -289,7 +289,7 @@ for review (or update the existing PR with new commits).
 | VRAM accounting | partial — engine layouts captured + nvidia-smi snapshots captured (table above). Full ±256 MB delta requires successful end-to-end runs (deferred). |
 | Peer-matrix logged | **DONE** (BOUNCE both directions on driver 570.207) |
 | Baseline report written | **DONE** (this document) |
-| Single-tier regression preserved | partial — `--tool-call-quality` PASS, `--server` PASS, `--long-context` re-running standalone (first run was load-thrashed by concurrent CPU bench) |
+| Single-tier regression preserved | **PASS** — `--tool-call-quality`, `--server`, and `--long-context` (standalone retry) all PASS |
 | `test_engine_mgpu_runtime` actually runs | **SKIP_PASS** (same env-block; documented) |
 | Bench runs complete without script errors | **PASS** (harness records each ENV-BLOCK and proceeds) |
 | No production code changes | **PASS** (only scripts + this report) |
