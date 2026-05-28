@@ -21,7 +21,7 @@
 /tasks
 /.claude/skills/
 /.claude/agents
-/docs/plans
+/docs/
 /tests/ui
 /tests/api
 /tests/reports
