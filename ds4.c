@@ -9232,6 +9232,12 @@ typedef struct {
     ds4_gpu_tensor *kv_raw_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *kv_by_tier[DS4_MAX_GPUS];
     int active_tier;
+    /* Half-B (B6): cached engine placement[] (length DS4_N_LAYER + 2) for the
+     * dispatch loops. NULL in single-tier mode — active_tier stays 0 and
+     * dispatch wrappers no-op the tier-switch + cross-device copy. The
+     * pointer aliases e->placement; the engine outlives the graph so this
+     * is safe. */
+    const int *placement;
 
     /* Persistent KV state.  Raw KV is a sliding-window ring per layer.  Ratio-4
      * layers also keep an indexer-compressed cache; ratio-128 layers keep only
@@ -9520,6 +9526,89 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_routed_down)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_routed_out)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_ffn_out)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(directional_steering_dirs)
+
+/* Half-B (B6): dispatch-loop helpers for multi-tier per-layer execution.
+ *
+ * Single-tier (g->placement == NULL): all helpers are no-ops; active_tier
+ * stays 0 from memset; behavior is byte-equivalent to legacy.
+ *
+ * Multi-tier: each helper switches g->active_tier to the requested tier
+ * BEFORE the next kernel-dispatch wrapper reads any Class P accessor. If
+ * the source-tier Class P cur_hc (or batch_cur_hc) differs from the new
+ * tier's, ds4_gpu_tensor_copy_xdev ferries the active hidden state across
+ * the boundary. copy_xdev returns 1 on success, 0 on failure (Half-A
+ * convention). The destination tensor's device_id was stamped at
+ * alloc_on time and is immutable.
+ *
+ * For decode (one token at a time): metal_graph_set_active_tier_decode
+ * swaps to the requested tier and copies cur_hc across the boundary.
+ *
+ * For batch (chunked prefill): metal_graph_set_active_tier_batch swaps
+ * tier and copies batch_cur_hc across the boundary. The next/cur pair
+ * is maintained per tier — after a copy, batch_next_hc on the destination
+ * tier becomes the swap target for the next layer step on that tier.
+ *
+ * Helpers always invoke ds4_gpu_set_current_device(tier) so the next
+ * kernel-launch sees the correct CUDA device. */
+
+/* ds4_gpu_set_current_device is declared in ds4_gpu_mgpu.h — single-tier
+ * (g_n_gpus <= 1) callers no-op. Returns 0 on success. */
+
+#ifdef DS4_NO_GPU
+static inline int ds4_gpu_set_current_device(int tier) { (void)tier; return 0; }
+static inline int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
+                                            const ds4_gpu_tensor *src,
+                                            uint64_t bytes) {
+    (void)dst; (void)src; (void)bytes; return 1;
+}
+#endif
+
+/* Returns true on success. Single-tier: no-op success. Multi-tier:
+ * sets the CUDA device, then if tier differs from current active_tier,
+ * copies cur_hc to the destination tier and updates active_tier. */
+static bool metal_graph_set_active_tier_decode(ds4_gpu_graph *g, int tier) {
+    if (!g->placement) {
+        /* Single-tier: just keep active_tier at 0; no device switch needed. */
+        (void)tier;
+        return true;
+    }
+    if (tier < 0 || tier >= DS4_MAX_GPUS) return false;
+    if (ds4_gpu_set_current_device(tier) != 0) return false;
+    if (tier == g->active_tier) return true;
+    /* Boundary hop: copy cur_hc from source-tier to destination-tier slot. */
+    ds4_gpu_tensor *src = g->cur_hc_by_tier[g->active_tier];
+    ds4_gpu_tensor *dst = g->cur_hc_by_tier[tier];
+    if (src && dst) {
+        const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) return false;
+    }
+    g->active_tier = tier;
+    return true;
+}
+
+/* Returns true on success. Same semantics as the decode helper but ferries
+ * batch_cur_hc (which contains chunk_tokens * hc_dim floats — variable per
+ * prefill call). The caller passes the chunk size in tokens; single-tier
+ * paths ignore the argument. */
+static bool metal_graph_set_active_tier_batch(ds4_gpu_graph *g, int tier, uint32_t chunk_tokens) {
+    if (!g->placement) {
+        (void)tier;
+        (void)chunk_tokens;
+        return true;
+    }
+    if (tier < 0 || tier >= DS4_MAX_GPUS) return false;
+    if (ds4_gpu_set_current_device(tier) != 0) return false;
+    if (tier == g->active_tier) return true;
+    ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[g->active_tier];
+    ds4_gpu_tensor *dst = g->batch_cur_hc_by_tier[tier];
+    if (src && dst) {
+        const uint64_t hc_bytes =
+            (uint64_t)chunk_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) return false;
+    }
+    g->active_tier = tier;
+    return true;
+}
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
@@ -10010,6 +10099,11 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp,
         const int              *placement) {
     memset(g, 0, sizeof(*g));
+    /* Half-B (B6): cache placement on the graph so the dispatch loops can
+     * walk it without threading the engine pointer through every
+     * kernel-dispatch wrapper. NULL in single-tier callers (placement
+     * was already NULL on entry). */
+    g->placement = placement;
     g->mtp_enabled = enable_mtp;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
@@ -10616,6 +10710,12 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token) {
+    /* Half-B (B6): switch to this layer's home tier before any Class P
+     * accessor reads. Single-tier (placement == NULL): no-op. */
+    if (g->placement) {
+        const int this_tier = g->placement[il + 1];
+        if (!metal_graph_set_active_tier_decode(g, this_tier)) return false;
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -11378,6 +11478,15 @@ static bool metal_graph_encode_output_head(
         const ds4_model       *model,
         const ds4_weights     *weights,
         uint64_t               vocab_dim) {
+    /* Half-B (B6): switch to head_tier before the output-head pipeline.
+     * Single-tier (placement == NULL): no-op (head_tier == 0 == active_tier).
+     * Note: head_tier was captured in metal_graph_alloc_raw_cap; this
+     * helper consults it directly (and also covers the case where the
+     * preceding decode layer ran on a different tier — copy_xdev ferries
+     * the active cur_hc across the boundary). */
+    if (g->placement) {
+        if (!metal_graph_set_active_tier_decode(g, g->head_tier)) return false;
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = ds4_gpu_rms_norm_plain_tensor(metal_graph_flat_hc(g), metal_graph_cur_hc(g), (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_output_pre(g),
@@ -12255,6 +12364,12 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
+    /* Half-B (B6): write the embedded token on the embedding tier. Single-
+     * tier: emb_tier == 0 == active_tier; no-op. Multi-tier: switch to
+     * emb_tier (no cross-device copy needed — embed writes from scratch). */
+    if (g->placement) {
+        if (!metal_graph_set_active_tier_decode(g, g->emb_tier)) return false;
+    }
     bool ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(g),
                                               model->map,
                                               model->size,
@@ -14195,6 +14310,12 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+    /* Half-B (B6): switch to this layer's home tier before any Class P
+     * accessor reads. Single-tier (placement == NULL): no-op. */
+    if (g->placement) {
+        const int this_tier = g->placement[il + 1];
+        if (!metal_graph_set_active_tier_batch(g, this_tier, n_tokens)) return false;
+    }
     bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
     if (ok) {
@@ -14665,6 +14786,12 @@ static bool metal_graph_prefill_layer_major(
         ds4_imatrix_collector *imatrix) {
     if (n_tokens <= 0 || n_tokens > prompt->len || (uint32_t)n_tokens > g->prefill_cap) return false;
 
+    /* Half-B (B6): write the prompt tokens + embed onto the embedding tier.
+     * Single-tier: emb_tier == 0; no-op. Multi-tier: switch to emb_tier
+     * before any Class P / Class E accessor read. */
+    if (g->placement) {
+        if (!metal_graph_set_active_tier_batch(g, g->emb_tier, (uint32_t)n_tokens)) return false;
+    }
     bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, 0, (uint32_t)n_tokens);
     if (!ok) return false;
 
