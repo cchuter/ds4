@@ -11249,8 +11249,11 @@ int main(int argc, char **argv) {
             cfg.engine.backend = DS4_BACKEND_CPU;
             if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
         } else {
-            const bool was_auto = cfg.gpu_vram_arg &&
-                                   !strcmp(cfg.gpu_vram_arg, "auto");
+            /* Auto-detect runs in two cases: explicit `--gpu-vram auto`,
+             * OR `--gpu-devices X` alone (parser auto-promotes to auto). */
+            const bool was_auto =
+                (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto"))
+                || (cfg.gpu_vram_arg == NULL && cfg.gpu_devices_arg != NULL);
             char layout[256];
             if (format_gpu_layout_line(&gpu_cfg, was_auto, layout, sizeof(layout)) > 0) {
                 fprintf(stdout, "%s\n", layout);

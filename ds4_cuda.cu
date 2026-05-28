@@ -11978,10 +11978,13 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
             }
             return 1;
         }
-        size_t budget = (free_b > safety_margin_bytes) ?
-                        (free_b - safety_margin_bytes) : 0;
+        /* Store raw free VRAM. engine_classify_multi_tier (ds4.c) is the
+         * single point where safety_margin_bytes + cuBLAS workspace reserve
+         * is subtracted. Pre-subtracting here would double-count the safety
+         * margin and false-spill tight layouts. */
+        (void)safety_margin_bytes;
         out->device_indices[i] = d;
-        out->vram_bytes[i] = budget;
+        out->vram_bytes[i] = free_b;
     }
     return 0;
 }
