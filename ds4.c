@@ -9775,7 +9775,18 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
  * ========================================================================= */
 
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
- * weights are not copied here; tensors reference the mapped GGUF. */
+ * weights are not copied here; tensors reference the mapped GGUF.
+ *
+ * Half-B (B2): tier-aware per-layer allocation.
+ *   placement: when non-NULL, an array of DS4_N_LAYER + 2 logical tiers
+ *     (embedding, per-layer..., head). The per-layer KV / state allocations
+ *     in this function use placement[il + 1] as the home tier for each
+ *     layer il. When NULL (single-tier callers, diagnostic paths), all
+ *     per-layer allocations land on tier 0 — byte-equivalent to legacy.
+ *
+ * Single-tier (g_n_gpus <= 1) is byte-equivalent regardless of placement,
+ * because metal_graph_alloc_kv_cache_tensor_on short-circuits to the
+ * legacy 1-arg helpers when g_n_gpus <= 1. */
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
@@ -9783,7 +9794,8 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
-        bool                    enable_mtp) {
+        bool                    enable_mtp,
+        const int              *placement) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
     if (raw_cap == 0) raw_cap = 1;
@@ -9873,20 +9885,32 @@ static bool metal_graph_alloc_raw_cap(
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
+        /* Half-B (B2): per-layer Class L allocations land on the layer's
+         * home tier. placement is NULL on single-tier / diagnostic paths
+         * (all-tier-0); non-NULL on the engine path that opted into
+         * multi-tier. layer_tier == 0 in single-tier mode is the
+         * byte-equivalent path through metal_graph_alloc_kv_cache_tensor_on
+         * and ds4_gpu_tensor_alloc_ptr_on. */
+        const int layer_tier = placement ? placement[il + 1] : 0;
+        g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                 managed_kv_cache,
+                layer_tier,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
-            g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
+            g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                     managed_kv_cache,
+                    layer_tier,
                     (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float));
-            g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+            g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+            g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
             if (enable_mtp) {
+                /* MTP is disabled in multi-tier mode (engine_classify_multi_tier
+                 * forces mtp off for placement crossings). These callsites stay
+                 * on the legacy single-tier allocator. */
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
@@ -9904,12 +9928,14 @@ static bool metal_graph_alloc_raw_cap(
             if (ratio == 4) {
                 const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
                 const uint64_t index_rows = (uint64_t)coff * ratio;
-                g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
+                g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
+                        layer_tier,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-                g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
+                g->layer_index_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 if (enable_mtp) {
+                    /* MTP spec/prefix1 buffers: single-tier only (MTP disabled in multi-tier). */
                     g->spec_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
@@ -10096,7 +10122,9 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    /* Half-B (B2): single-tier convenience wrapper; placement=NULL routes
+     * all per-layer allocations to tier 0. */
+    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, NULL);
 }
 
 static uint32_t metal_graph_raw_span_for_batch(
@@ -15215,8 +15243,9 @@ static int metal_graph_prompt_logits_test(
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, (uint32_t)n_test);
 
     ds4_gpu_graph g;
+    /* Half-B (B2): diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
+                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false, NULL);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -16616,8 +16645,9 @@ static int generate_metal_graph_raw_swa(
                 prompt->len);
     }
     ds4_gpu_graph g;
+    /* Half-B (B2): diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, NULL);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -17969,8 +17999,9 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
 
     ds4_gpu_graph g;
+    /* Half-B (B2): diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, NULL);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -18931,8 +18962,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
+    /* Half-B (B2): pass engine placement[] into per-layer KV/state alloc.
+     * Single-tier engines (gpu_cfg == NULL, e->multi_tier == 0) pass NULL
+     * which routes everything to tier 0 — byte-equivalent to legacy. */
+    const int *placement = e->multi_tier ? e->placement : NULL;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready,
+                                   placement))
     {
         free(s);
         return 1;
