@@ -19679,8 +19679,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 /* Classify each model tensor by its placement entry.
  *
  * Tensor names live in ds4_str slices (ptr+len), NOT NUL-terminated.
- * We bound every comparison by name.len to avoid out-of-buffer reads
- * (codex plan-review round 2 finding #5). */
+ * We bound every comparison by name.len to avoid out-of-buffer reads. */
 static int tensor_to_entry(const ds4_tensor *t, int n_layer) {
     const char *p = t->name.ptr;
     int n = (int)t->name.len;
@@ -19833,8 +19832,7 @@ static int engine_install_per_device_caches(ds4_engine *e) {
     /* Prereq: register the host model map so ds4_gpu_device_cache_tensors
      * can resolve g_model_host_base. We use the no-copy variant so
      * DS4_CUDA_COPY_MODEL cannot reintroduce a full-model copy that would
-     * defeat the per-device selective cache (codex plan-review round 3
-     * finding #1). */
+     * defeat the per-device selective cache. */
     if (!ds4_gpu_register_model_map_no_copy(e->model.map, e->model.size)) return -1;
 
     /* Per-logical-tier dynamic range lists. */
@@ -19936,9 +19934,9 @@ static void engine_print_layout(const ds4_engine *e) {
     fputc('\n', stderr);
 }
 
-/* Phase B: install GPU-side placement state.
+/* Install GPU-side placement state.
  *
- * Ordering (codex plan-review round 2 issue #3):
+ * Ordering:
  *   1. Print layout FIRST so it is always visible to the operator,
  *      even if subsequent steps fail.
  *   2. Detect any CPU-spill placement; this PR refuses to open
