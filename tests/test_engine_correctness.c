@@ -40,13 +40,21 @@
         }                                                                   \
     } while (0)
 
-/* Build a short prompt that exercises prefill but stays inside ctx=1024.
- * Uses the chat-rendering tokenizer so DeepSeek-V4-Flash treats it as an
- * instruction-style turn instead of raw text continuation (which produces
- * non-answers like repeating the question). */
+/* Build a short prompt using the actual chat template
+ * (BOS + user_id + <text> + assistant_id + think_end so the model skips
+ * any reasoning trace and goes straight to the answer). With DS4_THINK_NONE
+ * the model produces a clean short reply, which makes the token-ID compare
+ * easy to read at a glance.
+ *
+ * Why not ds4_tokenize_rendered_chat: that function parses text that
+ * ALREADY contains special tokens (it just looks for them inline). It adds
+ * no scaffolding on its own, so the model sees raw text and continues it
+ * like a completion ("What is the capital of France?...What is the capital
+ * of France?<EOS>"). ds4_encode_chat_prompt adds the actual BOS / user /
+ * assistant / think markers DeepSeek-V4-Flash is trained on. */
 static void build_prompt(ds4_engine *e, ds4_tokens *out) {
-    const char *text = "What is the capital of France?";
-    ds4_tokenize_rendered_chat(e, text, out);
+    const char *prompt = "What is the capital of France?";
+    ds4_encode_chat_prompt(e, /*system=*/NULL, prompt, DS4_THINK_NONE, out);
 }
 
 /* Decode an array of token IDs to UTF-8 (writes into a heap buffer the
