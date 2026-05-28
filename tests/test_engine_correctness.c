@@ -40,12 +40,13 @@
         }                                                                   \
     } while (0)
 
-/* Build a short prompt that exercises prefill but stays inside ctx=1024. */
+/* Build a short prompt that exercises prefill but stays inside ctx=1024.
+ * Uses the chat-rendering tokenizer so DeepSeek-V4-Flash treats it as an
+ * instruction-style turn instead of raw text continuation (which produces
+ * non-answers like repeating the question). */
 static void build_prompt(ds4_engine *e, ds4_tokens *out) {
-    const char *text =
-        "Q: What is the capital of France?\n"
-        "A:";
-    ds4_tokenize_text(e, text, out);
+    const char *text = "What is the capital of France?";
+    ds4_tokenize_rendered_chat(e, text, out);
 }
 
 /* Decode an array of token IDs to UTF-8 (writes into a heap buffer the
