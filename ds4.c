@@ -19041,9 +19041,8 @@ static int engine_install_gpu_placement(ds4_engine *e) {
     }
     if (has_cpu_spill) {
         fprintf(stderr,
-            "ds4: CPU-spill placement detected; execution wiring for CPU-tier\n"
-            "ds4: layers lands in mgpu-graph-session-execution. Aborting engine\n"
-            "ds4: creation. (mgpu-graph-session-placement ships layout-only.)\n");
+            "ds4: CPU-spill placement detected; CPU-tier execution wiring lands in\n"
+            "ds4: mgpu-graph-session-cpu-spill (wave 3b). Aborting engine creation.\n");
         return -1;
     }
 
@@ -19252,14 +19251,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
-            fprintf(stderr,
-                "ds4: multi-tier layout computed and per-device weight caches installed,\n"
-                "ds4: but execution wiring for multi-tier (per-tier cuBLAS, graph scratch,\n"
-                "ds4: boundary hops) lands in mgpu-graph-session-execution. This PR\n"
-                "ds4: ships dry-run layout only. Aborting engine creation.\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+            /* Half-B (B7): GPU-only multi-tier execution is now wired up
+             * (B2-B6: per-tier graph allocation, dispatch loops, boundary
+             * copies). CPU-spill placements were rejected by
+             * engine_install_gpu_placement above with stderr naming the
+             * wave-3b follow-up. Skip the single-tier ds4_gpu_init /
+             * set_model_map_range path below — those calls are explicitly
+             * single-tier behavior (per the pre-B7 comment block). */
+            *out = e;
+            return 0;
         }
 
         /* Single-tier path (every existing caller). Body is byte-equivalent
