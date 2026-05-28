@@ -91,11 +91,20 @@ test_engine_mgpu_runtime SKIP_PASS
 
 Env used: `DS4_CUDA_NO_TF32=1` for math-mode pinning.
 
-The test correctly detects the env-block and SKIP_PASSes per its
-documented contract (Half-B added this skip path). When the user
-frees GPU1 (kills miners), re-running this test will exercise the
-multi-tier path and produce the prefill/decode logit deltas
-expected to meet the 1e-4 design target.
+**Honest qualifier:** `test_engine_mgpu_runtime` was **not exercised**
+in this run. Its SKIP_PASS path accepts ANY multi-tier
+`ds4_engine_create_with_gpu_config` failure, not specifically a
+CPU-spill refusal. We infer the env-block specifically from the layout
+log preceding the engine refusal, not from any test-internal check.
+
+Tightening the SKIP_PASS detection to require a CPU-spill stderr match
+(rather than any create failure) is a follow-up — for now the
+empirical numerical-equivalence gate is **pending**, not validated.
+
+When GPU1 frees up, re-running this test will exercise the multi-tier
+path and produce the prefill/decode logit deltas expected to meet the
+1e-4 design target. Update this section with the actual deltas at that
+point.
 
 ## VRAM accounting
 
@@ -285,7 +294,7 @@ for review (or update the existing PR with new commits).
 | Acceptance | Status |
 |---|---|
 | Bench matrix end-to-end | partial — CPU-only completed (1.94 prefill, 1.59 gen tok/s at ctx=2048); all GPU splits ENV-BLOCK (CPU-spill refusal, model > 64 GB available VRAM) |
-| Numerical-equivalence test runs | SKIP_PASS env-blocked (test correctly detects + skips; documented) |
+| Numerical-equivalence test runs | **not exercised** — SKIP_PASS path fires on any multi-tier create failure, not specifically CPU-spill; env-block inferred from layout log. Empirical 1e-4 gate is **pending** until GPU1 frees and the test is re-run (also tighten SKIP_PASS detection in a follow-up). |
 | VRAM accounting | partial — engine layouts captured + nvidia-smi snapshots captured (table above). Full ±256 MB delta requires successful end-to-end runs (deferred). |
 | Peer-matrix logged | **DONE** (BOUNCE both directions on driver 570.207) |
 | Baseline report written | **DONE** (this document) |

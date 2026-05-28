@@ -75,11 +75,17 @@ run_split () {
         >> "$log" 2>&1 &
     local pid=$!
 
-    # Wait up to 180 s for "backend initialized for graph diagnostics"
-    # which signals engine load complete. Then snapshot nvidia-smi.
+    # Wait up to 180 s for the engine to finish loading. Two valid signals:
+    #   - single-tier path prints "backend initialized for graph diagnostics"
+    #     near the end of the single-tier branch
+    #   - multi-tier path returns earlier without that line; the success
+    #     signal there is the "multi-GPU layout:" header printed by
+    #     engine_print_layout BEFORE the return
+    # We accept either so the snapshot fires before generation starts and
+    # captures real engine-resident VRAM (not post-mortem).
     local captured_smi=0
     for _i in $(seq 1 180); do
-        if grep -q "backend initialized for graph diagnostics" "$log" 2>/dev/null; then
+        if grep -qE "backend initialized for graph diagnostics|multi-GPU layout:" "$log" 2>/dev/null; then
             sleep 2
             nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader > "$smi" 2>/dev/null || true
             captured_smi=1
