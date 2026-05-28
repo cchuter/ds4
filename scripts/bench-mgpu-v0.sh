@@ -75,17 +75,22 @@ run_split () {
         >> "$log" 2>&1 &
     local pid=$!
 
-    # Wait up to 180 s for the engine to finish loading. Two valid signals:
-    #   - single-tier path prints "backend initialized for graph diagnostics"
-    #     near the end of the single-tier branch
-    #   - multi-tier path returns earlier without that line; the success
-    #     signal there is the "multi-GPU layout:" header printed by
-    #     engine_print_layout BEFORE the return
-    # We accept either so the snapshot fires before generation starts and
-    # captures real engine-resident VRAM (not post-mortem).
+    # Wait up to 180 s for ds4-bench to finish ALL of: engine_open (which
+    # includes layout print + multi-tier per-device cache install),
+    # prompt tokenization, and session_create (KV cache allocation). The
+    # canonical post-cache signal is the CSV header
+    #   ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes
+    # which ds4-bench prints to stdout immediately before its first
+    # iteration runs. At this point all device memory is committed and the
+    # nvidia-smi snapshot captures real steady-state engine-resident VRAM.
+    #
+    # Earlier signals ("multi-GPU layout:", "backend initialized for graph
+    # diagnostics") were tried and rejected: the layout line is printed
+    # BEFORE engine_install_per_device_caches (ds4.c:19097 vs :19110), and
+    # the diagnostics line only fires on the single-tier path.
     local captured_smi=0
     for _i in $(seq 1 180); do
-        if grep -qE "backend initialized for graph diagnostics|multi-GPU layout:" "$log" 2>/dev/null; then
+        if grep -q "ctx_tokens,prefill_tokens" "$log" 2>/dev/null; then
             sleep 2
             nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader > "$smi" 2>/dev/null || true
             captured_smi=1
