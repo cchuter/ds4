@@ -14844,21 +14844,25 @@ static bool metal_graph_prefill_layer_major(
             }
         }
         ds4_gpu_tensor *last_hc = NULL;
-        ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
+        /* Half-B (B6 fix): capture the source-tier slot BEFORE the head call
+         * (which can change g->active_tier to g->head_tier). Restore on
+         * the source tier explicitly, not via the post-call active_tier. */
+        const int src_tier = g->active_tier;
+        ds4_gpu_tensor *saved_cur = g->cur_hc_by_tier[src_tier];
         if (ok) {
             last_hc = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g), output_row, hc_dim);
             ok = last_hc != NULL;
         }
         if (ok) {
-            g->cur_hc_by_tier[g->active_tier] = last_hc;
+            g->cur_hc_by_tier[src_tier] = last_hc;
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-            g->cur_hc_by_tier[g->active_tier] = saved_cur;
+            g->cur_hc_by_tier[src_tier] = saved_cur;
         }
 
         const double t_encoded = profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double t_done = profile ? now_sec() : 0.0;
-        g->cur_hc_by_tier[g->active_tier] = saved_cur;
+        g->cur_hc_by_tier[src_tier] = saved_cur;
         if (last_hc) ds4_gpu_tensor_free(last_hc);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
@@ -14913,6 +14917,18 @@ static bool metal_graph_prefill_layer_major(
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (split_profile) {
+            /* Half-B (B6 fix): split-profile diagnostic bypasses the
+             * metal_graph_encode_layer_batch wrapper that normally does
+             * the per-layer tier switch. Replicate the switch here so the
+             * diagnostic / profile mode stays multi-tier-correct.
+             * Single-tier (g->placement == NULL): no-op. */
+            if (g->placement) {
+                const int this_tier = g->placement[il + 1];
+                if (!metal_graph_set_active_tier_batch(g, this_tier, (uint32_t)n_tokens)) {
+                    ok = false;
+                    break;
+                }
+            }
             const double t_attn0 = now_sec();
             ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_attention_batch(g,
@@ -15002,8 +15018,12 @@ static bool metal_graph_prefill_layer_major(
                                                             output_row,
                                                             hc_dim);
     if (!last_hc) return false;
-    ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
-    g->cur_hc_by_tier[g->active_tier] = last_hc;
+    /* Half-B (B6 fix): capture the source-tier slot BEFORE the head call
+     * (which may switch g->active_tier to g->head_tier). Restore on the
+     * source tier explicitly. */
+    const int src_tier = g->active_tier;
+    ds4_gpu_tensor *saved_cur = g->cur_hc_by_tier[src_tier];
+    g->cur_hc_by_tier[src_tier] = last_hc;
 
     const double t_head0 = profile ? now_sec() : 0.0;
     ok = ds4_gpu_begin_commands() != 0;
@@ -15011,7 +15031,7 @@ static bool metal_graph_prefill_layer_major(
     const double t_head_encoded = profile ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_head_done = profile ? now_sec() : 0.0;
-    g->cur_hc_by_tier[g->active_tier] = saved_cur;
+    g->cur_hc_by_tier[src_tier] = saved_cur;
     ds4_gpu_tensor_free(last_hc);
     if (!ok) return false;
 
@@ -15065,13 +15085,15 @@ static bool metal_graph_prefill_batch_row_logits(
                                                             batch_row,
                                                             hc_dim);
     if (!last_hc) return false;
-    ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
-    g->cur_hc_by_tier[g->active_tier] = last_hc;
+    /* Half-B (B6 fix): same source-tier capture pattern as above. */
+    const int src_tier = g->active_tier;
+    ds4_gpu_tensor *saved_cur = g->cur_hc_by_tier[src_tier];
+    g->cur_hc_by_tier[src_tier] = last_hc;
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    g->cur_hc_by_tier[g->active_tier] = saved_cur;
+    g->cur_hc_by_tier[src_tier] = saved_cur;
     ds4_gpu_tensor_free(last_hc);
     if (!ok) return false;
     return ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits,
@@ -15140,6 +15162,15 @@ static bool metal_graph_prefill_chunked_range(
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         last_chunk_tokens = chunk;
 
+        /* Half-B (B6 fix): each chunk starts on the embedding tier. After
+         * the previous chunk's layer / head walk, active_tier may be the
+         * last layer tier or head tier; switch to emb_tier so the upload
+         * writes prompt_tokens + batch_cur_hc to the embedding-tier slots
+         * and subsequent encode_layer_batch picks up from there. Single-
+         * tier (g->placement == NULL): no-op. */
+        if (g->placement) {
+            if (!metal_graph_set_active_tier_batch(g, g->emb_tier, chunk)) return false;
+        }
         bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, pos0, chunk);
         if (ok) ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                              metal_graph_prefill_tokens(g),
@@ -15209,8 +15240,10 @@ static bool metal_graph_prefill_chunked_range(
                                                             last_chunk_tokens - 1u,
                                                             hc_dim);
     if (!last_hc) return false;
-    ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
-    g->cur_hc_by_tier[g->active_tier] = last_hc;
+    /* Half-B (B6 fix): same source-tier capture pattern as above. */
+    const int src_tier = g->active_tier;
+    ds4_gpu_tensor *saved_cur = g->cur_hc_by_tier[src_tier];
+    g->cur_hc_by_tier[src_tier] = last_hc;
 
     const double t_head0 = profile ? now_sec() : 0.0;
     bool ok = ds4_gpu_begin_commands() != 0;
@@ -15218,7 +15251,7 @@ static bool metal_graph_prefill_chunked_range(
     const double t_head_encoded = profile ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_head_done = profile ? now_sec() : 0.0;
-    g->cur_hc_by_tier[g->active_tier] = saved_cur;
+    g->cur_hc_by_tier[src_tier] = saved_cur;
     ds4_gpu_tensor_free(last_hc);
     if (!ok) return false;
 
