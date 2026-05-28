@@ -228,6 +228,18 @@ tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_g
 
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+# Half-B (B8) runtime test: GPU-only multi-tier numerical-equivalence.
+# Requires DS4_TEST_HOOKS so ds4_test_session_read_logits + ds4_test_engine_placement
+# are exported from ds4.c. Builds against the CUDA backend; skipped on Darwin.
+ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
+
+tests/test_engine_mgpu_runtime.o: tests/test_engine_mgpu_runtime.c ds4.h ds4_gpu_mgpu.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ tests/test_engine_mgpu_runtime.c
+
+tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o ds4_kvstore.o rax.o ds4_layer_pack.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 endif
 
 ds4_test: ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -243,4 +255,4 @@ test: ds4_test tests/test_layer_pack tests/test_engine_mgpu_placement
 	./tests/test_engine_mgpu_placement
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_layer_pack tests/test_layer_pack.o tests/test_engine_mgpu_placement tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_layer_pack tests/test_layer_pack.o tests/test_engine_mgpu_placement tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_engine_mgpu_runtime tests/test_engine_mgpu_runtime.o

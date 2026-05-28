@@ -19122,6 +19122,36 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
     free(eng.model.tensors);
     return rc;
 }
+
+/* Half-B (B8): reach into a session and read raw logits from
+ * g->logits_by_tier[head_tier] to host memory. Used by
+ * tests/test_engine_mgpu_runtime.c to compare single-tier vs multi-tier
+ * outputs. Returns 0 on success, nonzero on error. */
+int ds4_test_session_read_logits(ds4_session *s, float *out, uint64_t out_bytes) {
+    if (!s || !out) return 1;
+    if (out_bytes < (uint64_t)DS4_N_VOCAB * sizeof(float)) return 1;
+#ifdef DS4_NO_GPU
+    (void)out;
+    return 1;
+#else
+    /* metal_graph_logits resolves g->logits_by_tier[g->head_tier]; the
+     * tensor's device_id was stamped at alloc_on time, so
+     * ds4_gpu_tensor_read calls cudaSetDevice on the right device. */
+    if (!ds4_gpu_tensor_read(metal_graph_logits(&s->graph),
+                             /*offset*/ 0,
+                             out,
+                             (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        return 1;
+    }
+    return 0;
+#endif
+}
+
+/* Half-B (B8): expose engine's placement[] array for runtime-test
+ * assertion (DS4_N_LAYER + 2 entries). Lifetime tied to engine. */
+const int *ds4_test_engine_placement(const ds4_engine *e) {
+    return e ? e->placement : NULL;
+}
 #endif /* DS4_TEST_HOOKS */
 
 /* Internal engine-open helper carrying today's body verbatim plus three

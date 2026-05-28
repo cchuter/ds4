@@ -1,25 +1,19 @@
-/* CUDA-build regression test for mgpu-graph-session-placement.
+/* CUDA-build regression test for the multi-tier CPU-spill refusal path.
  *
- * Catches two failure modes that the CPU-only test_engine_mgpu_placement
- * can't reach because it bypasses ds4_engine_open_internal:
+ * Half-B (B7) lifted the GPU-only refusal: GPU-only multi-tier placements
+ * now run normally. CPU-spill placements (where any layer lands on the
+ * CPU tier because GPU VRAM is too tight) continue to refuse with stderr
+ * naming the wave-3b follow-up `mgpu-graph-session-cpu-spill`.
  *
- * 1. Inverted return-value check on ds4_gpu_init_multi (== vs !=). If the
- *    check is wrong, init succeeds, the engine aborts immediately, and
- *    the layout-print + refusal flow never runs.
- *
- * 2. Partial-state leak from ds4_gpu_init_multi on mid-loop failure (which
- *    requires g_n_gpus to be published incrementally so ds4_gpu_cleanup
- *    can unwind allocated contexts).
- *
- * The test:
- *   - Constructs a 2-GPU ds4_gpu_config (skips with PASS if dev_count < 2).
- *   - Captures stderr via freopen.
- *   - Calls ds4_engine_create_with_gpu_config.
- *   - Restores stderr.
- *   - Asserts: engine open returned nonzero, engine pointer is NULL,
- *     captured stderr contains BOTH "multi-GPU layout" (proves the
- *     init_multi success path ran) AND the refusal message (proves the
- *     documented dry-run refusal fired).
+ * This test forces CPU spill by configuring two GPUs with deliberately
+ * tiny VRAM budgets (1 GiB each, not enough to hold the model), then
+ * asserts that engine creation:
+ *   - returns nonzero,
+ *   - leaves the engine pointer NULL,
+ *   - emits stderr containing "multi-GPU layout" (proves the layout
+ *     printer ran — init_multi succeeded and placement was computed),
+ *   - emits stderr containing "mgpu-graph-session-cpu-spill" (proves
+ *     the CPU-spill branch fired with the new wording).
  *
  * Requires DS4_TEST_MODEL to be set to a valid GGUF path. */
 
@@ -131,9 +125,10 @@ int main(void) {
     CHECK(strstr(cap, "multi-GPU layout") != NULL,
           "stderr must contain 'multi-GPU layout' (init_multi must have succeeded "
           "and layout must have been printed before refusal)");
-    CHECK(strstr(cap, "mgpu-graph-session-execution") != NULL ||
-          strstr(cap, "execution wiring lands in") != NULL,
-          "stderr must contain the documented refusal message");
+    CHECK(strstr(cap, "mgpu-graph-session-cpu-spill") != NULL,
+          "stderr must name the wave-3b CPU-spill follow-up task");
+    CHECK(strstr(cap, "CPU-spill placement detected") != NULL,
+          "stderr must contain the CPU-spill diagnostic line");
 
     free(cap);
     (void)unlink(cap_path);
