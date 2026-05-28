@@ -198,14 +198,12 @@ int main(void) {
     cfg.device_indices[0] = 0;
     cfg.device_indices[1] = 1;
     /* Budgets sized to fit the 80 GiB IQ2XXS DeepSeek-V4-Flash model
-     * with KV-cache + output-head headroom on a box where GPU1 has
-     * ~12 GiB used by unrelated workloads (~36 GiB actually free).
-     * GPU0 gets the bulk (47 GiB) so the packer can put more layers
-     * there and leave enough slack on GPU1 for the output head pseudo-
-     * layer to fit too. If GPU1 free is even lower, the placement
-     * spills and the test SKIP_PASSes (same existing behavior). */
+     * fully across two GPUs with KV-cache + output-head headroom at
+     * ctx=4096. Both GPUs are assumed to have ≥47 GiB free; if
+     * contested by unrelated workloads the placement spills and the
+     * test SKIP_PASSes (same existing behavior). */
     cfg.vram_bytes[0] = (size_t)47ull * 1024ull * 1024ull * 1024ull;
-    cfg.vram_bytes[1] = (size_t)35ull * 1024ull * 1024ull * 1024ull;
+    cfg.vram_bytes[1] = (size_t)47ull * 1024ull * 1024ull * 1024ull;
     cfg.safety_margin_bytes = (size_t)1024u * 1024u * 1024u;
 
     ds4_engine *e2 = NULL;
