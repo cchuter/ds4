@@ -252,6 +252,12 @@ tests/test_engine_mgpu_runtime.o: tests/test_engine_mgpu_runtime.c ds4.h ds4_gpu
 
 tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o ds4_cuda.o ds4_kvstore.o rax.o ds4_layer_pack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_engine_correctness.o: tests/test_engine_correctness.c ds4.h ds4_gpu_mgpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ tests/test_engine_correctness.c
+
+tests/test_engine_correctness: tests/test_engine_correctness.o ds4_cuda.o ds4_kvstore.o rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 endif
 
 ds4_test: ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -269,4 +275,4 @@ test: ds4_test tests/test_layer_pack tests/test_engine_mgpu_placement tests/test
 	./tests/test_gpu_args_cli.sh
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_layer_pack tests/test_layer_pack.o tests/test_engine_mgpu_placement tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_engine_mgpu_runtime tests/test_engine_mgpu_runtime.o tests/test_gpu_args tests/test_gpu_args.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_layer_pack tests/test_layer_pack.o tests/test_engine_mgpu_placement tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_engine_mgpu_runtime tests/test_engine_mgpu_runtime.o tests/test_engine_correctness tests/test_engine_correctness.o tests/test_gpu_args tests/test_gpu_args.o

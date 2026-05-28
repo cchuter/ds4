@@ -72,6 +72,7 @@ run_split () {
         --ctx-start 2048 \
         --ctx-max "$CTX_MAX" \
         --gen-tokens "$GEN_TOKENS" \
+        --show-output \
         >> "$log" 2>&1 &
     local pid=$!
 
