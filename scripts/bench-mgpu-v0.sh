@@ -113,17 +113,26 @@ run_split () {
     #   - "ctx_tokens,prefill_tokens" header present → bench ran
     #   - otherwise → error or aborted
     local outcome
+    local prefill_tps="" gen_tps="" ctx_tokens=""
     if grep -q "CPU-spill placement detected" "$log"; then
         outcome="ENV-BLOCK (CPU-spill refusal — wave 3b required)"
     elif grep -q "^ctx_tokens,prefill_tokens" "$log"; then
         outcome="OK (bench ran)"
+        # Extract the bench CSV row: ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes
+        local csv_row
+        csv_row=$(grep -E '^[0-9]+,[0-9]+,[0-9.]+,[0-9]+,[0-9.]+,[0-9]+' "$log" | head -1)
+        if [ -n "$csv_row" ]; then
+            ctx_tokens=$(echo "$csv_row" | awk -F',' '{print $1}')
+            prefill_tps=$(echo "$csv_row" | awk -F',' '{print $3}')
+            gen_tps=$(echo "$csv_row" | awk -F',' '{print $5}')
+        fi
     elif grep -q "another ds4 process is already running" "$log"; then
         outcome="LOCK CONFLICT (set DS4_LOCK_FILE to a free path)"
     else
         outcome="UNKNOWN (rc=$rc, see log)"
     fi
 
-    results+=("$label|$outcome|$log|$smi")
+    results+=("$label|$outcome|$prefill_tps|$gen_tps|$ctx_tokens|$log|$smi")
     {
         echo
         echo "# === post-run summary ==="
@@ -151,11 +160,16 @@ run_split auto           --gpu-vram auto
 echo
 echo "## bench-mgpu-v0 summary"
 echo
-printf "| %-12s | %s |\n" "split" "outcome"
-printf "| %-12s | %s |\n" "---" "---"
+printf "| %-12s | %-12s | %-10s | %-9s | %s |\n" "split" "ctx_tokens" "prefill tps" "gen tps" "outcome"
+printf "| %-12s | %-12s | %-10s | %-9s | %s |\n" "---" "---" "---" "---" "---"
 for row in "${results[@]}"; do
-    IFS='|' read -r label outcome _log _smi <<< "$row"
-    printf "| %-12s | %s |\n" "$label" "$outcome"
+    IFS='|' read -r label outcome prefill_tps gen_tps ctx_tokens _log _smi <<< "$row"
+    printf "| %-12s | %-12s | %-10s | %-9s | %s |\n" \
+        "$label" \
+        "${ctx_tokens:--}" \
+        "${prefill_tps:--}" \
+        "${gen_tps:--}" \
+        "$outcome"
 done
 
 echo

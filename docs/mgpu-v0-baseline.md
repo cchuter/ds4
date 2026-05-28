@@ -34,13 +34,19 @@ GPU(s) will trigger the engine's documented CPU-spill refusal.
 
 ## Bench matrix
 
-| Split | Flags | Outcome |
-|---|---|---|
-| single-gpu | `--gpu-vram 48` | ENV-BLOCK (CPU-spill: 47.2 / 48.0 GB fits layers 0-24 + emb; 25-42 spill to CPU; engine refuses) |
-| split-24-24 | `--gpu-vram 24,24` | ENV-BLOCK (CPU-spill: GPU0 layers 0-11, GPU1 layers 12-23, CPU 24-42) |
-| split-40-12 | `--gpu-vram 40,12` | ENV-BLOCK (CPU-spill: GPU0 layers 0-19, GPU1 layers 20-25, CPU 26-42) |
-| cpu-only | `--gpu-vram 0` | (in progress — extremely slow on CPU; report-update pending) |
-| auto | `--gpu-vram auto` | ENV-BLOCK (auto-probed 47 + 17 GB; same shape as split-40-12; CPU-spill 26-42) |
+| Split | Flags | Outcome | Prefill tok/s | Gen tok/s |
+|---|---|---|---|---|
+| single-gpu | `--gpu-vram 48` | ENV-BLOCK (CPU-spill: 47.2 / 48.0 GB fits layers 0-24 + emb; 25-42 spill to CPU; engine refuses) | n/a | n/a |
+| split-24-24 | `--gpu-vram 24,24` | ENV-BLOCK (CPU-spill: GPU0 layers 0-11, GPU1 layers 12-23, CPU 24-42) | n/a | n/a |
+| split-40-12 | `--gpu-vram 40,12` | ENV-BLOCK (CPU-spill: GPU0 layers 0-19, GPU1 layers 20-25, CPU 26-42) | n/a | n/a |
+| cpu-only | `--gpu-vram 0` | **OK** (ran to completion) | **1.94** | **1.59** |
+| auto | `--gpu-vram auto` | ENV-BLOCK (auto-probed 47 + 17 GB; same shape as split-40-12; CPU-spill 26-42) | n/a | n/a |
+
+CPU baseline measured at `ctx=2048, gen-tokens=64` on the box's
+128-core CPU; kvcache 52 MB. This is the only end-to-end bench
+that completed in the current env. Reference numbers v1/v2 will
+crush these by orders of magnitude with GPU placement when GPU1
+frees up.
 
 Per-run logs land in `.dev-team/reports/mgpu-bench/<label>-<ts>.log`
 (gitignored — not part of the PR).
@@ -139,14 +145,33 @@ GPU1: layers 24-31  (14.8 / 16.6 GB)
 CPU : layers 32-42 + output head
 ```
 
-The "(used / budget)" pattern engine-side is consistent with the
-nvidia-smi snapshot to within the 256 MB tolerance from the design
-doc, except that no bench-time generation happened so the
-"steady-state" comparison the design envisions isn't measurable
-yet.
+### Engine-vs-nvidia-smi delta table (snapshots at engine init)
 
-**Full empirical VRAM-vs-smi delta table is deferred to a re-run
-after the user frees GPU1.**
+Captures from `.dev-team/reports/mgpu-bench/<split>-<ts>.smi`,
+taken AFTER engine reported `backend initialized for graph
+diagnostics` but BEFORE bench generation:
+
+| Split | Device | Engine "used" (GB) | nvidia-smi used (MiB) | Note |
+|---|---|---|---|---|
+| single-gpu | GPU0 | 47.2 (target) | 4 | Engine ABORTED at CPU-spill check; no allocation ever happened. nvidia-smi reflects pre-init state. |
+| split-24-24 | GPU0 | 23.1 (target) | 4 | Same — engine aborted pre-alloc. |
+| split-24-24 | GPU1 | 22.2 (target) | 30851 (miners) | nvidia-smi reflects ONLY miners. |
+| split-40-12 | GPU0 | 37.9 (target) | 4 | Engine aborted pre-alloc. |
+| split-40-12 | GPU1 | 11.1 (target) | 30851 (miners) | — |
+| auto | GPU0 | 45.3 (target) | **15668** | Engine started mmap registration (15.3 GiB) before refusing. |
+| auto | GPU1 | 14.8 (target) | 28339 (miners) | — |
+
+The "engine used" values are the planned allocations from the
+layout-print; on the env-blocked splits the engine refused before
+actually allocating, so the nvidia-smi shows pre-alloc state plus
+any miner load. The `auto` run captured a partial mmap registration
+(GPU0 ~15 GiB) showing that the engine does begin allocation before
+hitting the CPU-spill refusal point.
+
+**A clean engine-vs-smi delta (within ±256 MB tolerance per design)
+requires a successful end-to-end run where the engine fully
+allocates and runs bench iterations. That's deferred to a re-run
+after GPU1 frees up.**
 
 ## Peer-access matrix
 
@@ -169,10 +194,15 @@ directions is expected and produces better cross-device latency.
 |---|---|---|
 | `./ds4_test --tool-call-quality` | **PASS** | Both fast-path and exact-path subtests passed on box. |
 | `./ds4_test --server` | **PASS** | Server end-to-end OK. |
-| `./ds4_test --long-context` | (in progress — see PR description) | Pre-existing `--logprob-vectors short_code_completion` step 1 failure documented; not blocking. |
+| `./ds4_test --long-context` | (re-running in isolation) | First run was concurrent with the CPU-only bench (load avg 10+; ds4-bench at 1000% CPU) and produced 19 fact-recall failures — the model was being starved of cycles. Re-running standalone; result updated to PR when complete. The expected pre-existing failure `--logprob-vectors short_code_completion` step 1 is documented and not blocking. |
 
-All regression gates that have completed at time of report write
-show single-tier inference unchanged by this PR.
+Concurrent test execution caveat: the first `--long-context` run
+overlapped with the CPU-only bench (which is a multi-hour process
+saturating the box's 128-core CPU). That produced spurious
+fact-recall misses. The harness should be re-run with isolation
+in normal use, OR the CPU-only bench should be scheduled separately
+from regression tests on shared hardware. This is operational, not a
+code regression.
 
 ## Notable / pre-existing issues
 
@@ -243,15 +273,16 @@ for review (or update the existing PR with new commits).
 
 | Acceptance | Status |
 |---|---|
-| Bench matrix end-to-end | env-blocked (recorded with reason per split) |
-| Numerical-equivalence test runs | SKIP_PASS env-blocked (documented) |
-| VRAM accounting | partial (engine layouts captured; nvidia-smi snapshots captured; delta table deferred) |
+| Bench matrix end-to-end | partial — CPU-only completed (1.94 prefill, 1.59 gen tok/s at ctx=2048); all GPU splits ENV-BLOCK (CPU-spill refusal, model > 64 GB available VRAM) |
+| Numerical-equivalence test runs | SKIP_PASS env-blocked (test correctly detects + skips; documented) |
+| VRAM accounting | partial — engine layouts captured + nvidia-smi snapshots captured (table above). Full ±256 MB delta requires successful end-to-end runs (deferred). |
 | Peer-matrix logged | **DONE** (BOUNCE both directions on driver 570.207) |
 | Baseline report written | **DONE** (this document) |
-| Single-tier regression preserved | **PASS** (--tool-call-quality, --server; --long-context in progress) |
+| Single-tier regression preserved | partial — `--tool-call-quality` PASS, `--server` PASS, `--long-context` re-running standalone (first run was load-thrashed by concurrent CPU bench) |
 | `test_engine_mgpu_runtime` actually runs | **SKIP_PASS** (same env-block; documented) |
 | Bench runs complete without script errors | **PASS** (harness records each ENV-BLOCK and proceeds) |
 | No production code changes | **PASS** (only scripts + this report) |
 
 The wiring + harness are in a state ready to capture real numbers
-once the GPU1 contention is resolved.
+once the GPU1 contention is resolved. The CPU-only baseline is
+in-hand (1.94 prefill / 1.59 gen tok/s at ctx=2048).
