@@ -87,6 +87,21 @@ int ds4_gpu_init_multi(const ds4_gpu_config *cfg);
 int  ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes);
 void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t);
 
+/* Heap-allocated tensor on a specific logical tier; mirrors the legacy
+ * ds4_gpu_tensor_alloc ABI (returns ds4_gpu_tensor *) but with a tier
+ * parameter. Returns NULL on failure. Used by the multi-tier graph
+ * allocations in ds4.c. Single-tier callers can continue using the
+ * legacy ds4_gpu_tensor_alloc(bytes) which is equivalent to
+ * ds4_gpu_tensor_alloc_ptr_on(0, bytes). */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes);
+
+/* Heap-allocated MANAGED-memory tensor on a specific logical tier. Used
+ * for the KV-cache pool. Stamps tier on the tensor so subsequent
+ * ds4_gpu_tensor_free runs under the correct device. Note managed memory
+ * pages on first-touch and is not strictly device-bound; the stamped
+ * tier records the home tier for accounting + free. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes);
+
 /* Cross-device tensor copy. Same-device → cudaMemcpyAsync; peer-capable
  * cross-device → cudaMemcpyPeerAsync with event sync; non-peer → pinned
  * host bounce (per src→dst pair). Honors DS4_FORCE_HOST_BOUNCE=1. */

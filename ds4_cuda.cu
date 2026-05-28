@@ -1930,6 +1930,67 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return t;
 }
 
+/* Half-B: heap-allocated tensor on a specific logical tier.
+ *
+ * Mirrors the legacy ds4_gpu_tensor_alloc ABI (returns ds4_gpu_tensor *)
+ * with an explicit tier argument. Internally calls
+ * ds4_gpu_tensor_alloc_on on a freshly malloc'd struct.
+ *
+ * The legacy ds4_gpu_tensor_alloc(bytes) (above) calls
+ * ds4_gpu_tensor_alloc_on(t, 0, bytes); ds4_gpu_tensor_alloc_ptr_on(0,
+ * bytes) is byte-equivalent. Single-tier callers MAY remain on the
+ * legacy 1-arg helper; new multi-tier callers in ds4.c use _ptr_on. */
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes) {
+    if (tier < 0 || tier >= g_n_gpus) {
+        fprintf(stderr,
+            "ds4: ds4_gpu_tensor_alloc_ptr_on: bad tier %d (n_gpus=%d)\n",
+            tier, g_n_gpus);
+        return NULL;
+    }
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    if (ds4_gpu_tensor_alloc_on(t, tier, bytes) != 0) {
+        free(t);
+        return NULL;
+    }
+    return t;
+}
+
+/* Half-B: heap-allocated managed-memory tensor on a specific logical
+ * tier. Differs from ds4_gpu_tensor_alloc_managed only in stamping
+ * tier instead of 0. Used by the per-layer KV cache when tier !=0.
+ *
+ * Managed-memory paging behavior: cudaMallocManaged pages between
+ * devices on first-touch. In a single-tier pipeline the page lives on
+ * tier 0; in a multi-tier pipeline the layer's kernels run on the
+ * layer's tier so the page lives there after first-touch and stays
+ * unless another device touches it. Stamping tier matches the home
+ * device for free-time accounting. */
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes) {
+    if (tier < 0 || tier >= g_n_gpus) {
+        fprintf(stderr,
+            "ds4: ds4_gpu_tensor_alloc_managed_on: bad tier %d (n_gpus=%d)\n",
+            tier, g_n_gpus);
+        return NULL;
+    }
+    if (bytes == 0) bytes = 1;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    int ok = 0;
+    /* Run the cudaMallocManaged call under the home tier's device so the
+     * first-touch home matches the stamped device_id; the page itself can
+     * migrate freely under managed-memory semantics. */
+    WITH_DEVICE(g_gpu[tier].device_id) {
+        ok = cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes),
+                     "managed tensor alloc (tier)");
+    }
+    if (!ok) { free(t); return NULL; }
+    t->bytes = bytes;
+    t->owner = 1;
+    t->device_id = tier;
+    return t;
+}
+
 extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) {
     return t ? t->device_id : -1;
 }
