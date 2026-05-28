@@ -63,7 +63,7 @@ typedef struct {
 typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
-    /* mgpu-cli-wiring: raw --gpu-vram / --gpu-devices argv values. */
+    /* CLI flag wiring: raw --gpu-vram / --gpu-devices argv values. */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     const char *chdir_path;
@@ -9600,7 +9600,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* mgpu-cli-wiring: resolve backend before logging context-memory. */
+    /* CLI flag wiring: resolve backend before logging context-memory. */
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         if (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "0")) {
             cfg.engine.backend = DS4_BACKEND_CPU;
@@ -9611,7 +9611,7 @@ int main(int argc, char **argv) {
     log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
 
     ds4_engine *engine = NULL;
-    /* mgpu-cli-wiring: route through ds4_engine_create_with_gpu_config
+    /* CLI flag wiring: route through ds4_engine_create_with_gpu_config
      * when the user opted in via --gpu-vram / --gpu-devices. */
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = (ds4_gpu_config){0};

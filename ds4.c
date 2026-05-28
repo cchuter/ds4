@@ -49,7 +49,7 @@
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
- * stubs for the wave-1/2 multi-GPU functions and globals declared in
+ * stubs for the multi-GPU plumbing multi-GPU functions and globals declared in
  * ds4_gpu_mgpu.h. These keep the linker happy on Mac/Metal and on CPU
  * builds. None of these are reached at runtime in non-CUDA builds
  * because multi_tier == 1 requires graph_backend == true which on
@@ -61,7 +61,7 @@
  * because there's no positive "is CUDA build" macro and ds4_cuda.cu
  * is only compiled in the non-Apple, non-DS4_NO_GPU configuration. */
 /* Apple (Metal) build: ds4_cuda.cu is not linked, but the engine compiles
- * code referencing some wave-2 symbols inside dead multi-tier branches.
+ * code referencing some multi-GPU CLI symbols inside dead multi-tier branches.
  * Provide stubs so the linker is happy. CPU-only (DS4_NO_GPU) builds
  * never reach the multi-tier branches and never include ds4_gpu.h, so
  * we cannot reference ds4_tensor_range there — those stubs are guarded
@@ -82,7 +82,7 @@ int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes) {
 }
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes) {
     /* Metal / CPU build has no CUDA multi-tier — short-circuit tier 0 to
-     * the legacy single-device allocator so the Half-B per-tier graph
+     * the legacy single-device allocator so the per-tier graph
      * allocation path (e.g. g->output_pre_by_tier[head_tier]) keeps
      * working byte-equivalent to pre-multi-tier Metal. Without this,
      * every multi-tier-aware allocation in metal_graph_alloc_raw_cap
@@ -9592,7 +9592,7 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  */
 
 typedef struct {
-    /* Half-B (B5): Class P — per-tier replicated kernel scratch buffers.
+    /* Class P — per-tier replicated kernel scratch buffers.
      * Each used tier has its own copy; active_tier names the slot the
      * current dispatch step reads/writes. Single-tier paths leave
      * active_tier == 0; multi-tier dispatch updates active_tier in B6.
@@ -9616,7 +9616,7 @@ typedef struct {
     ds4_gpu_tensor *kv_raw_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *kv_by_tier[DS4_MAX_GPUS];
     int active_tier;
-    /* Half-B (B6): cached engine placement[] (length DS4_N_LAYER + 2) for the
+    /* cached engine placement[] (length DS4_N_LAYER + 2) for the
      * dispatch loops. NULL in single-tier mode — active_tier stays 0 and
      * dispatch wrappers no-op the tier-switch + cross-device copy. The
      * pointer aliases e->placement; the engine outlives the graph so this
@@ -9664,7 +9664,7 @@ typedef struct {
     uint32_t layer_comp_cap[DS4_MAX_LAYER];
     uint32_t attn_comp_stage_cap;
 
-    /* Half-B (B5): Class P (per-layer work tensors). Each used tier has its
+    /* Class P (per-layer work tensors). Each used tier has its
      * own replica. They are reused in place by every layer instead of
      * allocating a generic graph arena. This is why the code is verbose but
      * predictable: each pointer names an actual DS4 stage. */
@@ -9697,7 +9697,7 @@ typedef struct {
     ds4_gpu_tensor *routed_out_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *ffn_out_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *after_ffn_hc_by_tier[DS4_MAX_GPUS];
-    /* Half-B (B3): Class H — output-head buffers and logits live on the
+    /* Class H — output-head buffers and logits live on the
      * head tier only. head_tier is captured at metal_graph_alloc_raw_cap
      * time from placement[DS4_N_LAYER + 1] (or 0 in single-tier /
      * diagnostic paths). Non-head slots remain NULL. Readers go through
@@ -9730,13 +9730,13 @@ typedef struct {
      * tokens moves through layer 0, then layer 1, and so on, updating the same
      * persistent caches used by decode.  Keeping this separate from decode
      * avoids a slow loop of one-token graph steps for long prompts. */
-    /* Half-B (B4): Class E — embedding-tier-only prompt-token integer buffer.
+    /* Class E — embedding-tier-only prompt-token integer buffer.
      * Captured at metal_graph_alloc_raw_cap time from placement[0] (or 0 in
      * single-tier / diagnostic paths). Non-embedding slots stay NULL. Readers
      * go through metal_graph_prefill_tokens() below. */
     ds4_gpu_tensor *prefill_tokens_by_tier[DS4_MAX_GPUS];
     int emb_tier;
-    /* Half-B (B5): Class P batch (chunked-prefill) scratch — per-tier
+    /* Class P batch (chunked-prefill) scratch — per-tier
      * replicated. The cur/next pair is ping-ponged per layer step on the
      * layer's active tier; tier transitions copy the active buffer across
      * boundaries via ds4_gpu_tensor_copy_xdev (handled in B6). */
@@ -9780,7 +9780,7 @@ typedef struct {
     bool batch_routed_mid_is_f16;
     ds4_gpu_tensor *batch_ffn_out_by_tier[DS4_MAX_GPUS];
     bool materialize_ffn_out;
-    /* Half-B (B5): Class P (replicated per tier per codex round-1 — this is
+    /* Class P (replicated per tier — this is
      * consumed in per-layer attn/FFN kernels, NOT embedding-only). Read-only
      * after init; replicate by writing the same host directions buffer to
      * every used tier's slot during session setup. */
@@ -9794,7 +9794,7 @@ typedef struct {
     bool mtp_enabled;
 } ds4_gpu_graph;
 
-/* Half-B (B3): Class H accessors. All reader sites for the output-head
+/* Class H accessors. All reader sites for the output-head
  * tensors and the final logits route through these inlines, which read the
  * head_tier slot captured at allocation time. Single-tier paths set
  * head_tier == 0 and the slot is byte-identical to the legacy
@@ -9816,7 +9816,7 @@ static inline ds4_gpu_tensor *metal_graph_output_norm(const ds4_gpu_graph *g) {
     return g->output_norm_by_tier[g->head_tier];
 }
 
-/* Half-B (B4): Class E accessor. The prompt-token integer buffer is
+/* Class E accessor. The prompt-token integer buffer is
  * consumed by the embedding kernel on the embedding tier only. Single-tier
  * paths set emb_tier == 0 (byte-equivalent to the legacy single-tier
  * pointer). Multi-tier paths set emb_tier = placement[0]. */
@@ -9824,7 +9824,7 @@ static inline ds4_gpu_tensor *metal_graph_prefill_tokens(const ds4_gpu_graph *g)
     return g->prefill_tokens_by_tier[g->emb_tier];
 }
 
-/* Half-B (B5): Class P accessors. Each Class P kernel-scratch buffer is
+/* Class P accessors. Each Class P kernel-scratch buffer is
  * replicated across every tier the placement uses; the active_tier field
  * names the slot the current dispatch step reads/writes. Single-tier paths
  * leave active_tier == 0 (byte-equivalent to the legacy single-tier
@@ -9917,7 +9917,7 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_routed_out)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_ffn_out)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(directional_steering_dirs)
 
-/* Half-B (B6): dispatch-loop helpers for multi-tier per-layer execution.
+/* dispatch-loop helpers for multi-tier per-layer execution.
  *
  * Single-tier (g->placement == NULL): all helpers are no-ops; active_tier
  * stays 0 from memset; behavior is byte-equivalent to legacy.
@@ -9926,9 +9926,9 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(directional_steering_dirs)
  * BEFORE the next kernel-dispatch wrapper reads any Class P accessor. If
  * the source-tier Class P cur_hc (or batch_cur_hc) differs from the new
  * tier's, ds4_gpu_tensor_copy_xdev ferries the active hidden state across
- * the boundary. copy_xdev returns 1 on success, 0 on failure (Half-A
- * convention). The destination tensor's device_id was stamped at
- * alloc_on time and is immutable.
+ * the boundary. copy_xdev returns 1 on success, 0 on failure. The
+ * destination tensor's device_id was stamped at alloc_on time and is
+ * immutable.
  *
  * For decode (one token at a time): metal_graph_set_active_tier_decode
  * swaps to the requested tier and copies cur_hc across the boundary.
@@ -10043,7 +10043,7 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
-    /* Half-B (B5): free every Class P slot across all DS4_MAX_GPUS tier
+    /* free every Class P slot across all DS4_MAX_GPUS tier
      * slots. Unallocated slots are NULL and ds4_gpu_tensor_free(NULL) is a
      * no-op. The hc_pre / hc_post / hc_comb views must be freed BEFORE
      * their parent hc_split — view destruction releases its own struct
@@ -10091,12 +10091,12 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->batch_next_hc_by_tier[t]);
         ds4_gpu_tensor_free(g->batch_cur_hc_by_tier[t]);
     }
-    /* Half-B (B4): Class E free across all tier slots. */
+    /* Class E free across all tier slots. */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         ds4_gpu_tensor_free(g->prefill_tokens_by_tier[t]);
         g->prefill_tokens_by_tier[t] = NULL;
     }
-    /* Half-B (B3): Class H free across all tier slots. Non-head slots are
+    /* Class H free across all tier slots. Non-head slots are
      * NULL and ds4_gpu_tensor_free(NULL) is a no-op. */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         ds4_gpu_tensor_free(g->logits_by_tier[t]);
@@ -10113,7 +10113,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_enorm);
     ds4_gpu_tensor_free(g->mtp_embed);
     ds4_gpu_tensor_free(g->spec_logits);
-    /* Half-B (B3): Class H output-head free across all tier slots. */
+    /* Class H output-head free across all tier slots. */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         ds4_gpu_tensor_free(g->output_norm_by_tier[t]);
         g->output_norm_by_tier[t] = NULL;
@@ -10124,7 +10124,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->output_pre_by_tier[t]);
         g->output_pre_by_tier[t] = NULL;
     }
-    /* Half-B (B5): Class P decode scratch + routed-FFN free across all
+    /* Class P decode scratch + routed-FFN free across all
      * tier slots. ffn_out is also a Class P field freed here. */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         ds4_gpu_tensor_free(g->after_ffn_hc_by_tier[t]);
@@ -10188,7 +10188,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
     }
-    /* Half-B (B5): Class P decode-step scratch + decode HC group free across
+    /* Class P decode-step scratch + decode HC group free across
      * all tier slots. hc_pre / hc_post / hc_comb are VIEWS of hc_split — free
      * them before hc_split so the view struct release happens with the parent
      * still pointer-valid (view free does not touch parent memory). */
@@ -10230,7 +10230,7 @@ static bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
  * the normal inference path.
  */
 
-/* Half-B (B5): directional_steering_dirs is Class P — replicated per tier.
+/* directional_steering_dirs is Class P — replicated per tier.
  * The same host directions buffer is written to every tier slot the engine's
  * placement uses, then the load buffer is freed. Read-only after init, so
  * the per-tier replicas stay byte-identical and never re-sync. */
@@ -10367,7 +10367,7 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     return bytes;
 }
 
-/* Half-B (B1): tier-aware KV-cache tensor allocator.
+/* tier-aware KV-cache tensor allocator.
  *
  * For multi-tier (g_n_gpus > 1), the per-layer KV cache must live on the
  * layer's tier. The non-managed path uses ds4_gpu_tensor_alloc_ptr_on;
@@ -10521,7 +10521,7 @@ static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint3
            metal_graph_debug_wants("ffn_out", il, pos);
 }
 
-/* Half-B (B5): tier-aware lazy allocator. The Class P ffn_out scratch is
+/* tier-aware lazy allocator. The Class P ffn_out scratch is
  * created on demand the first time a layer that materializes ffn_out runs
  * on a tier; subsequent visits to the same tier reuse the existing slot.
  * Single-tier paths: active_tier == 0 always, behavior unchanged. */
@@ -10550,7 +10550,7 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF.
  *
- * Half-B (B2): tier-aware per-layer allocation.
+ * tier-aware per-layer allocation.
  *   placement: when non-NULL, an array of DS4_N_LAYER + 2 logical tiers
  *     (embedding, per-layer..., head). The per-layer KV / state allocations
  *     in this function use placement[il + 1] as the home tier for each
@@ -10570,7 +10570,7 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp,
         const int              *placement) {
     memset(g, 0, sizeof(*g));
-    /* Half-B (B6): cache placement on the graph so the dispatch loops can
+    /* cache placement on the graph so the dispatch loops can
      * walk it without threading the engine pointer through every
      * kernel-dispatch wrapper. NULL in single-tier callers (placement
      * was already NULL on entry). */
@@ -10647,7 +10647,7 @@ static bool metal_graph_alloc_raw_cap(
                 (double)context_bytes / 1073741824.0);
     }
 
-    /* Half-B (B5): Class P decode HC scratch — replicated across every tier
+    /* Class P decode HC scratch — replicated across every tier
      * the placement uses (per-tier kernel-scratch). Single-tier path
      * (placement == NULL) collapses to tier 0 only; _ptr_on(0, ...) short-
      * circuits to legacy ds4_gpu_tensor_alloc when g_n_gpus <= 1 — byte-
@@ -10686,7 +10686,7 @@ static bool metal_graph_alloc_raw_cap(
     }
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        /* Half-B (B2): per-layer Class L allocations land on the layer's
+        /* per-layer Class L allocations land on the layer's
          * home tier. placement is NULL on single-tier / diagnostic paths
          * (all-tier-0); non-NULL on the engine path that opted into
          * multi-tier. layer_tier == 0 in single-tier mode is the
@@ -10754,7 +10754,7 @@ static bool metal_graph_alloc_raw_cap(
             }
         }
     }
-    /* Half-B (B5): Class P per-layer decode scratch + routed-expert state —
+    /* Class P per-layer decode scratch + routed-expert state —
      * replicated across every used tier. ffn_out is lazily allocated by
      * metal_graph_ensure_ffn_out (per-tier on first touch). */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
@@ -10798,7 +10798,7 @@ static bool metal_graph_alloc_raw_cap(
         g->routed_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
         g->after_ffn_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, hc_dim * sizeof(float));
     }
-    /* Half-B (B3): Class H — head_tier captured from placement[DS4_N_LAYER + 1]
+    /* Class H — head_tier captured from placement[DS4_N_LAYER + 1]
      * (or 0 in single-tier / diagnostic paths). Output-head tensors and the
      * final logits buffer allocate on head_tier only; other tier slots stay
      * NULL. The _ptr_on(0, ...) path short-circuits to the legacy
@@ -10837,13 +10837,13 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_n_raw = 0;
     }
 
-    /* Half-B (B4): Class E — emb_tier captured from placement[0] (or 0 in
+    /* Class E — emb_tier captured from placement[0] (or 0 in
      * single-tier / diagnostic paths). _ptr_on(0, ...) short-circuits to the
      * legacy ds4_gpu_tensor_alloc when g_n_gpus <= 1 — byte-equivalent. */
     g->emb_tier = placement ? placement[0] : 0;
     g->prefill_tokens_by_tier[g->emb_tier] =
         ds4_gpu_tensor_alloc_ptr_on(g->emb_tier, pc * sizeof(int32_t));
-    /* Half-B (B5): Class P chunked-prefill batch scratch — replicated across
+    /* Class P chunked-prefill batch scratch — replicated across
      * every used tier. The cur/next pair (batch_cur_hc / batch_next_hc) is
      * ping-ponged per layer step on each tier; tier transitions copy via
      * ds4_gpu_tensor_copy_xdev (handled in B6). batch_ffn_out is lazily
@@ -10915,7 +10915,7 @@ static bool metal_graph_alloc_raw_cap(
         }
     }
 
-    /* Half-B (B5): Class P validation — check every used tier's slot. */
+    /* Class P validation — check every used tier's slot. */
     bool class_p_ok = true;
     for (int t = 0; class_p_ok && t < DS4_MAX_GPUS; t++) {
         if (!used_tier[t]) continue;
@@ -10956,7 +10956,7 @@ static bool metal_graph_alloc_raw_cap(
             g->batch_routed_out_by_tier[t];
     }
     const bool ok = state_init_ok && layer_cache_ok && class_p_ok &&
-                    /* Half-B (B3): Class H — validate the head_tier slot
+                    /* Class H — validate the head_tier slot
                      * (single-tier: head_tier == 0, byte-equivalent). */
                     metal_graph_output_pre(g) && metal_graph_output_weights(g) &&
                     metal_graph_output_embd(g) && metal_graph_output_norm(g) &&
@@ -10966,7 +10966,7 @@ static bool metal_graph_alloc_raw_cap(
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
                       g->mtp_input_hc && g->mtp_state_hc && g->mtp_next_hc &&
                       g->mtp_raw_cache && g->spec_logits)) &&
-                    /* Half-B (B4): Class E — validate the emb_tier slot. */
+                    /* Class E — validate the emb_tier slot. */
                     metal_graph_prefill_tokens(g);
     if (!ok) metal_graph_free(g);
     return ok;
@@ -10976,7 +10976,7 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    /* Half-B (B2): single-tier convenience wrapper; placement=NULL routes
+    /* single-tier convenience wrapper; placement=NULL routes
      * all per-layer allocations to tier 0. */
     return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, NULL);
 }
@@ -11314,7 +11314,7 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token) {
-    /* Half-B (B6): switch to this layer's home tier before any Class P
+    /* switch to this layer's home tier before any Class P
      * accessor reads. Single-tier (placement == NULL): no-op. */
     if (g->placement) {
         const int this_tier = g->placement[il + 1];
@@ -12115,7 +12115,7 @@ static bool metal_graph_encode_output_head(
         const ds4_model       *model,
         const ds4_weights     *weights,
         uint64_t               vocab_dim) {
-    /* Half-B (B6): switch to head_tier before the output-head pipeline.
+    /* switch to head_tier before the output-head pipeline.
      * Single-tier (placement == NULL): no-op (head_tier == 0 == active_tier).
      * Note: head_tier was captured in metal_graph_alloc_raw_cap; this
      * helper consults it directly (and also covers the case where the
@@ -13026,7 +13026,7 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
-    /* Half-B (B6): write the embedded token on the embedding tier. Single-
+    /* write the embedded token on the embedding tier. Single-
      * tier: emb_tier == 0 == active_tier; no-op. Multi-tier: switch to
      * emb_tier (no cross-device copy needed — embed writes from scratch). */
     if (g->placement) {
@@ -13269,7 +13269,7 @@ static bool metal_graph_warmup_prefill_kernels(
      */
     if (n_tokens <= 8) return true;
 
-    /* Half-B (B6 fix, codex round-2): warm-up uses layer-0's hc_attn_fn
+    /* (B6 fix, ): warm-up uses layer-0's hc_attn_fn
      * weight, which in multi-tier is resolved on placement[1]'s tier.
      * Switch active_tier so the F16 matmul reads/writes the correct
      * Class P scratch and resolves the weight on the right device.
@@ -15012,7 +15012,7 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
-    /* Half-B (B6): switch to this layer's home tier before any Class P
+    /* switch to this layer's home tier before any Class P
      * accessor reads. Single-tier (placement == NULL): no-op. */
     if (g->placement) {
         const int this_tier = g->placement[il + 1];
@@ -15514,7 +15514,7 @@ static bool metal_graph_prefill_layer_major(
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
 
-    /* Half-B (B6): write the prompt tokens + embed onto the embedding tier.
+    /* write the prompt tokens + embed onto the embedding tier.
      * Single-tier: emb_tier == 0; no-op. Multi-tier: switch to emb_tier
      * before any Class P / Class E accessor read. */
     if (g->placement) {
@@ -15525,8 +15525,8 @@ static bool metal_graph_prefill_layer_major(
 
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
 
-    /* Codex round-2 code-review fix: metal_graph_warmup_prefill_kernels may
-     * switch active_tier to placement[1] (layer-0 tier). The subsequent
+    /* metal_graph_warmup_prefill_kernels may switch active_tier to
+     * placement[1] (layer-0 tier). The subsequent
      * metal_graph_upload_prompt_embeddings_hc call must read prefill_tokens
      * on the embedding tier (emb_tier), so explicitly switch back. Single-
      * tier (g->placement == NULL): no-op (set_active_tier_batch returns
@@ -15589,7 +15589,7 @@ static bool metal_graph_prefill_layer_major(
             }
         }
         ds4_gpu_tensor *last_hc = NULL;
-        /* Half-B (B6 fix): capture the source-tier slot BEFORE the head call
+        /* (B6 fix): capture the source-tier slot BEFORE the head call
          * (which can change g->active_tier to g->head_tier). Restore on
          * the source tier explicitly, not via the post-call active_tier. */
         const int src_tier = g->active_tier;
@@ -15663,7 +15663,7 @@ static bool metal_graph_prefill_layer_major(
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         double layer_elapsed = 0.0;
         if (split_profile) {
-            /* Half-B (B6 fix): split-profile diagnostic bypasses the
+            /* (B6 fix): split-profile diagnostic bypasses the
              * metal_graph_encode_layer_batch wrapper that normally does
              * the per-layer tier switch. Replicate the switch here so the
              * diagnostic / profile mode stays multi-tier-correct.
@@ -15769,7 +15769,7 @@ static bool metal_graph_prefill_layer_major(
             output_row = (uint32_t)v;
         }
     }
-    /* Half-B (B6 fix): capture the source-tier slot BEFORE the head call
+    /* (B6 fix): capture the source-tier slot BEFORE the head call
      * (which may switch g->active_tier to g->head_tier). Restore on the
      * source tier explicitly. */
     const int src_tier = g->active_tier;
@@ -15857,7 +15857,7 @@ static bool metal_graph_prefill_batch_row_logits(
                                                             batch_row,
                                                             hc_dim);
     if (!last_hc) return false;
-    /* Half-B (B6 fix, codex round-2): chunked-prefill progress callback
+    /* (B6 fix, ): chunked-prefill progress callback
      * calls this helper after each chunk. Capture src_tier for the slot
      * save/restore (head call may switch active_tier to head_tier), AND
      * restore active_tier after the helper exits so the caller's
@@ -15946,7 +15946,7 @@ static bool metal_graph_prefill_chunked_range(
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
 
-        /* Half-B (B6 fix): each chunk starts on the embedding tier. After
+        /* (B6 fix): each chunk starts on the embedding tier. After
          * the previous chunk's layer / head walk, active_tier may be the
          * last layer tier or head tier; switch to emb_tier so the
          * prefill_layer_major delegate sees the correct starting tier
@@ -16417,7 +16417,7 @@ static int metal_graph_prompt_logits_test(
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, (uint32_t)n_test);
 
     ds4_gpu_graph g;
-    /* Half-B (B2): diagnostic single-tier callsite; placement=NULL. */
+    /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false, NULL);
     if (!ok) {
@@ -16731,10 +16731,10 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
 
-    /* Wave-2 mgpu-graph-session-placement: optional multi-GPU placement
+    /* Wave-2 multi-GPU placement scaffolding: optional multi-GPU placement
      * state. Zero-initialized for every existing caller (gpu_cfg == NULL)
      * via xcalloc, so the single-tier path observes identical engine
-     * state to pre-wave-2 main. multi_tier == 1 is the gate for all
+     * state to pre-multi-GPU CLI main. multi_tier == 1 is the gate for all
      * new code paths. */
     ds4_gpu_config gpu_cfg;
     int            placement[DS4_MAX_LAYER + 2];
@@ -17835,7 +17835,7 @@ static int generate_metal_graph_raw_swa(
                 prompt->len);
     }
     ds4_gpu_graph g;
-    /* Half-B (B2): diagnostic single-tier callsite; placement=NULL. */
+    /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false, NULL);
     if (!ok) {
@@ -19319,7 +19319,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
 
     ds4_gpu_graph g;
-    /* Half-B (B2): diagnostic single-tier callsite; placement=NULL. */
+    /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false, NULL);
     if (!ok) {
@@ -19665,7 +19665,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 /* =========================================================================
- * Wave-2 mgpu-graph-session-placement: engine placement helpers.
+ * Wave-2 multi-GPU placement scaffolding: engine placement helpers.
  * =========================================================================
  *
  * These helpers compute and install the multi-GPU layer placement table.
@@ -19673,7 +19673,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
  * with a non-NULL ds4_gpu_config. When the caller passes NULL (every
  * existing caller — ds4_engine_open shim, ds4_test, ds4_cli, ds4_server,
  * ds4_bench, ds4_eval, ds4_agent), these helpers are not invoked and the
- * engine state is byte-equivalent to the pre-wave-2 main branch.
+ * engine state is byte-equivalent to the pre-multi-GPU CLI main branch.
  */
 
 /* Classify each model tensor by its placement entry.
@@ -19746,7 +19746,7 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     }
 
     /* Per-layer KV/scratch estimate at a conservative context size.
-     * mgpu-bench-qa will tune this; the packer just needs the per-entry
+     * bench harness will tune this; the packer just needs the per-entry
      * numbers to be self-consistent. */
     const int est_ctx = 4096;
     ds4_context_memory mem = ds4_context_memory_estimate(DS4_BACKEND_CUDA, est_ctx);
@@ -19777,7 +19777,7 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
      * struct with only n_gpus and device_indices populated would
      * classify every entry as CPU spill and the engine would refuse.
      * That outcome is never useful, so reject it loudly. Auto-detection
-     * belongs in the CLI layer (mgpu-cli-wiring maps --gpu-vram auto to
+     * belongs in the CLI layer (CLI flag wiring maps --gpu-vram auto to
      * cudaMemGetInfo before constructing the config). */
     size_t total_budget = 0;
     for (int d = 0; d < cfg->n_gpus; d++) total_budget += cfg->vram_bytes[d];
@@ -19896,7 +19896,7 @@ cleanup:
     return rc;
 }
 
-/* Pretty-print the layout via the wave-1 helper, then emit a peer-access
+/* Pretty-print the layout via the multi-GPU plumbing helper, then emit a peer-access
  * summary by walking g_gpu_peer_ok[][]. Always called in multi-tier
  * mode so the operator sees what the packer decided. */
 static void engine_print_layout(const ds4_engine *e) {
@@ -19944,7 +19944,7 @@ static void engine_print_layout(const ds4_engine *e) {
  *   2. Detect any CPU-spill placement; this PR refuses to open
  *      multi-tier engines with CPU spill because the execution-side
  *      wiring (CPU↔GPU boundary materialization) lands in the
- *      follow-up mgpu-graph-session-execution task.
+ *      follow-up multi-GPU execution task.
  *   3. Register host model map and install per-device selective
  *      caches.
  *
@@ -19961,7 +19961,7 @@ static int engine_install_gpu_placement(ds4_engine *e) {
     if (has_cpu_spill) {
         fprintf(stderr,
             "ds4: CPU-spill placement detected; CPU-tier execution wiring lands in\n"
-            "ds4: mgpu-graph-session-cpu-spill (wave 3b). Aborting engine creation.\n");
+            "ds4: cpu-spill execution (follow-up) (CPU-spill execution). Aborting engine creation.\n");
         return -1;
     }
 
@@ -19971,7 +19971,7 @@ static int engine_install_gpu_placement(ds4_engine *e) {
 #endif /* !DS4_NO_GPU */
 
 #ifdef DS4_TEST_HOOKS
-/* Test-only hooks for exercising the wave-2 placement logic without
+/* Test-only hooks for exercising the multi-GPU CLI placement logic without
  * needing a real GGUF. The unit test in tests/test_engine_mgpu_placement.c
  * builds a synthetic "fake tensor list", invokes ds4_test_classify, and
  * asserts on the resulting placement table.
@@ -20042,7 +20042,7 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
     return rc;
 }
 
-/* Half-B (B8): reach into a session and read raw logits from
+/* reach into a session and read raw logits from
  * g->logits_by_tier[head_tier] to host memory. Used by
  * tests/test_engine_mgpu_runtime.c to compare single-tier vs multi-tier
  * outputs. Returns 0 on success, nonzero on error. */
@@ -20066,7 +20066,7 @@ int ds4_test_session_read_logits(ds4_session *s, float *out, uint64_t out_bytes)
 #endif
 }
 
-/* Half-B (B8): expose engine's placement[] array for runtime-test
+/* expose engine's placement[] array for runtime-test
  * assertion (DS4_N_LAYER + 2 entries). Lifetime tied to engine. */
 const int *ds4_test_engine_placement(const ds4_engine *e) {
     return e ? e->placement : NULL;
@@ -20076,7 +20076,7 @@ const int *ds4_test_engine_placement(const ds4_engine *e) {
 /* Internal engine-open helper carrying today's body verbatim plus three
  * gated branch points (only reachable when gpu_cfg != NULL). When the
  * caller passes NULL — which every existing caller does via ds4_engine_open
- * — the function is byte-equivalent to pre-wave-2 main. */
+ * — the function is byte-equivalent to pre-multi-GPU CLI main. */
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg);
@@ -20136,9 +20136,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     /* Wave-2: classify multi-tier BEFORE opening the MTP model so we can
-     * suppress MTP load entirely in multi-tier mode (codex round-2 #8).
+     * suppress MTP load entirely in multi-tier mode ( #8).
      * NULL gpu_cfg leaves e->multi_tier == 0 and is bit-equivalent to
-     * pre-wave-2 main. */
+     * pre-multi-GPU CLI main. */
     if (engine_classify_multi_tier(e, gpu_cfg) != 0) {
         fprintf(stderr, "ds4: failed to classify multi-tier placement\n");
         ds4_engine_close(e);
@@ -20147,7 +20147,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (e->multi_tier && opt->mtp_path && opt->mtp_path[0]) {
         fprintf(stderr,
-            "ds4: MTP disabled in multi-tier mode (wave-1 design constraint; "
+            "ds4: MTP disabled in multi-tier mode (multi-GPU plumbing design constraint; "
             "re-enabled in v1).\n");
         /* Do not open the MTP model. e->mtp_ready stays false, so every
          * MTP-gated code path is dormant. */
@@ -20182,13 +20182,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             /* Wave-2 multi-tier branch.
              *
              * 1. Initialize all configured CUDA devices via ds4_gpu_init_multi
-             *    (the wave-1 multi-device init that populates g_gpu[]).
+             *    (the multi-GPU plumbing multi-device init that populates g_gpu[]).
              * 2. Skip the legacy ds4_gpu_set_model_map_range / accelerator
              *    cache calls — those are single-tier behavior.
              * 3. Install per-device selective caches per the placement.
              * 4. Refuse engine creation with the documented notice: this PR
              *    ships scaffolding only; execution wiring lands in
-             *    mgpu-graph-session-execution. */
+             *    multi-GPU execution. */
             /* ds4_gpu_init_multi returns 1 on success and 0 on failure
              * (matches ds4_gpu_init). */
             if (ds4_gpu_init_multi(gpu_cfg) == 0) {
@@ -20206,11 +20206,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
-            /* Half-B (B7): GPU-only multi-tier execution is now wired up
+            /* GPU-only multi-tier execution is now wired up
              * (B2-B6: per-tier graph allocation, dispatch loops, boundary
              * copies). CPU-spill placements were rejected by
              * engine_install_gpu_placement above with stderr naming the
-             * wave-3b follow-up. Skip the single-tier ds4_gpu_init /
+             * CPU-spill execution follow-up. Skip the single-tier ds4_gpu_init /
              * set_model_map_range path below — those calls are explicitly
              * single-tier behavior (per the pre-B7 comment block). */
             *out = e;
@@ -20218,7 +20218,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
 
         /* Single-tier path (every existing caller). Body is byte-equivalent
-         * to pre-wave-2 main. */
+         * to pre-multi-GPU CLI main. */
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
@@ -20349,7 +20349,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
-    /* Half-B (B2): pass engine placement[] into per-layer KV/state alloc.
+    /* pass engine placement[] into per-layer KV/state alloc.
      * Single-tier engines (gpu_cfg == NULL, e->multi_tier == 0) pass NULL
      * which routes everything to tier 0 — byte-equivalent to legacy. */
     const int *placement = e->multi_tier ? e->placement : NULL;

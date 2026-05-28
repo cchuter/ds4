@@ -11287,7 +11287,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
-    /* mgpu-cli-wiring: raw --gpu-vram / --gpu-devices argv values. */
+    /* CLI flag wiring: raw --gpu-vram / --gpu-devices argv values. */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
 } server_config;
@@ -11611,7 +11611,7 @@ int main(int argc, char **argv) {
     }
 
     ds4_engine *engine = NULL;
-    /* mgpu-cli-wiring: route through ds4_engine_create_with_gpu_config
+    /* CLI flag wiring: route through ds4_engine_create_with_gpu_config
      * when --gpu-vram / --gpu-devices was supplied. Layout is fixed at
      * process start; no per-request placement. */
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {

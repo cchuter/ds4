@@ -37,7 +37,7 @@ enum {
 };
 
 /* struct ds4_gpu_tensor is defined in ds4_gpu.h (no longer opaque as of
- * the mgpu-device-aware-cuda PR). Field layout includes the new device_id
+ * the device-aware CUDA PR). Field layout includes the new device_id
  * tag and is read by the WITH_DEVICE-wrapped tensor APIs below. */
 
 typedef struct {
@@ -88,7 +88,7 @@ static int g_cublas_ready;
 static int g_quality_mode;
 
 /* =========================================================================
- * Multi-GPU plumbing (mgpu-device-aware-cuda).
+ * Multi-GPU plumbing (device-aware CUDA).
  * ========================================================================= */
 
 static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
@@ -136,7 +136,7 @@ static inline int ds4_tensor_device_idx(const ds4_gpu_tensor *t) {
         if (cudaSetDevice(d)           != cudaSuccess) { /* leave */ } else
 
 /* =========================================================================
- * Per-device selective model cache (mgpu-selective-model-cache).
+ * Per-device selective model cache (selective model cache).
  *
  * The public API in ds4_gpu.h declares ds4_tensor_range and the
  * device_cache_tensors / lookup_cache entry points. ds4_cuda.cu does NOT
@@ -287,7 +287,7 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
  * still use cuda_tmp_alloc directly. No aliasing between g_cuda_tmp
  * and g_gpu[0].scratch — they are independently owned and freed.
  *
- * Added for mgpu-graph-session-execution (wave 3a), step A3 of the
+ * Added for multi-GPU execution (multi-GPU execution), step A3 of the
  * spec (sub-area 2). */
 static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
@@ -467,7 +467,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
  * legacy g_cublas alias points at (set at ds4_gpu_init_multi line 1647).
  * That preserves bit-identical N=1 behavior at every migrated callsite.
  *
- * Added for mgpu-graph-session-execution (wave 3a), sub-area 1. */
+ * Added for multi-GPU execution (multi-GPU execution), sub-area 1. */
 static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
     if (g_n_gpus <= 1 || logical_tier < 0 || logical_tier >= g_n_gpus) {
         return (cublasHandle_t)g_gpu[0].cublas;
@@ -498,7 +498,7 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * Wrappers in this file thread `int logical_tier` from the dispatch
  * caller; single-tier callers pass 0, which hits the short-circuit.
  *
- * Added for mgpu-graph-session-execution (wave 3a), sub-area 3 of the
+ * Added for multi-GPU execution (multi-GPU execution), sub-area 3 of the
  * spec. */
 static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             uint64_t offset,
@@ -1796,7 +1796,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_cublas = NULL;
     g_cublas_ready = 0;
 
-    /* Per-device selective cache teardown (mgpu-selective-model-cache). */
+    /* Per-device selective cache teardown (selective model cache). */
     for (int d = 0; d < DS4_MAX_GPUS; d++) {
         if (!g_dev_cache[d].present) continue;
         int prev = -1;
@@ -1930,7 +1930,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return t;
 }
 
-/* Half-B: heap-allocated tensor on a specific logical tier.
+/* Heap-allocated tensor on a specific logical tier.
  *
  * Mirrors the legacy ds4_gpu_tensor_alloc ABI (returns ds4_gpu_tensor *)
  * with an explicit tier argument. Internally calls
@@ -1956,8 +1956,8 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes)
     return t;
 }
 
-/* Half-B: heap-allocated managed-memory tensor on a specific logical
- * tier. Differs from ds4_gpu_tensor_alloc_managed only in stamping
+/* Heap-allocated managed-memory tensor on a specific logical tier.
+ * Differs from ds4_gpu_tensor_alloc_managed only in stamping
  * tier instead of 0. Used by the per-layer KV cache when tier !=0.
  *
  * Managed-memory paging behavior: cudaMallocManaged pages between
@@ -2298,7 +2298,7 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
 }
 
 /* Register the mmap'd host model pointer for selective-cache lookups WITHOUT
- * triggering any device-side copy. Used by mgpu-graph-session-placement's
+ * triggering any device-side copy. Used by multi-GPU placement scaffolding's
  * multi-tier path so DS4_CUDA_COPY_MODEL cannot reintroduce a full-model
  * copy that defeats the per-device selective cache.
  *
@@ -2367,15 +2367,15 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
 
 /* Set the current CUDA device by LOGICAL tier index (0..g_n_gpus-1).
  * Maps to the physical CUDA device id stored in g_gpu[].device_id.
- * Added for mgpu-graph-session-placement (wave 2); first executed by
- * mgpu-graph-session-execution (follow-up). */
+ * Added for multi-GPU placement scaffolding (multi-GPU CLI); first executed by
+ * multi-GPU execution (follow-up). */
 extern "C" int ds4_gpu_set_current_device(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
     return cudaSetDevice(g_gpu[logical_tier].device_id) == cudaSuccess ? 0 : -1;
 }
 
 /* =========================================================================
- * Per-device selective model cache (mgpu-selective-model-cache).
+ * Per-device selective model cache (selective model cache).
  *
  * ds4_gpu_device_cache_tensors copies the listed source ranges from the
  * host mmap onto device_id's selective slab and appends sorted lookup
@@ -2571,7 +2571,7 @@ extern "C" int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t byte
  * index). The caller is expected to have cudaSetDevice'd to
  * expected_device before invoking; the returned pointer is valid to
  * consume from that device's kernel. Added for
- * mgpu-graph-session-execution (wave 3a). */
+ * multi-GPU execution (multi-GPU execution). */
 extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
                                             uint64_t bytes,
                                             int      expected_device,

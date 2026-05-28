@@ -56,7 +56,7 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
-    /* mgpu-cli-wiring: raw argv values for --gpu-vram and --gpu-devices.
+    /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
@@ -1602,10 +1602,10 @@ int main(int argc, char **argv) {
     }
     cfg.engine.inspect_only = cfg.inspect;
     ds4_engine *engine = NULL;
-    /* mgpu-cli-wiring: route through ds4_engine_create_with_gpu_config
+    /* CLI flag wiring: route through ds4_engine_create_with_gpu_config
      * when the user opted in via --gpu-vram / --gpu-devices. The
      * --cuda-alone path stays on ds4_engine_open (NULL gpu_cfg) for
-     * bit-equivalent back-compat. See docs/plans/mgpu-cli-wiring.md. */
+     * bit-equivalent back-compat. See docs/plans/CLI flag wiring.md. */
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = (ds4_gpu_config){0};
         bool skip_cuda = false;

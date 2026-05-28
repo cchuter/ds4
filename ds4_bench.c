@@ -40,7 +40,7 @@ typedef struct {
     const char *dump_frontier_logits_dir;
     bool warm_weights;
     bool quality;
-    /* mgpu-cli-wiring: raw --gpu-vram / --gpu-devices argv values. */
+    /* CLI flag wiring: raw --gpu-vram / --gpu-devices argv values. */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     /* Correctness smoke: decode + print generated tokens after each
@@ -415,7 +415,7 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
-    /* mgpu-cli-wiring: resolve backend before logging context-memory. */
+    /* CLI flag wiring: resolve backend before logging context-memory. */
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         if (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "0")) {
             cfg.backend = DS4_BACKEND_CPU;
@@ -434,9 +434,9 @@ int main(int argc, char **argv) {
         .quality = cfg.quality,
     };
     ds4_engine *engine = NULL;
-    /* mgpu-cli-wiring: route through ds4_engine_create_with_gpu_config
+    /* CLI flag wiring: route through ds4_engine_create_with_gpu_config
      * when --gpu-vram or --gpu-devices was supplied. See
-     * docs/plans/mgpu-cli-wiring.md for the single-source-of-truth
+     * docs/plans/CLI flag wiring.md for the single-source-of-truth
      * routing rule. */
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = (ds4_gpu_config){0};

@@ -1,7 +1,7 @@
 /* ds4_gpu_mgpu.h — multi-GPU plumbing types and APIs (v0).
  *
- * This header carries the new multi-GPU additions for the wave-1 PP work
- * (mgpu-device-aware-cuda). It is included from ds4_cuda.cu and from
+ * This header carries the new multi-GPU additions for the multi-GPU plumbing PP work
+ * (device-aware CUDA). It is included from ds4_cuda.cu and from
  * downstream tasks that need access to g_gpu[], g_n_gpus, g_gpu_peer_ok[],
  * the ds4_gpu_config struct, and the new tensor APIs.
  *
@@ -52,7 +52,7 @@ typedef struct ds4_gpu_config {
      * missing budgets - a value of 0 means "zero bytes of budget for
      * this slot" and (combined with reserves) will push placement to
      * CPU spill. Auto-detection (e.g. mapping --gpu-vram auto to
-     * cudaMemGetInfo) is the caller's job; see mgpu-cli-wiring for the
+     * cudaMemGetInfo) is the caller's job; see CLI flag wiring for the
      * canonical CLI path. The engine emits a clear stderr and refuses
      * if n_gpus > 0 and every vram_bytes[] is 0 (almost certainly a
      * caller bug from zero-initializing the struct). */
@@ -120,8 +120,8 @@ int ds4_gpu_tensor_device(const ds4_gpu_tensor *t);
  * cudaSetDevice. Returns 0 on success, nonzero on error or if the
  * tier index is out of range.
  *
- * Wave-2 mgpu-graph-session-placement adds this shim but does not
- * exercise the multi-tier execution path; mgpu-graph-session-execution
+ * Wave-2 multi-GPU placement scaffolding adds this shim but does not
+ * exercise the multi-tier execution path; multi-GPU execution
  * (follow-up) is its first caller. */
 int ds4_gpu_set_current_device(int logical_tier);
 
@@ -130,10 +130,7 @@ int ds4_gpu_set_current_device(int logical_tier);
  * DS4_CUDA_COPY_MODEL environment-variable branch that
  * ds4_gpu_set_model_map normally honors, which is essential for
  * multi-tier startup: we want only per-device selective tensor caches,
- * never the whole-model copy. Returns 1 on success, 0 on error.
- *
- * Added for mgpu-graph-session-placement (wave 2) per codex
- * plan-review round 3 finding #1. */
+ * never the whole-model copy. Returns 1 on success, 0 on error. */
 int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size);
 
 /* Strict per-device selective-cache lookup (no fallback).
@@ -146,7 +143,7 @@ int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_siz
  * kernel.
  *
  * Used by multi-tier kernel-dispatch resolvers in
- * mgpu-graph-session-execution (wave 3a). Single-tier callers should
+ * multi-GPU execution (multi-GPU execution). Single-tier callers should
  * keep using ds4_gpu_lookup_cache for back-compat behavior. */
 int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
                                  uint64_t bytes,
