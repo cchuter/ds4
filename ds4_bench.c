@@ -41,6 +41,10 @@ typedef struct {
     /* mgpu-cli-wiring: raw --gpu-vram / --gpu-devices argv values. */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
+    /* Correctness smoke: decode + print generated tokens after each
+     * iteration's gen loop so a human can eyeball the output for
+     * obvious corruption (random tokens, repeated junk, etc.). */
+    bool show_output;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -77,6 +81,8 @@ static void usage(FILE *fp) {
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
+        "  --show-output          Decode + print generated tokens after each iteration\n"
+        "                         (correctness smoke check; output to stderr).\n"
         "\n"
         "Sweep:\n"
         "  --ctx-start N          First measured frontier. Default: 2048\n"
@@ -228,6 +234,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
             c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--show-output")) {
+            c.show_output = true;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
@@ -421,6 +429,14 @@ int main(int argc, char **argv) {
             break;
         }
 
+        /* When --show-output is set, capture generated token IDs so we
+         * can decode and print them after the gen loop for a correctness
+         * smoke check (garbage tokens / repeated junk are visible). */
+        int *gen_token_buf = NULL;
+        if (cfg.show_output && cfg.gen_tokens > 0) {
+            gen_token_buf = (int *)malloc((size_t)cfg.gen_tokens * sizeof(int));
+        }
+        int gen_token_count = 0;
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
@@ -434,6 +450,9 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            if (gen_token_buf) {
+                gen_token_buf[gen_token_count++] = token;
+            }
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
@@ -441,6 +460,20 @@ int main(int argc, char **argv) {
             }
         }
         const double gen_t1 = bench_now_sec();
+        if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
+            fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
+            for (int i = 0; i < gen_token_count; i++) {
+                size_t tlen = 0;
+                char *txt = ds4_token_text(engine, gen_token_buf[i], &tlen);
+                if (txt) {
+                    fwrite(txt, 1, tlen, stderr);
+                    free(txt);
+                }
+            }
+            fprintf(stderr, "\"\n");
+            fflush(stderr);
+        }
+        free(gen_token_buf);
         if (rc != 0) break;
 
         if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
