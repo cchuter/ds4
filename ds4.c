@@ -9330,7 +9330,12 @@ typedef struct {
      * tokens moves through layer 0, then layer 1, and so on, updating the same
      * persistent caches used by decode.  Keeping this separate from decode
      * avoids a slow loop of one-token graph steps for long prompts. */
-    ds4_gpu_tensor *prefill_tokens;
+    /* Half-B (B4): Class E — embedding-tier-only prompt-token integer buffer.
+     * Captured at metal_graph_alloc_raw_cap time from placement[0] (or 0 in
+     * single-tier / diagnostic paths). Non-embedding slots stay NULL. Readers
+     * go through metal_graph_prefill_tokens() below. */
+    ds4_gpu_tensor *prefill_tokens_by_tier[DS4_MAX_GPUS];
+    int emb_tier;
     ds4_gpu_tensor *batch_cur_hc;
     ds4_gpu_tensor *batch_next_hc;
     ds4_gpu_tensor *batch_flat_hc;
@@ -9400,6 +9405,14 @@ static inline ds4_gpu_tensor *metal_graph_output_norm(const ds4_gpu_graph *g) {
     return g->output_norm_by_tier[g->head_tier];
 }
 
+/* Half-B (B4): Class E accessor. The prompt-token integer buffer is
+ * consumed by the embedding kernel on the embedding tier only. Single-tier
+ * paths set emb_tier == 0 (byte-equivalent to the legacy single-tier
+ * pointer). Multi-tier paths set emb_tier = placement[0]. */
+static inline ds4_gpu_tensor *metal_graph_prefill_tokens(const ds4_gpu_graph *g) {
+    return g->prefill_tokens_by_tier[g->emb_tier];
+}
+
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->directional_steering_dirs);
@@ -9441,7 +9454,11 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_flat_hc);
     ds4_gpu_tensor_free(g->batch_next_hc);
     ds4_gpu_tensor_free(g->batch_cur_hc);
-    ds4_gpu_tensor_free(g->prefill_tokens);
+    /* Half-B (B4): Class E free across all tier slots. */
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        ds4_gpu_tensor_free(g->prefill_tokens_by_tier[t]);
+        g->prefill_tokens_by_tier[t] = NULL;
+    }
     /* Half-B (B3): Class H free across all tier slots. Non-head slots are
      * NULL and ds4_gpu_tensor_free(NULL) is a no-op. */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
@@ -10059,7 +10076,12 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_n_raw = 0;
     }
 
-    g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
+    /* Half-B (B4): Class E — emb_tier captured from placement[0] (or 0 in
+     * single-tier / diagnostic paths). _ptr_on(0, ...) short-circuits to the
+     * legacy ds4_gpu_tensor_alloc when g_n_gpus <= 1 — byte-equivalent. */
+    g->emb_tier = placement ? placement[0] : 0;
+    g->prefill_tokens_by_tier[g->emb_tier] =
+        ds4_gpu_tensor_alloc_ptr_on(g->emb_tier, pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_flat_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -10150,7 +10172,8 @@ static bool metal_graph_alloc_raw_cap(
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
                       g->mtp_input_hc && g->mtp_state_hc && g->mtp_next_hc &&
                       g->mtp_raw_cache && g->spec_logits)) &&
-                    g->prefill_tokens &&
+                    /* Half-B (B4): Class E — validate the emb_tier slot. */
+                    metal_graph_prefill_tokens(g) &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
                     g->batch_attn_cur && g->batch_attn_norm &&
@@ -13822,7 +13845,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       layer->ffn_exp_probs_b != NULL,
                                                       layer->ffn_gate_tid2eid != NULL,
                                                       g->batch_router_logits,
-                                                      g->prefill_tokens,
+                                                      metal_graph_prefill_tokens(g),
                                                       n_tokens) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->batch_router_logits,
@@ -14440,7 +14463,7 @@ static bool metal_graph_prefill_layer_major(
         ds4_imatrix_collector *imatrix) {
     if (n_tokens <= 0 || n_tokens > prompt->len || (uint32_t)n_tokens > g->prefill_cap) return false;
 
-    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, 0, (uint32_t)n_tokens);
+    bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, 0, (uint32_t)n_tokens);
     if (!ok) return false;
 
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, (uint32_t)n_tokens)) return false;
@@ -14460,7 +14483,7 @@ static bool metal_graph_prefill_layer_major(
 
     if (!split_commands) {
         ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                     g->prefill_tokens,
+                                                     metal_graph_prefill_tokens(g),
                                                      model,
                                                      weights,
                                                      prompt,
@@ -14534,7 +14557,7 @@ static bool metal_graph_prefill_layer_major(
 
     double t_layer0 = profile ? now_sec() : 0.0;
     ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                 g->prefill_tokens,
+                                                 metal_graph_prefill_tokens(g),
                                                  model,
                                                  weights,
                                                  prompt,
@@ -14788,9 +14811,9 @@ static bool metal_graph_prefill_chunked_range(
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         last_chunk_tokens = chunk;
 
-        bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, pos0, chunk);
+        bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, pos0, chunk);
         if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                             g->prefill_tokens,
+                                                             metal_graph_prefill_tokens(g),
                                                              model,
                                                              weights,
                                                              prompt,
@@ -14942,9 +14965,9 @@ static bool metal_graph_verify_suffix_tops(
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
 
-    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
+    bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                         g->prefill_tokens,
+                                                         metal_graph_prefill_tokens(g),
                                                          model,
                                                          weights,
                                                          prompt,
