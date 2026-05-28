@@ -169,6 +169,10 @@ int main(void) {
     for (int i = 0; i < n_a; i++) fprintf(stderr, " %d", tokens_a[i]);
     fprintf(stderr, "\n");
 
+    /* Stash prompt length before freeing — ds4_tokens_free memsets the
+     * struct to zero, so reading prompt1.len after free returns 0
+     * (which broke the cross-engine prompt-length sanity check below). */
+    const int prompt1_len = prompt1.len;
     ds4_session_free(s1);
     ds4_tokens_free(&prompt1);
     ds4_engine_close(e1);
@@ -205,11 +209,9 @@ int main(void) {
 
     ds4_tokens prompt2 = {0};
     build_prompt(e2, &prompt2);
-    CHECK(prompt2.len == prompt1.len, "prompt tokenization matches across engines");
-    /* IDs must also match — tokenizer is deterministic for the same model. */
-    for (int i = 0; i < prompt2.len; i++) {
-        CHECKF(prompt2.v[i] == prompt1.v[i] || 1, "prompt token %d differs", i);
-    }
+    CHECKF(prompt2.len == prompt1_len,
+           "prompt tokenization length differs across engines (single=%d multi=%d)",
+           prompt1_len, prompt2.len);
 
     ds4_session *s2 = NULL;
     rc = ds4_session_create(&s2, e2, 1024);
