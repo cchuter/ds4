@@ -197,12 +197,14 @@ int main(void) {
     cfg.n_gpus = 2;
     cfg.device_indices[0] = 0;
     cfg.device_indices[1] = 1;
-    /* GPU0 has ~48 GiB free on the test box; GPU1 has ~17 GiB free
-     * because unrelated workloads occupy ~30 GiB. Budget {44, 14} GiB
-     * after a 1 GiB safety margin — enough headroom to fit the entire
-     * model across two GPUs with a small over-provision allowance. */
+    /* Budgets sized for the 80 GiB IQ2XXS DeepSeek-V4-Flash model
+     * with KV-cache headroom at ctx_size=2048. Both GPUs are assumed
+     * to have ≥44 GiB free; if GPU1 is contested by unrelated workloads
+     * the placement will spill and the engine will refuse (test then
+     * SKIP_PASSes, same as before). When GPU1 is free, this configuration
+     * exercises the multi-tier numerical-equivalence gate. */
     cfg.vram_bytes[0] = (size_t)44ull * 1024ull * 1024ull * 1024ull;
-    cfg.vram_bytes[1] = (size_t)14ull * 1024ull * 1024ull * 1024ull;
+    cfg.vram_bytes[1] = (size_t)40ull * 1024ull * 1024ull * 1024ull;
     cfg.safety_margin_bytes = (size_t)1024u * 1024u * 1024u;
 
     ds4_engine *e2 = NULL;
