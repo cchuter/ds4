@@ -81,10 +81,19 @@ int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes) {
     (void)t; (void)device_id; (void)bytes; return -1;
 }
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes) {
-    (void)tier; (void)bytes; return NULL;
+    /* Metal / CPU build has no CUDA multi-tier — short-circuit tier 0 to
+     * the legacy single-device allocator so the Half-B per-tier graph
+     * allocation path (e.g. g->output_pre_by_tier[head_tier]) keeps
+     * working byte-equivalent to pre-multi-tier Metal. Without this,
+     * every multi-tier-aware allocation in metal_graph_alloc_raw_cap
+     * returns NULL, the validation chain fails, and session_create
+     * silently returns 1. */
+    if (tier == 0) return ds4_gpu_tensor_alloc(bytes);
+    return NULL;
 }
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes) {
-    (void)tier; (void)bytes; return NULL;
+    if (tier == 0) return ds4_gpu_tensor_alloc_managed(bytes);
+    return NULL;
 }
 void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) { (void)t; }
 int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
