@@ -1454,10 +1454,6 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
-        cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
-    }
     ds4_engine *engine = NULL;
     /* mgpu-cli-wiring: route through ds4_engine_create_with_gpu_config
      * when the user opted in via --gpu-vram / --gpu-devices. The
@@ -1477,6 +1473,14 @@ int main(int argc, char **argv) {
         if (skip_cuda) {
             /* --gpu-vram 0: explicit CPU-only, never touch CUDA. */
             cfg.engine.backend = DS4_BACKEND_CPU;
+        } else {
+            cfg.engine.backend = DS4_BACKEND_CUDA;
+        }
+        if (!cfg.inspect) {
+            log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
+            cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
+        }
+        if (skip_cuda) {
             if (ds4_engine_open(&engine, &cfg.engine) != 0) {
                 free(cfg.prompt_owned);
                 return 1;
@@ -1489,16 +1493,21 @@ int main(int argc, char **argv) {
                 fprintf(stdout, "%s\n", layout);
                 fflush(stdout);
             }
-            cfg.engine.backend = DS4_BACKEND_CUDA;
             if (ds4_engine_create_with_gpu_config(&engine, &cfg.engine,
                                                     &gpu_cfg) != 0) {
                 free(cfg.prompt_owned);
                 return 1;
             }
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        free(cfg.prompt_owned);
-        return 1;
+    } else {
+        if (!cfg.inspect) {
+            log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
+            cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
+        }
+        if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+            free(cfg.prompt_owned);
+            return 1;
+        }
     }
     int rc = 0;
     if (cfg.inspect) {

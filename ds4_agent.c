@@ -7177,6 +7177,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    /* mgpu-cli-wiring: resolve backend before logging context-memory. */
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        if (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "0")) {
+            cfg.engine.backend = DS4_BACKEND_CPU;
+        } else {
+            cfg.engine.backend = DS4_BACKEND_CUDA;
+        }
+    }
     log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
 
     ds4_engine *engine = NULL;

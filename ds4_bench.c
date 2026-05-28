@@ -298,6 +298,14 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
+    /* mgpu-cli-wiring: resolve backend before logging context-memory. */
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        if (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "0")) {
+            cfg.backend = DS4_BACKEND_CPU;
+        } else {
+            cfg.backend = DS4_BACKEND_CUDA;
+        }
+    }
     log_context_memory(cfg.backend, cfg.ctx_alloc);
 
     ds4_engine_options opt = {
