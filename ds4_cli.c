@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_gpu_args.h"
+#include "ds4_gpu_mgpu.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -53,6 +55,10 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    /* mgpu-cli-wiring: raw argv values for --gpu-vram and --gpu-devices.
+     * Resolved post-parse via parse_gpu_vram_arg(). */
+    const char *gpu_vram_arg;
+    const char *gpu_devices_arg;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -96,7 +102,15 @@ static void usage(FILE *fp) {
         "  --metal\n"
         "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
         "  --cuda\n"
-        "      Use the CUDA graph backend. This is the normal fast path on CUDA builds.\n"
+        "      Use the CUDA graph backend (device 0 only — for multi-GPU use --gpu-vram).\n"
+        "  --gpu-vram N[,N,...]\n"
+        "      Per-device VRAM budget in GB. Comma-separated for multi-GPU.\n"
+        "      \"auto\" detects free VRAM on each visible CUDA device (CUDA build only).\n"
+        "      \"0\" forces CPU-only (skip CUDA init entirely).\n"
+        "      Single-GPU: --gpu-vram 40   Multi-GPU: --gpu-vram 40,12\n"
+        "  --gpu-devices N[,N,...]\n"
+        "      Restrict to listed CUDA device indices. Defaults to all visible.\n"
+        "      Count must match --gpu-vram (when both are explicit lists).\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
@@ -1350,6 +1364,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--gpu-vram")) {
+            c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-devices")) {
+            c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -1441,7 +1459,44 @@ int main(int argc, char **argv) {
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+    /* mgpu-cli-wiring: route through ds4_engine_create_with_gpu_config
+     * when the user opted in via --gpu-vram / --gpu-devices. The
+     * --cuda-alone path stays on ds4_engine_open (NULL gpu_cfg) for
+     * bit-equivalent back-compat. See docs/plans/mgpu-cli-wiring.md. */
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        ds4_gpu_config gpu_cfg = (ds4_gpu_config){0};
+        bool skip_cuda = false;
+        char errbuf[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                                &gpu_cfg, &skip_cuda,
+                                errbuf, sizeof(errbuf)) != 0) {
+            fprintf(stderr, "ds4: %s\n", errbuf);
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        if (skip_cuda) {
+            /* --gpu-vram 0: explicit CPU-only, never touch CUDA. */
+            cfg.engine.backend = DS4_BACKEND_CPU;
+            if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+                free(cfg.prompt_owned);
+                return 1;
+            }
+        } else {
+            const bool was_auto = cfg.gpu_vram_arg &&
+                                   !strcmp(cfg.gpu_vram_arg, "auto");
+            char layout[256];
+            if (format_gpu_layout_line(&gpu_cfg, was_auto, layout, sizeof(layout)) > 0) {
+                fprintf(stdout, "%s\n", layout);
+                fflush(stdout);
+            }
+            cfg.engine.backend = DS4_BACKEND_CUDA;
+            if (ds4_engine_create_with_gpu_config(&engine, &cfg.engine,
+                                                    &gpu_cfg) != 0) {
+                free(cfg.prompt_owned);
+                return 1;
+            }
+        }
+    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         free(cfg.prompt_owned);
         return 1;
     }

@@ -11898,3 +11898,90 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
 }
+
+/* --gpu-vram auto probe. Defined here (in the .cu unit) so the
+ * C-side parser (ds4_gpu_args.c) does not need to include
+ * <cuda_runtime.h>. Returns 0 on success, nonzero on error
+ * (errbuf populated). See ds4_gpu_args.h.
+ *
+ * Side-effect-light: changes cudaSetDevice during probing; callers
+ * that care about the active device should reset it themselves
+ * before continuing. (The mgpu init path resets it anyway.) */
+extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
+                                              int             filter_len,
+                                              ds4_gpu_config *out,
+                                              size_t          safety_margin_bytes,
+                                              char           *errbuf,
+                                              size_t          errbuflen) {
+    if (!out) {
+        if (errbuf && errbuflen) snprintf(errbuf, errbuflen, "internal: NULL out");
+        return 1;
+    }
+    int visible = 0;
+    cudaError_t rc = cudaGetDeviceCount(&visible);
+    if (rc != cudaSuccess || visible <= 0) {
+        if (errbuf && errbuflen) {
+            snprintf(errbuf, errbuflen,
+                     "cudaGetDeviceCount failed: %s",
+                     rc == cudaSuccess ? "no devices" : cudaGetErrorString(rc));
+        }
+        return 1;
+    }
+    /* Build the device list: either the explicit filter or 0..visible-1. */
+    int devs[DS4_MAX_GPUS];
+    int n_dev = 0;
+    if (device_filter && filter_len > 0) {
+        if (filter_len > DS4_MAX_GPUS) {
+            if (errbuf && errbuflen) {
+                snprintf(errbuf, errbuflen,
+                         "--gpu-devices filter has %d entries (max %d)",
+                         filter_len, DS4_MAX_GPUS);
+            }
+            return 1;
+        }
+        for (int i = 0; i < filter_len; i++) {
+            int d = device_filter[i];
+            if (d < 0 || d >= visible) {
+                if (errbuf && errbuflen) {
+                    snprintf(errbuf, errbuflen,
+                             "--gpu-devices: device %d not in 0..%d",
+                             d, visible - 1);
+                }
+                return 1;
+            }
+            devs[n_dev++] = d;
+        }
+    } else {
+        int cap = visible < DS4_MAX_GPUS ? visible : DS4_MAX_GPUS;
+        for (int i = 0; i < cap; i++) devs[n_dev++] = i;
+    }
+    out->n_gpus = n_dev;
+    out->safety_margin_bytes = safety_margin_bytes;
+    for (int i = 0; i < n_dev; i++) {
+        int d = devs[i];
+        rc = cudaSetDevice(d);
+        if (rc != cudaSuccess) {
+            if (errbuf && errbuflen) {
+                snprintf(errbuf, errbuflen,
+                         "cudaSetDevice(%d) failed: %s",
+                         d, cudaGetErrorString(rc));
+            }
+            return 1;
+        }
+        size_t free_b = 0, total_b = 0;
+        rc = cudaMemGetInfo(&free_b, &total_b);
+        if (rc != cudaSuccess) {
+            if (errbuf && errbuflen) {
+                snprintf(errbuf, errbuflen,
+                         "cudaMemGetInfo on device %d failed: %s",
+                         d, cudaGetErrorString(rc));
+            }
+            return 1;
+        }
+        size_t budget = (free_b > safety_margin_bytes) ?
+                        (free_b - safety_margin_bytes) : 0;
+        out->device_indices[i] = d;
+        out->vram_bytes[i] = budget;
+    }
+    return 0;
+}
