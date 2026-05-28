@@ -18120,10 +18120,18 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il, int ctx_size) {
         }
     }
 
-    /* Scratch share: divide the global scratch_bytes evenly across all
-     * layers so every tier that owns layers gets a proportional scratch
-     * charge. Math mirrors the graph branch of
-     * ds4_context_memory_estimate at ds4.c:16362-16368. */
+    /* Scratch is per-tier at allocation time: indexer_scores_by_tier,
+     * comp_mask_by_tier, F16 staging, chunked-prefill batch scratch all
+     * get replicated on every used tier (see ds4.c:10760-10773,
+     * 10846-10870). Code-review round 2 (codex) flagged that dividing
+     * scratch_bytes by DS4_N_LAYER under-charges any tier that owns
+     * fewer than all layers. Per spec acceptance criterion 8 ("when in
+     * doubt, OVER-estimate per layer"), charge the FULL scratch_bytes
+     * to every layer. The packer then guarantees that every tier
+     * holding at least one layer is charged at least the full scratch
+     * cost — conservatively over-estimating by up to DS4_N_LAYER × for
+     * single-tier layouts, but the conservative direction is the spec's
+     * stated preference (better to refuse upfront than OOM late). */
     uint32_t min_ratio = UINT32_MAX;
     for (uint32_t l = 0; l < DS4_N_LAYER; l++) {
         const uint32_t r = ds4_layer_compress_ratio(l);
@@ -18138,7 +18146,7 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il, int ctx_size) {
     const uint64_t scratch_bytes =
         2ull * (uint64_t)comp_cap * (uint64_t)prefill_cap * sizeof(float) +
         attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
-    bytes += (size_t)(scratch_bytes / (uint64_t)DS4_N_LAYER);
+    bytes += (size_t)scratch_bytes;
 
     return bytes;
 }
@@ -20320,6 +20328,46 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_engine_close(e);
         *out = NULL;
         return 1;
+    }
+    /* mgpu-auto-vram-fix: refuse upfront, before any GPU init / cudaMalloc,
+     * when the multi-tier packer fell back to CPU spill because the
+     * configured budgets could not hold the planner's per-layer KV
+     * estimate. This is the explicit early-refusal path required by spec
+     * acceptance criterion 6 — replaces the silent late OOM at
+     * session_create. CPU-spill execution is a separate follow-up task. */
+    if (gpu_cfg && e->n_placement_entries > 0) {
+        int spilled = 0;
+        size_t spilled_bytes = 0;
+        size_t entry_bytes_buf[DS4_MAX_LAYER + 2];
+        if (engine_compute_entry_bytes(e, entry_bytes_buf) == 0) {
+            for (int i = 0; i < e->n_placement_entries; i++) {
+                if (e->placement[i] == DS4_LAYER_PACK_CPU) {
+                    spilled++;
+                    spilled_bytes += entry_bytes_buf[i];
+                }
+            }
+        }
+        if (spilled > 0) {
+            size_t total_budget = 0;
+            for (int d = 0; d < gpu_cfg->n_gpus; d++) {
+                total_budget += gpu_cfg->vram_bytes[d];
+            }
+            fprintf(stderr,
+                "ds4: --gpu-vram placement does not fit at the requested "
+                "context (ctx hint = %d):\n"
+                "ds4:   %d placement entries spilled to CPU "
+                "(%.2f GiB unaccommodated of %.2f GiB total per-device budget).\n"
+                "ds4: Lower --ctx / --ctx-max, raise --gpu-vram budgets, or use "
+                "--gpu-vram auto on a host with more free VRAM.\n"
+                "ds4: Refusing upfront to avoid silent OOM at session_create.\n",
+                e->placement_ctx_hint,
+                spilled,
+                (double)spilled_bytes / (1024.0 * 1024.0 * 1024.0),
+                (double)total_budget / (1024.0 * 1024.0 * 1024.0));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     if (e->multi_tier && opt->mtp_path && opt->mtp_path[0]) {
         fprintf(stderr,
