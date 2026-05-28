@@ -12604,6 +12604,14 @@ static bool metal_graph_warmup_prefill_kernels(
      */
     if (n_tokens <= 8) return true;
 
+    /* Half-B (B6 fix, codex round-2): warm-up uses layer-0's hc_attn_fn
+     * weight, which in multi-tier is resolved on placement[1]'s tier.
+     * Switch active_tier so the F16 matmul reads/writes the correct
+     * Class P scratch and resolves the weight on the right device.
+     * Single-tier (g->placement == NULL): no-op. */
+    if (g->placement) {
+        if (!metal_graph_set_active_tier_batch(g, g->placement[1], n_tokens)) return false;
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
 
@@ -15085,7 +15093,11 @@ static bool metal_graph_prefill_batch_row_logits(
                                                             batch_row,
                                                             hc_dim);
     if (!last_hc) return false;
-    /* Half-B (B6 fix): same source-tier capture pattern as above. */
+    /* Half-B (B6 fix, codex round-2): chunked-prefill progress callback
+     * calls this helper after each chunk. Capture src_tier for the slot
+     * save/restore (head call may switch active_tier to head_tier), AND
+     * restore active_tier after the helper exits so the caller's
+     * subsequent batch-tier operations resolve the correct slot. */
     const int src_tier = g->active_tier;
     ds4_gpu_tensor *saved_cur = g->cur_hc_by_tier[src_tier];
     g->cur_hc_by_tier[src_tier] = last_hc;
@@ -15095,9 +15107,25 @@ static bool metal_graph_prefill_batch_row_logits(
     else (void)ds4_gpu_synchronize();
     g->cur_hc_by_tier[src_tier] = saved_cur;
     ds4_gpu_tensor_free(last_hc);
-    if (!ok) return false;
-    return ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits,
+    if (ok) {
+        ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    /* Restore active_tier to src_tier (head call may have switched it to
+     * head_tier). Subsequent caller operations on batch_cur_hc must
+     * resolve via the correct source-tier slot, and the next kernel
+     * launch must see the correct CUDA device. Use the dispatch helper
+     * so both the slot index and the cudaSetDevice are restored. No
+     * cross-device copy is needed here — last_hc was a view of the
+     * source-tier batch_cur_hc and is already freed. Single-tier no-op. */
+    if (g->placement && g->active_tier != src_tier) {
+        /* Bypass the copy_xdev path: we have no Class P state on
+         * head_tier worth moving back to source. Set device + active_tier
+         * directly. */
+        if (ds4_gpu_set_current_device(src_tier) != 0) ok = false;
+        g->active_tier = src_tier;
+    }
+    return ok;
 }
 
 /* Prefill a contiguous token range in fixed-size chunks.
