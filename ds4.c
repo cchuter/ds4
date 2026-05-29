@@ -18120,34 +18120,15 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il, int ctx_size) {
         }
     }
 
-    /* Scratch is per-tier at allocation time: indexer_scores_by_tier,
-     * comp_mask_by_tier, F16 staging, chunked-prefill batch scratch all
-     * get replicated on every used tier (see ds4.c:10760-10773,
-     * 10846-10870). Code-review round 2 (codex) flagged that dividing
-     * scratch_bytes by DS4_N_LAYER under-charges any tier that owns
-     * fewer than all layers. Per spec acceptance criterion 8 ("when in
-     * doubt, OVER-estimate per layer"), charge the FULL scratch_bytes
-     * to every layer. The packer then guarantees that every tier
-     * holding at least one layer is charged at least the full scratch
-     * cost — conservatively over-estimating by up to DS4_N_LAYER × for
-     * single-tier layouts, but the conservative direction is the spec's
-     * stated preference (better to refuse upfront than OOM late). */
-    uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t l = 0; l < DS4_N_LAYER; l++) {
-        const uint32_t r = ds4_layer_compress_ratio(l);
-        if (r != 0 && r < min_ratio) min_ratio = r;
-    }
-    if (min_ratio == UINT32_MAX) min_ratio = ctx;
-    if (min_ratio == 0) min_ratio = 1;
-    uint32_t comp_cap = ctx / min_ratio + 2u;
-    if (comp_cap < 2u) comp_cap = 2u;
-    uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
-    if (attn_stage_cap < 2u) attn_stage_cap = 2u;
-    const uint64_t scratch_bytes =
-        2ull * (uint64_t)comp_cap * (uint64_t)prefill_cap * sizeof(float) +
-        attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
-    bytes += (size_t)scratch_bytes;
-
+    /* Per-tier scratch (indexer_scores_by_tier, comp_mask_by_tier,
+     * attn_comp_stage_by_tier, chunked-prefill batch_*_by_tier, head
+     * extras) is accounted for separately by
+     * engine_per_tier_graph_overhead_bytes() and pre-subtracted from
+     * each device's vram_bytes in engine_classify_multi_tier. This
+     * helper returns per-layer KV/index cache ONLY. Charging scratch
+     * both here (per layer) and there (per tier) would double-count —
+     * at large ctx the duplicate can falsely refuse layouts that
+     * actually fit. */
     return bytes;
 }
 

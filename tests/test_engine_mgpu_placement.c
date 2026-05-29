@@ -415,6 +415,44 @@ static void test_pertier_overhead_pushes_to_spill(void) {
     ds4_test_clear_compress_ratios();
 }
 
+/* Regression for the PR #12 review finding: scratch was double-counted
+ * (per-layer in engine_per_layer_kv_bytes_planner + per-tier in
+ * engine_per_tier_graph_overhead_bytes). At large ctx the duplicate
+ * inflates entry_sum by tens of GB and falsely refuses valid layouts.
+ * After the fix, per-layer math charges KV/index ONLY; per-tier scratch
+ * is reserved separately by the overhead pre-subtract. */
+static void test_no_per_layer_scratch_double_count(void) {
+    fprintf(stderr, "RUN: test_no_per_layer_scratch_double_count\n");
+    ds4_test_fake_tensor tensors[256];
+    int n = build_synthetic_model(tensors, 256);
+    if (n <= 0) return;
+
+    ds4_test_seed_compress_ratios();
+
+    /* Entry-bytes delta as ctx grows 4096 -> 65536 must be dominated by
+     * per-layer KV growth, NOT by per-layer scratch growth.
+     *
+     *   KV growth per layer (after fix): bounded by per-layer comp_cap
+     *   delta ~ (65536/4 - 4096/4) * (head_dim + indexer_head_dim) * 4
+     *         ~ 15360 * 160 * 4 = ~9.4 MB per layer
+     *         x DS4_N_LAYER ~ <1 GiB total.
+     *
+     *   Scratch growth per layer (under bug): 2 * comp_cap * prefill_cap * 4
+     *         ~ 2 * 16386 * 4096 * 4 = ~537 MB per layer at ctx=65536
+     *         minus ~33 MB at ctx=4096 = ~504 MB delta per layer
+     *         x DS4_N_LAYER ~ ~21 GiB total.
+     *
+     * 5 GiB bound discriminates cleanly: passes after fix, fails before. */
+    const size_t small = ds4_test_compute_entry_bytes_sum(tensors, n, 4096);
+    const size_t large = ds4_test_compute_entry_bytes_sum(tensors, n, 65536);
+    const size_t delta = large > small ? large - small : 0;
+    const size_t bound = (size_t)5ull * 1024ull * 1024ull * 1024ull;
+    CHECK(delta < bound,
+          "per-layer entry-bytes delta 4096->65536 is KV-only (no scratch double-count)");
+
+    ds4_test_clear_compress_ratios();
+}
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
@@ -423,6 +461,7 @@ int main(void) {
     test_zero_budget_guard();
     test_placement_ctx_hint_scales();
     test_pertier_overhead_pushes_to_spill();
+    test_no_per_layer_scratch_double_count();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
             g_checks - g_failures, g_checks, g_failures);
