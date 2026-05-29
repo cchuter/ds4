@@ -38,9 +38,8 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
                                   int *out_n_entries);
 int ds4_test_tensor_to_entry(const char *name, int name_len);
 
-/* mgpu-auto-vram-pertier-overhead: ctx-aware variants and calibration
- * helpers. Declared here (not in ds4.h) matching the existing
- * DS4_TEST_HOOKS pattern. */
+/* Ctx-aware variants and calibration helpers. Declared here (not in
+ * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
 int ds4_test_classify_multi_tier_with_ctx(const ds4_test_fake_tensor *tensors,
                                            int n_tensors,
                                            const ds4_gpu_config *cfg,
@@ -291,8 +290,9 @@ static void test_zero_budget_guard(void) {
     CHECK(rc != 0, "classify rejects all-zero vram_bytes");
 }
 
-/* mgpu-auto-vram-pertier-overhead: closes PR #12 TEST GAP — exercise the
- * placement_ctx_hint path in engine_compute_entry_bytes (Issue 2). */
+/* Exercise the placement_ctx_hint path in engine_compute_entry_bytes:
+ * the same layout at a larger ctx must produce more spill or refusal,
+ * proving the hint actually flows into per-layer KV pricing. */
 static void test_placement_ctx_hint_scales(void) {
     fprintf(stderr, "RUN: test_placement_ctx_hint_scales\n");
     ds4_test_fake_tensor tensors[256];
@@ -344,8 +344,10 @@ static void test_placement_ctx_hint_scales(void) {
     ds4_test_clear_compress_ratios();
 }
 
-/* mgpu-auto-vram-pertier-overhead: regression for Issue 1 — verifies the
- * per-tier overhead pre-subtract actually changes a packer decision. */
+/* Verifies the per-tier overhead pre-subtract actually changes a
+ * packer decision: at a budget that fits WITHOUT the pre-subtract, the
+ * layout must spill or refuse WITH it; at 1.5× the overhead headroom,
+ * the layout must still fit (counter-control). */
 static void test_pertier_overhead_pushes_to_spill(void) {
     fprintf(stderr, "RUN: test_pertier_overhead_pushes_to_spill\n");
     ds4_test_fake_tensor tensors[256];
@@ -415,12 +417,12 @@ static void test_pertier_overhead_pushes_to_spill(void) {
     ds4_test_clear_compress_ratios();
 }
 
-/* Regression for the PR #12 review finding: scratch was double-counted
- * (per-layer in engine_per_layer_kv_bytes_planner + per-tier in
- * engine_per_tier_graph_overhead_bytes). At large ctx the duplicate
- * inflates entry_sum by tens of GB and falsely refuses valid layouts.
- * After the fix, per-layer math charges KV/index ONLY; per-tier scratch
- * is reserved separately by the overhead pre-subtract. */
+/* Per-tier scratch must not be charged BOTH per layer (in
+ * engine_per_layer_kv_bytes_planner) AND per tier (in
+ * engine_per_tier_graph_overhead_bytes). At large ctx, double-counting
+ * inflates entry_sum by tens of GiB and falsely refuses valid layouts.
+ * Per-layer math charges KV/index ONLY; per-tier scratch is reserved
+ * separately by the overhead pre-subtract. */
 static void test_no_per_layer_scratch_double_count(void) {
     fprintf(stderr, "RUN: test_no_per_layer_scratch_double_count\n");
     ds4_test_fake_tensor tensors[256];

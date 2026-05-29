@@ -11996,9 +11996,9 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
             }
             return 1;
         }
-        /* mgpu-auto-vram-fix: auto-mode reserve. Auto-probe is the only
-         * place we override the user's stated budget, so this is where
-         * the conservative-on-the-user's-behalf reserve belongs. The
+        /* Auto-mode reserve. Auto-probe is the only place we override
+         * the user's stated budget, so this is where the conservative-
+         * on-the-user's-behalf reserve belongs. The
          * engine path (engine_classify_multi_tier) still subtracts the
          * user-supplied safety_margin_bytes + the cuBLAS workspace from
          * whatever budget we hand back; that math is unchanged and

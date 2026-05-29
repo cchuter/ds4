@@ -16741,7 +16741,7 @@ struct ds4_engine {
     int            n_placement_entries;
     int            multi_tier;
 
-    /* mgpu-auto-vram-fix: max-context hint copied from
+    /* Max-context hint copied from
      * ds4_engine_options.placement_ctx_hint. Used by
      * engine_compute_entry_bytes for per-layer KV estimation.
      * Zero / negative = legacy 4096 fallback (single-tier paths and any
@@ -17983,8 +17983,8 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
 }
 #endif
 
-/* mgpu-auto-vram-fix: per-layer KV+scratch byte estimate at a given
- * context size for the CUDA / Metal graph backend. Mirrors the per-layer
+/* Per-layer KV byte estimate at a given context size for the CUDA /
+ * Metal graph backend. Mirrors the per-layer
  * accounting the graph backend uses at allocation time, so the multi-GPU
  * layer packer (engine_compute_entry_bytes) can price each layer
  * individually instead of dividing a global total uniformly across all
@@ -18129,20 +18129,19 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il, int ctx_size) {
     return bytes;
 }
 
-/* mgpu-auto-vram-pertier-overhead: mirror of DS4_GPU_ATTN_COMP_CACHE_F16 that
- * is visible in DS4_NO_GPU test builds. The GPU macro at ds4.c:9580 is
- * defined inside `#ifndef DS4_NO_GPU`, so the planner-side helper below
- * (which is visible in BOTH builds so the placement test can call it)
- * cannot reference the GPU macro directly. Must stay in lockstep with
- * the GPU macro. */
+/* Mirror of DS4_GPU_ATTN_COMP_CACHE_F16 that is visible in DS4_NO_GPU
+ * test builds. The GPU macro is defined inside `#ifndef DS4_NO_GPU`, so
+ * the planner-side helper below (which is visible in BOTH builds so the
+ * placement test can call it) cannot reference the GPU macro directly.
+ * Must stay in lockstep with the GPU macro. */
 #if defined(__APPLE__)
 #define DS4_PLANNER_ATTN_COMP_CACHE_F16 1
 #else
 #define DS4_PLANNER_ATTN_COMP_CACHE_F16 0
 #endif
 
-/* mgpu-auto-vram-pertier-overhead: per-used-tier Class-P graph overhead
- * estimate. Mirrors the `*_by_tier[t]` allocations in
+/* Per-used-tier Class-P graph overhead estimate. Mirrors the
+ * `*_by_tier[t]` allocations in
  * metal_graph_alloc_raw_cap (ds4.c:10664-10686 + 10760-10800 + 10806-10816
  * for head extras + 10844 for prefill_tokens + 10852-10892 for batch
  * chunked-prefill scratch).
@@ -18278,8 +18277,7 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
 
     /* === Class P chunked-prefill batch scratch (mirrors ds4.c:10852-10892).
      * These are the LARGEST per-tier allocations (e.g. batch_cur_hc =
-     * pc * hc_dim * float = ~256 MiB at default prefill_cap=4096). Missing
-     * them was the original codex round-1 plan-review finding #3 — without
+     * pc * hc_dim * float = ~256 MiB at default prefill_cap=4096). Without
      * them the pre-subtract is meaningless for any non-trivial ctx. === */
     total += pc * hc_dim * sizeof(float);                  /* batch_cur_hc_by_tier */
     total += pc * hc_dim * sizeof(float);                  /* batch_next_hc_by_tier */
@@ -20158,8 +20156,8 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
 
     e->gpu_cfg = *cfg;
 
-    /* mgpu-auto-vram-pertier-overhead: pre-subtract per-tier Class-P graph
-     * scratch from EVERY device budget BEFORE the packer reads vram_bytes.
+    /* Pre-subtract per-tier Class-P graph scratch from EVERY device
+     * budget BEFORE the packer reads vram_bytes.
      * Conservative: tiers that end up unused still reserve the overhead, so
      * the packer cannot accept a layout that would later OOM at
      * session_create when metal_graph_alloc_raw_cap's per-tier scratch loop
@@ -20190,7 +20188,7 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
         /* Read post-subtract budgets from e->gpu_cfg (NOT the caller's
          * cfg) so the per-tier overhead pre-subtract actually flows into
-         * the packer. codex round-1 plan-review flagged this. */
+         * the packer. */
         size_t budget = e->gpu_cfg.vram_bytes[d];
         size_t reserve = e->gpu_cfg.safety_margin_bytes + cublas_workspace_overhead;
         pcfg.gpu_budget_bytes[d] = budget > reserve ? budget - reserve : 0;
@@ -20312,9 +20310,9 @@ static void engine_print_layout(const ds4_engine *e) {
                           budget,
                           e->gpu_cfg.n_gpus);
 
-    /* mgpu-auto-vram-pertier-overhead: show the per-tier graph scratch
-     * reservation so operators can correlate "47 GiB free" with the
-     * smaller post-subtract budget the packer actually had to spend. */
+    /* Show the per-tier graph scratch reservation so operators can
+     * correlate "47 GiB free" with the smaller post-subtract budget the
+     * packer actually had to spend. */
     const size_t per_tier_overhead = engine_per_tier_graph_overhead_bytes(e);
     fprintf(stderr,
             "ds4: per-tier graph scratch reserved: %.2f GiB "
@@ -20471,10 +20469,10 @@ const int *ds4_test_engine_placement(const ds4_engine *e) {
     return e ? e->placement : NULL;
 }
 
-/* mgpu-auto-vram-pertier-overhead: variant of ds4_test_classify_multi_tier
- * that lets the test set placement_ctx_hint on the synthetic engine before
- * classify. Required to exercise the ctx-aware code path in
- * engine_compute_entry_bytes / engine_per_tier_graph_overhead_bytes. */
+/* Variant of ds4_test_classify_multi_tier that lets the test set
+ * placement_ctx_hint on the synthetic engine before classify. Required
+ * to exercise the ctx-aware code path in engine_compute_entry_bytes /
+ * engine_per_tier_graph_overhead_bytes. */
 int ds4_test_classify_multi_tier_with_ctx(const ds4_test_fake_tensor *tensors,
                                            int n_tensors,
                                            const ds4_gpu_config *cfg,
@@ -20512,8 +20510,8 @@ int ds4_test_classify_multi_tier_with_ctx(const ds4_test_fake_tensor *tensors,
     return rc;
 }
 
-/* mgpu-auto-vram-pertier-overhead: populate g_ds4_compress_ratios with
- * the FLASH variant's expected per-layer pattern. Without this, the
+/* Populate g_ds4_compress_ratios with the FLASH variant's expected
+ * per-layer pattern. Without this, the
  * test-mode planner sees min_ratio==est_ctx and collapses comp_cap /
  * attn_comp_stage_cap, making the per-tier overhead artificially small.
  * Callers must invoke ds4_test_clear_compress_ratios() afterward to
@@ -20528,10 +20526,9 @@ void ds4_test_clear_compress_ratios(void) {
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
 }
 
-/* mgpu-auto-vram-pertier-overhead: expose
- * engine_per_tier_graph_overhead_bytes for test calibration. Builds a
- * synthetic engine (no model tensors) and returns the overhead at the
- * given ctx hint. */
+/* Expose engine_per_tier_graph_overhead_bytes for test calibration.
+ * Builds a synthetic engine (no model tensors) and returns the overhead
+ * at the given ctx hint. */
 size_t ds4_test_per_tier_graph_overhead_bytes(int placement_ctx_hint) {
     ds4_engine eng;
     memset(&eng, 0, sizeof(eng));
@@ -20540,8 +20537,8 @@ size_t ds4_test_per_tier_graph_overhead_bytes(int placement_ctx_hint) {
     return engine_per_tier_graph_overhead_bytes(&eng);
 }
 
-/* mgpu-auto-vram-pertier-overhead: expose engine_compute_entry_bytes for
- * test calibration. Builds a synthetic engine like
+/* Expose engine_compute_entry_bytes for test calibration. Builds a
+ * synthetic engine like
  * ds4_test_classify_multi_tier does (tensor names + bytes only) and
  * returns the sum of all entry_bytes[] at the given ctx hint. Used by
  * tests/test_engine_mgpu_placement to size budgets against the actual
@@ -20650,12 +20647,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    /* mgpu-auto-vram-fix: refuse upfront, before any GPU init / cudaMalloc,
-     * when the multi-tier packer fell back to CPU spill because the
-     * configured budgets could not hold the planner's per-layer KV
-     * estimate. This is the explicit early-refusal path required by spec
-     * acceptance criterion 6 — replaces the silent late OOM at
-     * session_create. CPU-spill execution is a separate follow-up task. */
+    /* Refuse upfront, before any GPU init / cudaMalloc, when the
+     * multi-tier packer fell back to CPU spill because the configured
+     * budgets could not hold the planner's per-layer KV estimate.
+     * Replaces a silent late OOM at session_create. CPU-spill
+     * execution is a separate follow-up. */
     if (gpu_cfg && e->n_placement_entries > 0) {
         int spilled = 0;
         size_t spilled_bytes = 0;
@@ -20664,10 +20660,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         size_t budget_bytes[DS4_LAYER_PACK_MAX_GPUS] = {0};
         int have_entry_bytes = (engine_compute_entry_bytes(e, entry_bytes_buf) == 0);
         if (have_entry_bytes) {
-            /* mgpu-auto-vram-pertier-overhead: read POST-subtract budgets
-             * from e->gpu_cfg, not the caller's gpu_cfg. The pre-subtract
-             * already happened in engine_classify_multi_tier; showing
-             * pre-subtract budgets here would lie to the user about what
+            /* Read POST-subtract budgets from e->gpu_cfg, not the
+             * caller's gpu_cfg. The pre-subtract already happened in
+             * engine_classify_multi_tier; showing pre-subtract budgets
+             * here would lie to the user about what
              * the packer actually had to spend. */
             for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
                 budget_bytes[d] = e->gpu_cfg.vram_bytes[d];
@@ -20703,10 +20699,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                       budget_bytes,
                                       e->gpu_cfg.n_gpus);
             }
-            /* mgpu-auto-vram-pertier-overhead: show the per-tier graph
-             * scratch reservation so users see why the per-device budget
-             * shrank. The actual subtract already happened in
-             * engine_classify_multi_tier; this is purely informational. */
+            /* Show the per-tier graph scratch reservation so users see
+             * why the per-device budget shrank. The actual subtract
+             * already happened in engine_classify_multi_tier; this is
+             * purely informational. */
             const size_t per_tier_overhead =
                 engine_per_tier_graph_overhead_bytes(e);
             fprintf(stderr,

@@ -425,10 +425,9 @@ int main(int argc, char **argv) {
     }
     log_context_memory(cfg.backend, cfg.ctx_alloc);
 
-    /* mgpu-auto-vram-fix: hint the packer at the largest ctx this bench
-     * run will exercise so per-layer KV bytes are priced for the real
-     * session size, not a stale 4096 default. Single-tier and CPU paths
-     * ignore this. */
+    /* Hint the packer at the largest ctx this bench run will exercise
+     * so per-layer KV bytes are priced for the real session size, not
+     * a stale 4096 default. Single-tier and CPU paths ignore this. */
     int placement_ctx_hint = cfg.ctx_max;
     if (cfg.ctx_alloc > placement_ctx_hint) placement_ctx_hint = cfg.ctx_alloc;
 
