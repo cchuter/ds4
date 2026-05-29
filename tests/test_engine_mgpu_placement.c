@@ -38,6 +38,23 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
                                   int *out_n_entries);
 int ds4_test_tensor_to_entry(const char *name, int name_len);
 
+/* mgpu-auto-vram-pertier-overhead: ctx-aware variants and calibration
+ * helpers. Declared here (not in ds4.h) matching the existing
+ * DS4_TEST_HOOKS pattern. */
+int ds4_test_classify_multi_tier_with_ctx(const ds4_test_fake_tensor *tensors,
+                                           int n_tensors,
+                                           const ds4_gpu_config *cfg,
+                                           int placement_ctx_hint,
+                                           int placement_out[],
+                                           int *out_multi_tier,
+                                           int *out_n_entries);
+void   ds4_test_seed_compress_ratios(void);
+void   ds4_test_clear_compress_ratios(void);
+size_t ds4_test_per_tier_graph_overhead_bytes(int placement_ctx_hint);
+size_t ds4_test_compute_entry_bytes_sum(const ds4_test_fake_tensor *tensors,
+                                         int n_tensors,
+                                         int placement_ctx_hint);
+
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
 #define DS4_N_LAYER_LOCAL 43
@@ -274,12 +291,138 @@ static void test_zero_budget_guard(void) {
     CHECK(rc != 0, "classify rejects all-zero vram_bytes");
 }
 
+/* mgpu-auto-vram-pertier-overhead: closes PR #12 TEST GAP — exercise the
+ * placement_ctx_hint path in engine_compute_entry_bytes (Issue 2). */
+static void test_placement_ctx_hint_scales(void) {
+    fprintf(stderr, "RUN: test_placement_ctx_hint_scales\n");
+    ds4_test_fake_tensor tensors[256];
+    int n = build_synthetic_model(tensors, 256);
+    if (n <= 0) return;
+
+    /* Seed FLASH compress ratios so the planner sees ratio==4 on half
+     * the layers; without this, min_ratio==est_ctx in test mode and the
+     * per-layer KV / per-tier overhead don't scale meaningfully with
+     * ctx. */
+    ds4_test_seed_compress_ratios();
+
+    /* Two-GPU budgets sized so that ctx=4096 fits cleanly but ctx=131072
+     * forces CPU spill (or refusal). */
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 0;
+    cfg.device_indices[1] = 1;
+    cfg.vram_bytes[0] = (size_t)24ull * 1024ull * 1024ull * 1024ull;
+    cfg.vram_bytes[1] = (size_t)24ull * 1024ull * 1024ull * 1024ull;
+    cfg.safety_margin_bytes = 0;
+
+    int placement_small[DS4_N_ENTRIES] = {0};
+    int placement_big[DS4_N_ENTRIES]   = {0};
+    int mt_small = 0, mt_big = 0;
+    int ne_small = 0, ne_big = 0;
+
+    int rc_s = ds4_test_classify_multi_tier_with_ctx(
+        tensors, n, &cfg, 4096, placement_small, &mt_small, &ne_small);
+    CHECK(rc_s == 0, "ctx=4096 classify ok");
+    int spill_s = 0;
+    for (int i = 0; i < ne_small; i++)
+        if (placement_small[i] == DS4_LAYER_PACK_CPU) spill_s++;
+
+    int rc_b = ds4_test_classify_multi_tier_with_ctx(
+        tensors, n, &cfg, 131072, placement_big, &mt_big, &ne_big);
+    /* rc_b may be 0 (with spill) or -1 (per-tier overhead refusal). */
+    int spill_b = 0;
+    for (int i = 0; i < ne_big; i++)
+        if (placement_big[i] == DS4_LAYER_PACK_CPU) spill_b++;
+
+    /* The discriminator: at the larger ctx hint the layout MUST be
+     * different — more spill OR upfront refusal. */
+    CHECK(rc_b != 0 || spill_b > spill_s,
+          "placement_ctx_hint plumbs through to per-layer KV / per-tier "
+          "overhead — larger ctx forces more spill (or refusal).");
+
+    ds4_test_clear_compress_ratios();
+}
+
+/* mgpu-auto-vram-pertier-overhead: regression for Issue 1 — verifies the
+ * per-tier overhead pre-subtract actually changes a packer decision. */
+static void test_pertier_overhead_pushes_to_spill(void) {
+    fprintf(stderr, "RUN: test_pertier_overhead_pushes_to_spill\n");
+    ds4_test_fake_tensor tensors[256];
+    int n = build_synthetic_model(tensors, 256);
+    if (n <= 0) return;
+
+    /* Seed compress ratios so the per-tier overhead has its real
+     * (non-collapsed) magnitude. */
+    ds4_test_seed_compress_ratios();
+
+    /* Query EXACT planner numbers at ctx=4096 — same code paths the real
+     * classify will hit. No approximations. */
+    const size_t entry_sum = ds4_test_compute_entry_bytes_sum(tensors, n, 4096);
+    const size_t overhead  = ds4_test_per_tier_graph_overhead_bytes(4096);
+    CHECK(entry_sum > 0, "planner entry-bytes sum > 0");
+    CHECK(overhead > 0,  "per-tier overhead > 0 with seeded compress ratios");
+
+    /* Budget = entry_sum + cublas + 0.6*overhead.
+     * WITHOUT pre-subtract: pcfg.gpu_budget = entry_sum + 0.6*overhead
+     *   → fits with 0.6*overhead spare.
+     * WITH pre-subtract: pcfg.gpu_budget = entry_sum - 0.4*overhead
+     *   → packer must spill 0.4*overhead worth of entries. */
+    const size_t cublas_workspace = (size_t)64ull * 1024ull * 1024ull;
+    const size_t headroom = overhead * 6 / 10;
+    const size_t budget = entry_sum + cublas_workspace + headroom;
+
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 1;
+    cfg.device_indices[0] = 0;
+    cfg.vram_bytes[0] = budget;
+    cfg.safety_margin_bytes = 0;
+
+    int placement[DS4_N_ENTRIES] = {0};
+    int multi_tier = 0;
+    int n_entries = 0;
+    int rc = ds4_test_classify_multi_tier(tensors, n, &cfg,
+                                           placement, &multi_tier, &n_entries);
+
+    if (rc == 0) {
+        int any_cpu = 0;
+        for (int i = 0; i < n_entries; i++) {
+            if (placement[i] == DS4_LAYER_PACK_CPU) { any_cpu = 1; break; }
+        }
+        CHECK(any_cpu,
+              "per-tier overhead pre-subtract pushes layout to CPU spill");
+    } else {
+        CHECK(rc == -1,
+              "per-tier overhead pre-subtract refuses upfront (budget < overhead)");
+    }
+
+    /* Counter-control: with budget = entry_sum + cublas + 1.5*overhead the
+     * layout MUST fit even AFTER the pre-subtract — verifies the test
+     * isn't asserting on noise. */
+    cfg.vram_bytes[0] = entry_sum + cublas_workspace + overhead * 3 / 2;
+    int placement2[DS4_N_ENTRIES] = {0};
+    int mt2 = 0, ne2 = 0;
+    int rc2 = ds4_test_classify_multi_tier(tensors, n, &cfg,
+                                            placement2, &mt2, &ne2);
+    CHECK(rc2 == 0, "1.5x-overhead budget classify ok");
+    int spill2 = 0;
+    for (int i = 0; i < ne2; i++)
+        if (placement2[i] == DS4_LAYER_PACK_CPU) spill2++;
+    CHECK(spill2 == 0,
+          "1.5x-overhead budget fits without CPU spill (control)");
+
+    ds4_test_clear_compress_ratios();
+}
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
     test_forced_two_tier_no_spill();
     test_cpu_spill();
     test_zero_budget_guard();
+    test_placement_ctx_hint_scales();
+    test_pertier_overhead_pushes_to_spill();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
             g_checks - g_failures, g_checks, g_failures);
