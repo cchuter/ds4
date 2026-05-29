@@ -18015,21 +18015,18 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
  *                                                          DS4_N_INDEXER_HEAD_DIM *
  *                                                          sizeof(float)
  *                                                        : 0)
- *   scratch_share_per_layer   = global scratch_bytes / DS4_N_LAYER
- *                               (scratch is allocated per-tier at
- *                               execution time, so charging a share to
- *                               every layer ensures every tier that owns
- *                               layers gets a proportional scratch
- *                               charge).
+ *
+ * Per-tier scratch buffers (indexer_scores_by_tier, comp_mask_by_tier,
+ * attn_comp_stage_by_tier, chunked-prefill batch_*_by_tier, head extras)
+ * are NOT included here. They are reserved separately by
+ * engine_per_tier_graph_overhead_bytes() and pre-subtracted from each
+ * device's vram_bytes in engine_classify_multi_tier. Counting them per
+ * layer here would double-count them once per layer.
  *
  * Invariant (by construction): sum over il of
  * engine_per_layer_kv_bytes_planner(il, ctx) ==
  *   DS4_N_LAYER * raw_cap * DS4_N_HEAD_DIM * sizeof(float)
  *   + sum_over_ratio_layers(compressed_per_layer)
- *   + scratch_bytes
- * which is the F32-sizing equivalent of
- * ds4_context_memory_estimate(CUDA, ctx).total_bytes (>= the F16 build's
- * total).
  */
 /* Planner equivalents of metal_graph_prefill_cap_for_prompt and
  * metal_graph_raw_cap_for_context. The graph variants live inside
@@ -20105,21 +20102,20 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
         out[entry] += t->bytes;
     }
 
-    /* Per-layer KV/scratch estimate. The CTX hint is plumbed from the CLI
+    /* Per-layer KV estimate. The CTX hint is plumbed from the CLI
      * (--ctx, --ctx-max, etc.) so the packer accounts for the actual
      * session size the user intends to allocate. Zero/unset falls back to
      * the legacy 4096 value for back-compat with callers that don't
-     * populate the option (single-tier paths, tests). */
+     * populate the option (single-tier paths, tests). Per-tier scratch
+     * is accounted separately (see engine_per_tier_graph_overhead_bytes
+     * and its pre-subtract in engine_classify_multi_tier). */
     const int est_ctx = (e->placement_ctx_hint > 0) ? e->placement_ctx_hint : 4096;
     ds4_context_memory mem = ds4_context_memory_estimate(DS4_BACKEND_CUDA, est_ctx);
     if (mem.total_bytes > 0) {
-        /* Per-layer KV by attention type. The planner helper returns raw
-         * + compressed + scratch_share for each layer; summing across all
-         * layers reproduces the planner's F32-sized total_bytes
-         * by construction (see invariant comment on
-         * engine_per_layer_kv_bytes_planner). mem.total_bytes is used
-         * only as a sentinel — its value is intentionally re-derived per
-         * layer by the planner helper to avoid F16/F32 build-time skew. */
+        /* Per-layer KV by attention type — raw + compressed (+ indexer
+         * for ratio==4 layers). mem.total_bytes is used only as a
+         * sentinel; values are re-derived per layer to avoid F16/F32
+         * build-time skew. */
         for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
             out[il + 1] += engine_per_layer_kv_bytes_planner(il, est_ctx);
         }
