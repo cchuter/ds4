@@ -9610,6 +9610,11 @@ int main(int argc, char **argv) {
     }
     log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
 
+    /* Tell the multi-GPU packer what session ctx the agent will
+     * actually use, so per-layer KV bytes are priced at the right
+     * size. Single-tier (NULL gpu_cfg) and CPU paths ignore this. */
+    cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+
     ds4_engine *engine = NULL;
     /* CLI flag wiring: route through ds4_engine_create_with_gpu_config
      * when the user opted in via --gpu-vram / --gpu-devices. */

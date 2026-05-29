@@ -11996,13 +11996,29 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
             }
             return 1;
         }
-        /* Store raw free VRAM. engine_classify_multi_tier (ds4.c) is the
-         * single point where safety_margin_bytes + cuBLAS workspace reserve
-         * is subtracted. Pre-subtracting here would double-count the safety
-         * margin and false-spill tight layouts. */
+        /* Auto-mode reserve. Auto-probe is the only place we override
+         * the user's stated budget, so this is where the conservative-
+         * on-the-user's-behalf reserve belongs. The
+         * engine path (engine_classify_multi_tier) still subtracts the
+         * user-supplied safety_margin_bytes + the cuBLAS workspace from
+         * whatever budget we hand back; that math is unchanged and
+         * applies on top of the reserve we trim here.
+         *
+         * Reserve = max(2 GiB, 5 % of free). Why these numbers:
+         *   - 2 GiB floor covers runtime scratch / Q8 dequant caches /
+         *     MTP optional state on small GPUs (8-12 GB cards) where
+         *     5 % is < 1 GiB and not enough headroom.
+         *   - 5 % of free scales the reserve up on larger cards where
+         *     workspace + KV growth needs proportionally more room.
+         * Explicit --gpu-vram 47,37 budgets do not go through this
+         * probe and are unaffected. */
+        const size_t reserve_floor = (size_t)2ull * 1024ull * 1024ull * 1024ull;
+        const size_t reserve_pct = free_b / 20u;
+        const size_t reserve = reserve_floor > reserve_pct ? reserve_floor : reserve_pct;
+        const size_t budget = free_b > reserve ? (free_b - reserve) : 0;
         (void)safety_margin_bytes;
         out->device_indices[i] = d;
-        out->vram_bytes[i] = free_b;
+        out->vram_bytes[i] = budget;
     }
     return 0;
 }

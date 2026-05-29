@@ -16740,6 +16740,13 @@ struct ds4_engine {
     int            placement[DS4_MAX_LAYER + 2];
     int            n_placement_entries;
     int            multi_tier;
+
+    /* Max-context hint copied from
+     * ds4_engine_options.placement_ctx_hint. Used by
+     * engine_compute_entry_bytes for per-layer KV estimation.
+     * Zero / negative = legacy 4096 fallback (single-tier paths and any
+     * caller that doesn't set the option observe the prior behavior). */
+    int            placement_ctx_hint;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -17975,6 +17982,355 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
     return m;
 }
 #endif
+
+/* Per-layer KV byte estimate at a given context size for the CUDA /
+ * Metal graph backend. Mirrors the per-layer
+ * accounting the graph backend uses at allocation time, so the multi-GPU
+ * layer packer (engine_compute_entry_bytes) can price each layer
+ * individually instead of dividing a global total uniformly across all
+ * layers. Heterogeneous attention compression (raw / ratio-4 /
+ * ratio-128) is then represented faithfully in the placement plan.
+ *
+ * Visible in both GPU and DS4_NO_GPU builds so the placement-test
+ * harness (which builds ds4.c with -DDS4_NO_GPU) can exercise the same
+ * packer code paths.
+ *
+ * Accounting (matches the graph branch of ds4_context_memory_estimate):
+ *   raw_bytes_per_layer       = raw_cap * DS4_N_HEAD_DIM * sizeof(float)
+ *                               applied to EVERY layer (the GPU graph
+ *                               allocates a raw entry for every layer,
+ *                               with the sliding-window cap applied at
+ *                               execution time, not at planning time).
+ *   compressed_bytes_per_layer = ratio==0 -> 0
+ *                                ratio!=0 -> (ctx/ratio + 2) * DS4_N_HEAD_DIM *
+ *                                            sizeof(float)
+ *                                            (uses sizeof(float) rather
+ *                                             than the F16/F32 choice
+ *                                             made at GPU build time —
+ *                                             over-estimates on Apple
+ *                                             Metal (F16 cache) which is
+ *                                             the desired conservative
+ *                                             posture for the planner).
+ *                                            + (ratio==4 ? (ctx/ratio + 2) *
+ *                                                          DS4_N_INDEXER_HEAD_DIM *
+ *                                                          sizeof(float)
+ *                                                        : 0)
+ *
+ * Per-tier scratch buffers (indexer_scores_by_tier, comp_mask_by_tier,
+ * attn_comp_stage_by_tier, chunked-prefill batch_*_by_tier, head extras)
+ * are NOT included here. They are reserved separately by
+ * engine_per_tier_graph_overhead_bytes() and pre-subtracted from each
+ * device's vram_bytes in engine_classify_multi_tier. Counting them per
+ * layer here would double-count them once per layer.
+ *
+ * Invariant (by construction): sum over il of
+ * engine_per_layer_kv_bytes_planner(il, ctx) ==
+ *   DS4_N_LAYER * raw_cap * DS4_N_HEAD_DIM * sizeof(float)
+ *   + sum_over_ratio_layers(compressed_per_layer)
+ */
+/* Planner equivalents of metal_graph_prefill_cap_for_prompt and
+ * metal_graph_raw_cap_for_context. The graph variants live inside
+ * `#ifndef DS4_NO_GPU` blocks (they share the env knob plumbing with
+ * the GPU execution path); these inline copies replicate the same
+ * numeric math so the planner can be called from both build flavors.
+ *
+ * If the env-knob behavior in the graph helpers ever changes, update
+ * these two helpers in lockstep. Tested via:
+ *   sum(engine_per_layer_kv_bytes_planner(il, ctx) for il in 0..N) ==
+ *   F32-sized ds4_context_memory_estimate(CUDA, ctx).total_bytes.
+ */
+static uint32_t engine_planner_prefill_cap(int prompt_len) {
+    if (prompt_len <= 0) return 1;
+    uint32_t cap = (uint32_t)prompt_len;
+    const char *env = getenv("DS4_METAL_PREFILL_CHUNK");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const long v = strtol(env, &endp, 10);
+        if (endp != env) {
+            if (v <= 0) return cap;
+            cap = (uint32_t)v;
+        }
+    } else if (prompt_len > 4096) {
+        cap = 4096u;
+    }
+    if (cap == 0) cap = 1;
+    if (cap > (uint32_t)prompt_len) cap = (uint32_t)prompt_len;
+    return cap;
+}
+
+static uint32_t engine_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
+    if (ctx_size <= 0) return 1;
+    uint32_t raw_window = DS4_N_SWA;
+    if (raw_window > (uint32_t)ctx_size) raw_window = (uint32_t)ctx_size;
+    if (raw_window == 0) raw_window = 1;
+
+    /* Pad to 256-row multiple so the planner matches the graph layout. */
+    uint64_t wanted = (uint64_t)raw_window + prefill_cap;
+    if (wanted > (uint32_t)ctx_size) wanted = (uint32_t)ctx_size;
+    if (wanted == 0) wanted = 1;
+    /* align_up to 256 — inline since align_up is defined upstream. */
+    const uint64_t align = 256u;
+    wanted = (wanted + align - 1u) & ~(align - 1u);
+    if (wanted > 8192u) wanted = 8192u;
+    uint32_t raw_cap = (uint32_t)wanted;
+    if (raw_cap < raw_window) raw_cap = raw_window;
+
+    /* Env override (matches metal_graph_raw_cap_for_context behavior). */
+    const char *env = getenv("DS4_METAL_GRAPH_RAW_CAP");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const long v = strtol(env, &endp, 10);
+        if (endp != env && v > 0) {
+            raw_cap = (uint32_t)v;
+            if (raw_cap > (uint32_t)ctx_size) raw_cap = (uint32_t)ctx_size;
+            if (raw_cap > 8192u) raw_cap = 8192u;
+            if (raw_cap < raw_window) raw_cap = raw_window;
+        }
+    }
+    return raw_cap;
+}
+
+static size_t engine_per_layer_kv_bytes_planner(uint32_t il, int ctx_size) {
+    if (ctx_size <= 0) return 0;
+    if (il >= DS4_N_LAYER) return 0;
+    const uint32_t ctx = (uint32_t)ctx_size;
+
+    /* Raw KV cache: every layer gets a raw entry sized by raw_cap, the
+     * same value the GPU graph requests per layer at
+     * metal_graph_alloc_kv_cache_tensor_on(. , raw_cap * DS4_N_HEAD_DIM *
+     * sizeof(float)). raw_cap factors in raw_window padding + prefill_cap
+     * and clamps to [raw_window, 8192]. */
+    const uint32_t prefill_cap = engine_planner_prefill_cap((int)ctx);
+    const uint32_t raw_cap = engine_planner_raw_cap((int)ctx, prefill_cap);
+    size_t bytes = (size_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+
+    /* Compressed + indexer for ratio != 0 layers. Uses sizeof(float)
+     * unconditionally (over-estimates on Apple Metal F16 cache, which
+     * is the desired conservative posture per spec criterion 8). */
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio != 0) {
+        const uint32_t layer_comp_cap = ctx / ratio + 2u;
+        bytes += (size_t)layer_comp_cap * DS4_N_HEAD_DIM * sizeof(float);
+        if (ratio == 4) {
+            bytes += (size_t)layer_comp_cap * DS4_N_INDEXER_HEAD_DIM *
+                     sizeof(float);
+        }
+    }
+
+    /* Per-tier scratch (indexer_scores_by_tier, comp_mask_by_tier,
+     * attn_comp_stage_by_tier, chunked-prefill batch_*_by_tier, head
+     * extras) is accounted for separately by
+     * engine_per_tier_graph_overhead_bytes() and pre-subtracted from
+     * each device's vram_bytes in engine_classify_multi_tier. This
+     * helper returns per-layer KV/index cache ONLY. Charging scratch
+     * both here (per layer) and there (per tier) would double-count —
+     * at large ctx the duplicate can falsely refuse layouts that
+     * actually fit. */
+    return bytes;
+}
+
+/* Mirror of DS4_GPU_ATTN_COMP_CACHE_F16 that is visible in DS4_NO_GPU
+ * test builds. The GPU macro is defined inside `#ifndef DS4_NO_GPU`, so
+ * the planner-side helper below (which is visible in BOTH builds so the
+ * placement test can call it) cannot reference the GPU macro directly.
+ * Must stay in lockstep with the GPU macro. */
+#if defined(__APPLE__)
+#define DS4_PLANNER_ATTN_COMP_CACHE_F16 1
+#else
+#define DS4_PLANNER_ATTN_COMP_CACHE_F16 0
+#endif
+
+/* Per-used-tier Class-P graph overhead estimate. Mirrors the
+ * `*_by_tier[t]` allocations in
+ * metal_graph_alloc_raw_cap (ds4.c:10664-10686 + 10760-10800 + 10806-10816
+ * for head extras + 10844 for prefill_tokens + 10852-10892 for batch
+ * chunked-prefill scratch).
+ *
+ * The runtime loop replicates an entire set of Class-P kernel-scratch
+ * buffers on EVERY used tier. The packer's budget math (entry_bytes) only
+ * accounts for tensor weights + per-layer KV — it never reserved this
+ * per-tier scratch, so a layout that fit by entry_bytes could still
+ * late-OOM at session_create. This helper returns the exact byte total,
+ * which is then pre-subtracted from EVERY device's vram_bytes inside
+ * engine_classify_multi_tier (conservative: even tiers that end up unused
+ * still reserve the overhead, so the packer cannot accept a layout that
+ * would later OOM).
+ *
+ * Head-tier extras (output_pre/weights/embd/norm/logits at ds4.c:10806-10816)
+ * and prefill_tokens (ds4.c:10844 — emb_tier only) are charged to ALL tiers
+ * conservatively: only the head_tier / emb_tier actually pays at runtime, but
+ * since the pre-subtract is a single scalar applied to every device, charging
+ * to all is the simplest correct posture. The over-charge is a few MB total.
+ *
+ * Uses g_ds4_shape compile-time constants (DS4_N_*) and ctx-derived caps
+ * from engine_planner_prefill_cap. The runtime computes some dims from
+ * model weights (e.g. q_rank = layer->attn_q_a->dim[1]), but
+ * tensor_expect_layout enforces those dims == DS4_N_LORA_Q etc., so the
+ * compile-time aliases used here are byte-equivalent.
+ *
+ * Visible in both GPU and DS4_NO_GPU builds. */
+static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
+    /* Local dim aliases — same values the runtime per-tier scratch loop
+     * reads. The runtime reads q_rank etc. from layer weights; the
+     * config_validate_model path (called from ds4_engine_open_internal
+     * before classify) enforces dim equivalence with DS4_N_*, so these
+     * aliases are byte-equivalent. */
+    const uint64_t hc_dim         = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc         = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_rank         = DS4_N_LORA_Q;
+    const uint64_t q_dim          = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t low_dim        = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t group_dim      = (uint64_t)DS4_N_HEAD_DIM *
+                                    (DS4_N_HEAD / DS4_N_OUT_GROUP);
+    const uint64_t shared_dim     = DS4_N_FF_EXP;
+    const uint64_t routed_mid_dim = DS4_N_FF_EXP;
+    const uint64_t vocab_dim      = DS4_N_VOCAB;
+    const uint64_t comp_width_max =
+        2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
+                ? DS4_N_HEAD_DIM
+                : DS4_N_INDEXER_HEAD_DIM);
+    const uint64_t indexer_q_dim  =
+        (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+
+    /* ctx-derived caps. The runtime uses prefill_cap derived from the
+     * chunked-prefill batch size; the planner has no prompt yet, so we
+     * drive prefill_cap from the same env-knob path the GPU helper uses
+     * (engine_planner_prefill_cap, with the same DS4_METAL_PREFILL_CHUNK
+     * override). */
+    const int est_ctx = (e->placement_ctx_hint > 0) ? e->placement_ctx_hint
+                                                    : 4096;
+    const uint32_t prefill_cap = engine_planner_prefill_cap(est_ctx);
+
+    /* comp_cap and attn_comp_stage_cap: same formula as runtime line 10597.
+     * If no layer has a compression ratio set (test path, where
+     * g_ds4_compress_ratios is zero-init), min_ratio falls back to ctx,
+     * matching runtime line 10596. */
+    uint32_t min_ratio = UINT32_MAX;
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
+    }
+    if (min_ratio == UINT32_MAX) {
+        min_ratio = est_ctx > 0 ? (uint32_t)est_ctx : 1u;
+    }
+    uint32_t comp_cap = (uint32_t)est_ctx / min_ratio + 2u;
+    if (comp_cap < 2u) comp_cap = 2u;
+    uint32_t attn_comp_stage_cap = 0;
+    if (DS4_PLANNER_ATTN_COMP_CACHE_F16) {
+        attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
+        if (attn_comp_stage_cap < 2u) attn_comp_stage_cap = 2u;
+    }
+    const uint64_t pc = (uint64_t)prefill_cap;
+
+    size_t total = 0;
+
+    /* === Class P decode HC scratch (mirrors ds4.c:10664-10686). The
+     * hc_pre/hc_post/hc_comb buffers are VIEWS of hc_split and are NOT
+     * counted (they would double-count). === */
+    total += hc_dim * sizeof(float);                       /* cur_hc_by_tier */
+    total += hc_dim * sizeof(float);                       /* flat_hc_by_tier */
+    total += mix_hc * sizeof(float);                       /* hc_mix_by_tier */
+    total += mix_hc * sizeof(float);                       /* hc_split_by_tier */
+    /* hc_pre_by_tier, hc_post_by_tier, hc_comb_by_tier — VIEWS of hc_split. */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);         /* attn_cur_by_tier */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);         /* attn_norm_by_tier */
+    total += q_rank * sizeof(float);                       /* qr_by_tier */
+    total += q_rank * sizeof(float);                       /* qr_norm_by_tier */
+    total += q_dim * sizeof(float);                        /* q_by_tier */
+    total += (uint64_t)DS4_N_HEAD_DIM * sizeof(float);     /* kv_raw_by_tier */
+    total += (uint64_t)DS4_N_HEAD_DIM * sizeof(float);     /* kv_by_tier */
+
+    /* === Class P FFN / routed-expert state (mirrors ds4.c:10760-10800). === */
+    total += comp_width_max * sizeof(float);               /* comp_kv_cur_by_tier */
+    total += comp_width_max * sizeof(float);               /* comp_sc_cur_by_tier */
+    if (DS4_PLANNER_ATTN_COMP_CACHE_F16) {
+        total += (uint64_t)attn_comp_stage_cap *
+                 DS4_N_HEAD_DIM * sizeof(float);           /* attn_comp_stage_by_tier */
+    }
+    total += indexer_q_dim * sizeof(float);                /* indexer_q_by_tier */
+    total += (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float); /* indexer_weights_by_tier */
+    total += (uint64_t)comp_cap * pc * sizeof(float);      /* indexer_scores_by_tier */
+    total += (uint64_t)comp_cap * pc * sizeof(float);      /* comp_mask_by_tier */
+    const uint64_t top_k =
+        (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u);
+    total += top_k * pc * sizeof(uint32_t);                /* comp_selected_by_tier */
+    total += q_dim * sizeof(float);                        /* heads_by_tier */
+    total += low_dim * sizeof(float);                      /* attn_low_by_tier */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);         /* attn_out_by_tier */
+    total += hc_dim * sizeof(float);                       /* after_attn_hc_by_tier */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);         /* ffn_cur_by_tier */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);         /* ffn_norm_by_tier */
+    total += shared_dim * sizeof(float);                   /* shared_gate_by_tier */
+    total += shared_dim * sizeof(float);                   /* shared_up_by_tier */
+    total += shared_dim * sizeof(float);                   /* shared_mid_by_tier */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);         /* shared_out_by_tier */
+    total += (uint64_t)DS4_N_EXPERT * sizeof(float);       /* router_logits_by_tier */
+    total += (uint64_t)DS4_N_EXPERT * sizeof(float);       /* router_probs_by_tier */
+    total += (uint64_t)DS4_N_EXPERT_USED * sizeof(int);    /* router_selected_by_tier */
+    total += (uint64_t)DS4_N_EXPERT_USED * sizeof(float);  /* router_weights_by_tier */
+    total += (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float); /* routed_gate */
+    total += (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float); /* routed_up */
+    total += (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float); /* routed_mid */
+    total += (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);     /* routed_down */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);                         /* routed_out */
+    total += hc_dim * sizeof(float);                                       /* after_ffn_hc */
+
+    /* === Class P chunked-prefill batch scratch (mirrors ds4.c:10852-10892).
+     * These are the LARGEST per-tier allocations (e.g. batch_cur_hc =
+     * pc * hc_dim * float = ~256 MiB at default prefill_cap=4096). Without
+     * them the pre-subtract is meaningless for any non-trivial ctx. === */
+    total += pc * hc_dim * sizeof(float);                  /* batch_cur_hc_by_tier */
+    total += pc * hc_dim * sizeof(float);                  /* batch_next_hc_by_tier */
+    total += pc * hc_dim * sizeof(float);                  /* batch_flat_hc_by_tier */
+    total += pc * mix_hc * sizeof(float);                  /* batch_hc_mix_by_tier */
+    total += pc * mix_hc * sizeof(float);                  /* batch_hc_split_by_tier */
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);    /* batch_attn_cur_by_tier */
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);    /* batch_attn_norm_by_tier */
+    total += pc * q_rank * sizeof(float);                  /* batch_qr_by_tier */
+    total += pc * q_rank * sizeof(float);                  /* batch_qr_norm_by_tier */
+    total += pc * q_dim * sizeof(float);                   /* batch_q_by_tier */
+    total += pc * (uint64_t)DS4_N_HEAD_DIM * sizeof(float);/* batch_kv_raw_by_tier */
+    total += pc * (uint64_t)DS4_N_HEAD_DIM * sizeof(float);/* batch_kv_by_tier */
+    total += pc * comp_width_max * sizeof(float);          /* batch_comp_kv_by_tier */
+    total += pc * comp_width_max * sizeof(float);          /* batch_comp_sc_by_tier */
+    total += pc * indexer_q_dim * sizeof(float);           /* batch_indexer_q_by_tier */
+    total += pc * (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float); /* batch_indexer_weights */
+    total += pc * q_dim * sizeof(float);                   /* batch_heads_by_tier */
+    total += pc * low_dim * sizeof(float);                 /* batch_attn_low_by_tier */
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);    /* batch_attn_out_by_tier */
+    total += pc * group_dim * sizeof(float);               /* batch_group_tmp_by_tier */
+    total += pc * (uint64_t)DS4_N_LORA_O * sizeof(float);  /* batch_low_tmp_by_tier */
+    total += pc * hc_dim * sizeof(float);                  /* batch_after_attn_hc_by_tier */
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);    /* batch_ffn_cur_by_tier */
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);    /* batch_ffn_norm_by_tier */
+    total += pc * shared_dim * sizeof(float);              /* batch_shared_gate_by_tier */
+    total += pc * shared_dim * sizeof(float);              /* batch_shared_up_by_tier */
+    total += pc * shared_dim * sizeof(float);              /* batch_shared_mid_by_tier */
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);    /* batch_shared_out_by_tier */
+    total += pc * (uint64_t)DS4_N_EXPERT * sizeof(float);  /* batch_router_logits_by_tier */
+    total += pc * (uint64_t)DS4_N_EXPERT * sizeof(float);  /* batch_router_probs_by_tier */
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * sizeof(int);   /* batch_router_selected */
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * sizeof(float); /* batch_router_weights */
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float); /* batch_routed_gate */
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float); /* batch_routed_up */
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float); /* batch_routed_mid */
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);     /* batch_routed_down */
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);    /* batch_routed_out_by_tier */
+
+    /* === Class E embedding-tier prefill_tokens (mirrors ds4.c:10844).
+     * Charged to ALL tiers conservatively. Negligible (pc * int32). === */
+    total += pc * sizeof(int32_t);                         /* prefill_tokens_by_tier */
+
+    /* === Head-tier-only extras (mirrors ds4.c:10806-10816). Charged
+     * conservatively to EVERY tier. === */
+    total += (uint64_t)DS4_N_HC   * sizeof(float);         /* output_pre_by_tier */
+    total += (uint64_t)DS4_N_HC   * sizeof(float);         /* output_weights_by_tier */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);         /* output_embd_by_tier */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);         /* output_norm_by_tier */
+    total += vocab_dim * sizeof(float);                    /* logits_by_tier */
+
+    return total;
+}
 
 /* =========================================================================
  * Engine API and Process Lock.
@@ -19744,14 +20100,23 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
         out[entry] += t->bytes;
     }
 
-    /* Per-layer KV/scratch estimate at a conservative context size.
-     * bench harness will tune this; the packer just needs the per-entry
-     * numbers to be self-consistent. */
-    const int est_ctx = 4096;
+    /* Per-layer KV estimate. The CTX hint is plumbed from the CLI
+     * (--ctx, --ctx-max, etc.) so the packer accounts for the actual
+     * session size the user intends to allocate. Zero/unset falls back to
+     * the legacy 4096 value for back-compat with callers that don't
+     * populate the option (single-tier paths, tests). Per-tier scratch
+     * is accounted separately (see engine_per_tier_graph_overhead_bytes
+     * and its pre-subtract in engine_classify_multi_tier). */
+    const int est_ctx = (e->placement_ctx_hint > 0) ? e->placement_ctx_hint : 4096;
     ds4_context_memory mem = ds4_context_memory_estimate(DS4_BACKEND_CUDA, est_ctx);
     if (mem.total_bytes > 0) {
-        const size_t per_layer_kv = (size_t)(mem.total_bytes / (uint64_t)DS4_N_LAYER);
-        for (int i = 1; i <= DS4_N_LAYER; i++) out[i] += per_layer_kv;
+        /* Per-layer KV by attention type — raw + compressed (+ indexer
+         * for ratio==4 layers). mem.total_bytes is used only as a
+         * sentinel; values are re-derived per layer to avoid F16/F32
+         * build-time skew. */
+        for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+            out[il + 1] += engine_per_layer_kv_bytes_planner(il, est_ctx);
+        }
     } else {
         /* Fallback: 128 MiB per layer as a static estimate. */
         const size_t fallback_per_layer = (size_t)128ull * 1024ull * 1024ull;
@@ -19791,16 +20156,41 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
 
     e->gpu_cfg = *cfg;
 
+    /* Pre-subtract per-tier Class-P graph scratch from EVERY device
+     * budget BEFORE the packer reads vram_bytes.
+     * Conservative: tiers that end up unused still reserve the overhead, so
+     * the packer cannot accept a layout that would later OOM at
+     * session_create when metal_graph_alloc_raw_cap's per-tier scratch loop
+     * runs. The reservation flows into the packer via e->gpu_cfg (NOT
+     * the caller's cfg) — see the budget loop below. */
+    const size_t per_tier_overhead = engine_per_tier_graph_overhead_bytes(e);
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        if (e->gpu_cfg.vram_bytes[d] <= per_tier_overhead) {
+            fprintf(stderr,
+                    "ds4: GPU%d budget %.2f GiB <= per-tier graph overhead "
+                    "%.2f GiB; tier cannot hold its own runtime scratch — "
+                    "refusing upfront.\n",
+                    e->gpu_cfg.device_indices[d],
+                    (double)e->gpu_cfg.vram_bytes[d] / (1024.0 * 1024.0 * 1024.0),
+                    (double)per_tier_overhead       / (1024.0 * 1024.0 * 1024.0));
+            return -1;
+        }
+        e->gpu_cfg.vram_bytes[d] -= per_tier_overhead;
+    }
+
     size_t entry_bytes[DS4_MAX_LAYER + 2];
     if (engine_compute_entry_bytes(e, entry_bytes) != 0) return -1;
 
     ds4_layer_pack_config pcfg;
     memset(&pcfg, 0, sizeof(pcfg));
-    pcfg.n_gpus = cfg->n_gpus;
+    pcfg.n_gpus = e->gpu_cfg.n_gpus;
     const size_t cublas_workspace_overhead = (size_t)64ull * 1024ull * 1024ull;
-    for (int d = 0; d < cfg->n_gpus; d++) {
-        size_t budget = cfg->vram_bytes[d];
-        size_t reserve = cfg->safety_margin_bytes + cublas_workspace_overhead;
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        /* Read post-subtract budgets from e->gpu_cfg (NOT the caller's
+         * cfg) so the per-tier overhead pre-subtract actually flows into
+         * the packer. */
+        size_t budget = e->gpu_cfg.vram_bytes[d];
+        size_t reserve = e->gpu_cfg.safety_margin_bytes + cublas_workspace_overhead;
         pcfg.gpu_budget_bytes[d] = budget > reserve ? budget - reserve : 0;
     }
 
@@ -19919,6 +20309,15 @@ static void engine_print_layout(const ds4_engine *e) {
                           used,
                           budget,
                           e->gpu_cfg.n_gpus);
+
+    /* Show the per-tier graph scratch reservation so operators can
+     * correlate "47 GiB free" with the smaller post-subtract budget the
+     * packer actually had to spend. */
+    const size_t per_tier_overhead = engine_per_tier_graph_overhead_bytes(e);
+    fprintf(stderr,
+            "ds4: per-tier graph scratch reserved: %.2f GiB "
+            "(pre-subtracted from each GPU budget)\n",
+            (double)per_tier_overhead / (1024.0 * 1024.0 * 1024.0));
 
     fprintf(stderr, "ds4: peer access matrix (validated):");
     int peer_any = 0;
@@ -20069,6 +20468,110 @@ int ds4_test_session_read_logits(ds4_session *s, float *out, uint64_t out_bytes)
 const int *ds4_test_engine_placement(const ds4_engine *e) {
     return e ? e->placement : NULL;
 }
+
+/* Variant of ds4_test_classify_multi_tier that lets the test set
+ * placement_ctx_hint on the synthetic engine before classify. Required
+ * to exercise the ctx-aware code path in engine_compute_entry_bytes /
+ * engine_per_tier_graph_overhead_bytes. */
+int ds4_test_classify_multi_tier_with_ctx(const ds4_test_fake_tensor *tensors,
+                                           int n_tensors,
+                                           const ds4_gpu_config *cfg,
+                                           int placement_ctx_hint,
+                                           int placement_out[DS4_MAX_LAYER + 2],
+                                           int *out_multi_tier,
+                                           int *out_n_entries) {
+    ds4_engine eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.model.fd = -1;
+    eng.model.n_tensors = (uint64_t)(n_tensors > 0 ? n_tensors : 0);
+    eng.model.tensors = NULL;
+    if (n_tensors > 0) {
+        eng.model.tensors = calloc((size_t)n_tensors, sizeof(*eng.model.tensors));
+        if (!eng.model.tensors) return -1;
+        for (int i = 0; i < n_tensors; i++) {
+            eng.model.tensors[i].name.ptr = tensors[i].name;
+            eng.model.tensors[i].name.len = tensors[i].name
+                ? (uint64_t)strlen(tensors[i].name) : 0;
+            eng.model.tensors[i].bytes = tensors[i].bytes;
+        }
+    }
+    eng.placement_ctx_hint = placement_ctx_hint;
+    int rc = engine_classify_multi_tier(&eng, cfg);
+    if (rc == 0) {
+        if (out_multi_tier) *out_multi_tier = eng.multi_tier;
+        if (out_n_entries) *out_n_entries = eng.n_placement_entries;
+        if (placement_out) {
+            for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER + 2u; i++) {
+                placement_out[i] = eng.placement[i];
+            }
+        }
+    }
+    free(eng.model.tensors);
+    return rc;
+}
+
+/* Populate g_ds4_compress_ratios with the FLASH variant's expected
+ * per-layer pattern. Without this, the
+ * test-mode planner sees min_ratio==est_ctx and collapses comp_cap /
+ * attn_comp_stage_cap, making the per-tier overhead artificially small.
+ * Callers must invoke ds4_test_clear_compress_ratios() afterward to
+ * restore the zero-init default so other tests are not affected. */
+void ds4_test_seed_compress_ratios(void) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g_ds4_compress_ratios[il] = ds4_expected_layer_compress_ratio(il);
+    }
+}
+
+void ds4_test_clear_compress_ratios(void) {
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+}
+
+/* Expose engine_per_tier_graph_overhead_bytes for test calibration.
+ * Builds a synthetic engine (no model tensors) and returns the overhead
+ * at the given ctx hint. */
+size_t ds4_test_per_tier_graph_overhead_bytes(int placement_ctx_hint) {
+    ds4_engine eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.model.fd = -1;
+    eng.placement_ctx_hint = placement_ctx_hint;
+    return engine_per_tier_graph_overhead_bytes(&eng);
+}
+
+/* Expose engine_compute_entry_bytes for test calibration. Builds a
+ * synthetic engine like
+ * ds4_test_classify_multi_tier does (tensor names + bytes only) and
+ * returns the sum of all entry_bytes[] at the given ctx hint. Used by
+ * tests/test_engine_mgpu_placement to size budgets against the actual
+ * planner entry-byte total. */
+size_t ds4_test_compute_entry_bytes_sum(const ds4_test_fake_tensor *tensors,
+                                         int n_tensors,
+                                         int placement_ctx_hint) {
+    ds4_engine eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.model.fd = -1;
+    eng.model.n_tensors = (uint64_t)(n_tensors > 0 ? n_tensors : 0);
+    eng.model.tensors = NULL;
+    if (n_tensors > 0) {
+        eng.model.tensors = calloc((size_t)n_tensors, sizeof(*eng.model.tensors));
+        if (!eng.model.tensors) return 0;
+        for (int i = 0; i < n_tensors; i++) {
+            eng.model.tensors[i].name.ptr = tensors[i].name;
+            eng.model.tensors[i].name.len = tensors[i].name
+                ? (uint64_t)strlen(tensors[i].name) : 0;
+            eng.model.tensors[i].bytes = tensors[i].bytes;
+        }
+    }
+    eng.placement_ctx_hint = placement_ctx_hint;
+    size_t entry_bytes[DS4_MAX_LAYER + 2];
+    size_t sum = 0;
+    if (engine_compute_entry_bytes(&eng, entry_bytes) == 0) {
+        for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER + 2u; i++) {
+            sum += entry_bytes[i];
+        }
+    }
+    free(eng.model.tensors);
+    return sum;
+}
 #endif /* DS4_TEST_HOOKS */
 
 /* Internal engine-open helper carrying today's body verbatim plus three
@@ -20116,6 +20619,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
+    e->placement_ctx_hint = opt->placement_ctx_hint;
     ds4_acquire_instance_lock();
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
@@ -20142,6 +20646,93 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_engine_close(e);
         *out = NULL;
         return 1;
+    }
+    /* Refuse upfront, before any GPU init / cudaMalloc, when the
+     * multi-tier packer fell back to CPU spill because the configured
+     * budgets could not hold the planner's per-layer KV estimate.
+     * Replaces a silent late OOM at session_create. CPU-spill
+     * execution is a separate follow-up. */
+    if (gpu_cfg && e->n_placement_entries > 0) {
+        int spilled = 0;
+        size_t spilled_bytes = 0;
+        size_t entry_bytes_buf[DS4_MAX_LAYER + 2];
+        size_t used_bytes[DS4_LAYER_PACK_MAX_GPUS] = {0};
+        size_t budget_bytes[DS4_LAYER_PACK_MAX_GPUS] = {0};
+        int have_entry_bytes = (engine_compute_entry_bytes(e, entry_bytes_buf) == 0);
+        if (have_entry_bytes) {
+            /* Read POST-subtract budgets from e->gpu_cfg, not the
+             * caller's gpu_cfg. The pre-subtract already happened in
+             * engine_classify_multi_tier; showing pre-subtract budgets
+             * here would lie to the user about what
+             * the packer actually had to spend. */
+            for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+                budget_bytes[d] = e->gpu_cfg.vram_bytes[d];
+            }
+            for (int i = 0; i < e->n_placement_entries; i++) {
+                int dev = e->placement[i];
+                if (dev == DS4_LAYER_PACK_CPU) {
+                    spilled++;
+                    spilled_bytes += entry_bytes_buf[i];
+                } else if (dev >= 0 && dev < e->gpu_cfg.n_gpus) {
+                    used_bytes[dev] += entry_bytes_buf[i];
+                }
+            }
+        }
+        if (spilled > 0) {
+            size_t total_budget = 0;
+            for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+                total_budget += e->gpu_cfg.vram_bytes[d];
+            }
+            /* Print the attempted layout so the user can see WHY the
+             * placement spilled. ds4_layer_pack_print emits the
+             * "multi-GPU layout:" header expected by the refusal regression
+             * test. We skip the peer-access matrix because that requires
+             * GPU init state which is intentionally not run on this
+             * early-refusal path. */
+            if (have_entry_bytes) {
+                ds4_layer_pack_print(stderr,
+                                      e->placement,
+                                      e->n_placement_entries,
+                                      DS4_N_LAYER,
+                                      entry_bytes_buf,
+                                      used_bytes,
+                                      budget_bytes,
+                                      e->gpu_cfg.n_gpus);
+            }
+            /* Show the per-tier graph scratch reservation so users see
+             * why the per-device budget shrank. The actual subtract
+             * already happened in engine_classify_multi_tier; this is
+             * purely informational. */
+            const size_t per_tier_overhead =
+                engine_per_tier_graph_overhead_bytes(e);
+            fprintf(stderr,
+                    "ds4: per-tier graph scratch reserved on each GPU: "
+                    "%.2f GiB (pre-subtracted from each --gpu-vram budget "
+                    "before packing).\n",
+                    (double)per_tier_overhead / (1024.0 * 1024.0 * 1024.0));
+            /* Keep the legacy diagnostic strings the refusal regression
+             * test in tests/test_engine_mgpu_refusal looks for. The
+             * "mgpu-graph-session-cpu-spill" name refers to the wave-3b
+             * CPU-spill execution follow-up task. */
+            fprintf(stderr,
+                "ds4: CPU-spill placement detected; CPU-tier execution wiring "
+                "is the wave-3b mgpu-graph-session-cpu-spill follow-up.\n");
+            fprintf(stderr,
+                "ds4: --gpu-vram placement does not fit at the requested "
+                "context (ctx hint = %d):\n"
+                "ds4:   %d placement entries spilled to CPU "
+                "(%.2f GiB unaccommodated of %.2f GiB total per-device budget).\n"
+                "ds4: Lower --ctx / --ctx-max, raise --gpu-vram budgets, or use "
+                "--gpu-vram auto on a host with more free VRAM.\n"
+                "ds4: Refusing upfront to avoid silent OOM at session_create.\n",
+                e->placement_ctx_hint,
+                spilled,
+                (double)spilled_bytes / (1024.0 * 1024.0 * 1024.0),
+                (double)total_budget / (1024.0 * 1024.0 * 1024.0));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     if (e->multi_tier && opt->mtp_path && opt->mtp_path[0]) {
         fprintf(stderr,

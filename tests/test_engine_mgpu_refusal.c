@@ -82,9 +82,19 @@ int main(void) {
     cfg.n_gpus = 2;
     cfg.device_indices[0] = 0;
     cfg.device_indices[1] = 1;
-    /* Pick small budgets so the placement spans 2 tiers (forces multi-tier). */
-    cfg.vram_bytes[0] = (size_t)1024u * 1024u * 1024u;   /* 1 GiB */
-    cfg.vram_bytes[1] = (size_t)1024u * 1024u * 1024u;   /* 1 GiB */
+    /* Pick small-but-not-too-small budgets:
+     *   - each must exceed the per-tier graph overhead (~4 GiB at default
+     *     ctx) so the pre-subtract refusal at engine_classify_multi_tier
+     *     doesn't fire (that path returns early without printing the
+     *     "multi-GPU layout:" header this test asserts on);
+     *   - but the combined budget must be far below the model's tensor
+     *     bytes so the packer is forced to spill some entries to CPU,
+     *     triggering the CPU-spill refusal path this test exercises.
+     * 8 GiB per GPU = 16 GiB total: leaves ~4 GiB usable per tier after
+     * the pre-subtract — enough for some layer entries — while the
+     * ~36 GiB model forces spill. */
+    cfg.vram_bytes[0] = (size_t)8ull * 1024u * 1024u * 1024u;   /* 8 GiB */
+    cfg.vram_bytes[1] = (size_t)8ull * 1024u * 1024u * 1024u;   /* 8 GiB */
     cfg.safety_margin_bytes = 0;
 
     ds4_engine_options opt;
