@@ -2426,6 +2426,54 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
     /* Allocate or grow the slab via cudaMalloc + d2d copy. */
     void *new_base = NULL;
     size_t new_bytes = c.bytes + want_bytes;
+
+    /* Refuse cleanly before cudaMalloc if the device clearly cannot hold
+     * the slab. The multi-tier packer reserves per-tier runtime scratch
+     * before placing tensors, but it cannot predict the cudaMalloc
+     * allocator's overhead (alignment, fragmentation after CUDA context
+     * init, default driver-side reservations). On a borderline budget
+     * that overhead pushes a "fits-by-packer-math" layout past the actual
+     * free pool and the cudaMalloc below OOMs after the engine already
+     * committed to the layout — same silent-late-OOM failure mode the
+     * upfront refusal path was added to eliminate. Catch it here too. */
+    {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            /* free_b already excludes the existing slab (it's still
+             * allocated), so the additional cudaMalloc only needs
+             * new_bytes free — not new_bytes + c.bytes. The old slab is
+             * freed AFTER the d2d copy succeeds. 2 GiB safety covers what
+             * the engine will allocate AFTER the cache slab in the same
+             * session_create: per-tier graph scratch (the planner can't
+             * predict its cumulative cudaMalloc alignment overhead),
+             * cuBLAS workspace beyond the 64 MiB the packer already
+             * reserves, and driver-side allocator slack. Without this
+             * headroom a borderline budget that fits the slab itself can
+             * still OOM at the per-tier tensor allocations a few moments
+             * later — same silent-late-OOM failure mode, one layer up. */
+            const size_t safety = (size_t)2ull * 1024ull * 1024ull * 1024ull;
+            const size_t need = new_bytes + safety;
+            if (need > free_b) {
+                fprintf(stderr,
+                        "ds4: device cache slab needs %.2f GiB on device %d "
+                        "but only %.2f GiB free (slab=%.2f GiB + %.2f GiB safety). "
+                        "Lower --gpu-vram / --ctx-max, or use --gpu-vram auto on "
+                        "a host with more free VRAM. Refusing upfront to avoid "
+                        "late OOM at cudaMalloc.\n",
+                        (double)need / 1073741824.0,
+                        device_id,
+                        (double)free_b / 1073741824.0,
+                        (double)new_bytes / 1073741824.0,
+                        (double)safety / 1073741824.0);
+                if (prev_device >= 0) (void)cudaSetDevice(prev_device);
+                return 5;
+            }
+        }
+        /* If cudaMemGetInfo itself failed, fall through; cudaMalloc's own
+         * error path still catches the late case, just with a less helpful
+         * message. */
+    }
+
     if (!cuda_ok(cudaMalloc(&new_base, new_bytes), "device cache alloc")) {
         if (prev_device >= 0) (void)cudaSetDevice(prev_device);
         return 5;
@@ -11996,13 +12044,29 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
             }
             return 1;
         }
-        /* Store raw free VRAM. engine_classify_multi_tier (ds4.c) is the
-         * single point where safety_margin_bytes + cuBLAS workspace reserve
-         * is subtracted. Pre-subtracting here would double-count the safety
-         * margin and false-spill tight layouts. */
+        /* Auto-mode reserve. Auto-probe is the only place we override
+         * the user's stated budget, so this is where the conservative-
+         * on-the-user's-behalf reserve belongs. The
+         * engine path (engine_classify_multi_tier) still subtracts the
+         * user-supplied safety_margin_bytes + the cuBLAS workspace from
+         * whatever budget we hand back; that math is unchanged and
+         * applies on top of the reserve we trim here.
+         *
+         * Reserve = max(2 GiB, 5 % of free). Why these numbers:
+         *   - 2 GiB floor covers runtime scratch / Q8 dequant caches /
+         *     MTP optional state on small GPUs (8-12 GB cards) where
+         *     5 % is < 1 GiB and not enough headroom.
+         *   - 5 % of free scales the reserve up on larger cards where
+         *     workspace + KV growth needs proportionally more room.
+         * Explicit --gpu-vram 47,37 budgets do not go through this
+         * probe and are unaffected. */
+        const size_t reserve_floor = (size_t)2ull * 1024ull * 1024ull * 1024ull;
+        const size_t reserve_pct = free_b / 20u;
+        const size_t reserve = reserve_floor > reserve_pct ? reserve_floor : reserve_pct;
+        const size_t budget = free_b > reserve ? (free_b - reserve) : 0;
         (void)safety_margin_bytes;
         out->device_indices[i] = d;
-        out->vram_bytes[i] = free_b;
+        out->vram_bytes[i] = budget;
     }
     return 0;
 }

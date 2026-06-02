@@ -73,6 +73,12 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool inspect_only;
+    /* Hint for multi-GPU placement KV cache footprint. Zero or negative =
+     * unspecified (packer falls back to the legacy 4096 default). Positive
+     * = the maximum context size the user intends to allocate sessions
+     * at; the layer packer uses this for per-layer KV bytes estimation.
+     * Single-tier (gpu_cfg == NULL) and CPU mode ignore this field. */
+    int placement_ctx_hint;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
