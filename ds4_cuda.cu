@@ -2876,6 +2876,59 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
+/* Well-occupied, bit-identical sibling of matmul_f16_ordered_chunks_kernel.
+ *
+ * The legacy ordered kernel launches one warp (32 threads) per output element,
+ * which leaves the SMs at ~2% occupancy (latency-bound). This kernel keeps the
+ * EXACT same per-element arithmetic — 32 contiguous chunks, lane `tid` sums
+ * chunk `tid` left-to-right, then lane 0 combines partial[0..31] in ascending
+ * index order (a sequential left-fold) — but packs DET_F16_WARPS_PER_BLOCK warps
+ * per block so every warp scheduler is fed and many independent rows' memory
+ * loads overlap. The operands, order and rounding are unchanged, so the result
+ * is bit-identical to the legacy kernel; only the launch geometry differs.
+ *
+ * Determinism guards (do NOT change): no warp-shuffle/tree reduction, no atomics,
+ * no half2/vectorized accumulation — any of those would reorder the adds and
+ * break bit-identity, which the router's strict top-6 `>` comparison depends on.
+ * Each warp reads only its own partial[warp][...], so __syncwarp() (not
+ * __syncthreads()) is the correct, deadlock-safe barrier under per-warp
+ * early-return masking. */
+#define DET_F16_WARPS_PER_BLOCK 8u
+
+__global__ static void matmul_f16_ordered_chunks_wide_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    const uint32_t warp = threadIdx.x >> 5;          /* 0 .. WARPS_PER_BLOCK-1 */
+    const uint32_t tid = threadIdx.x & 31u;          /* lane within warp == chunk id */
+    const uint64_t row = (uint64_t)blockIdx.x * DET_F16_WARPS_PER_BLOCK + warp;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    /* Whole-warp uniform skip: every lane in this warp shares `row`/`tok`. */
+    if (row >= out_dim || tok >= n_tok) return;
+
+    __shared__ float partial[DET_F16_WARPS_PER_BLOCK][32];
+    float sum = 0.0f;
+    const uint64_t chunk = (in_dim + 31u) / 32u;
+    const uint64_t k0 = (uint64_t)tid * chunk;
+    uint64_t k1 = k0 + chunk;
+    if (k1 > in_dim) k1 = in_dim;
+    const __half *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = k0; i < k1; i++) {
+        sum += __half2float(wr[i]) * xr[i];
+    }
+    partial[warp][tid] = sum;
+    __syncwarp();
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint32_t i = 0; i < 32u; i++) total += partial[warp][i];
+        out[tok * out_dim + row] = total;
+    }
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,
@@ -2913,6 +2966,58 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         for (uint32_t i = 0; i < 32u; i++) {
             total0 += partial0[i];
             total1 += partial1[i];
+        }
+        if (row < out0_dim) out0[row] = total0;
+        if (row < out1_dim) out1[row] = total1;
+    }
+}
+
+/* Well-occupied, bit-identical sibling of matmul_f16_pair_ordered_chunks_kernel.
+ * Same widening as matmul_f16_ordered_chunks_wide_kernel: one warp per output
+ * row, DET_F16_WARPS_PER_BLOCK warps per block. Each accumulator (out0, out1) is
+ * summed in its own per-warp partial buffer with the identical 32-chunk
+ * decomposition and the identical lane-0 sequential left-fold, so each output is
+ * bit-identical to the legacy pair kernel. The two accumulations are never
+ * combined with each other. */
+__global__ static void matmul_f16_pair_ordered_chunks_wide_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t tid = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * DET_F16_WARPS_PER_BLOCK + warp;
+    /* Whole-warp uniform skip: lanes share `row`. */
+    if (row >= out0_dim && row >= out1_dim) return;
+
+    __shared__ float partial0[DET_F16_WARPS_PER_BLOCK][32];
+    __shared__ float partial1[DET_F16_WARPS_PER_BLOCK][32];
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    const uint64_t chunk = (in_dim + 31u) / 32u;
+    const uint64_t k0 = (uint64_t)tid * chunk;
+    uint64_t k1 = k0 + chunk;
+    if (k1 > in_dim) k1 = in_dim;
+    const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
+    const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
+    for (uint64_t i = k0; i < k1; i++) {
+        const float xv = x[i];
+        if (row < out0_dim) sum0 += __half2float(wr0[i]) * xv;
+        if (row < out1_dim) sum1 += __half2float(wr1[i]) * xv;
+    }
+    partial0[warp][tid] = sum0;
+    partial1[warp][tid] = sum1;
+    __syncwarp();
+    if (tid == 0) {
+        float total0 = 0.0f;
+        float total1 = 0.0f;
+        for (uint32_t i = 0; i < 32u; i++) {
+            total0 += partial0[warp][i];
+            total1 += partial1[warp][i];
         }
         if (row < out0_dim) out0[row] = total0;
         if (row < out1_dim) out1[row] = total1;
@@ -7342,8 +7447,17 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         return cuda_ok(cudaGetLastError(), serial_router ? "matmul_f16_router_serial launch" : "matmul_f16_serial launch");
     }
     if (ordered_router) {
-        matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-        return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
+        /* The wide kernel is bit-identical to the legacy ordered kernel (same
+         * 32-chunk fixed-order arithmetic) but fills the SMs. It is the default
+         * for the ordered path; DS4_CUDA_LEGACY_ORDERED_F16=1 forces the old
+         * <<<grid,32>>> launch (reversibility). */
+        if (getenv("DS4_CUDA_LEGACY_ORDERED_F16") != NULL) {
+            matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
+        }
+        dim3 wide_grid((unsigned)((out_dim + DET_F16_WARPS_PER_BLOCK - 1u) / DET_F16_WARPS_PER_BLOCK), (unsigned)n_tok, 1);
+        matmul_f16_ordered_chunks_wide_kernel<<<wide_grid, 32u * DET_F16_WARPS_PER_BLOCK>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks_wide launch");
     }
     matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
@@ -7389,7 +7503,22 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_resolve_weight_ptr(model_map, weight0_offset, weight_bytes, logical_tier, "f16_pair0");
     const __half *w1 = (const __half *)cuda_resolve_weight_ptr(model_map, weight1_offset, weight_bytes, logical_tier, "f16_pair1");
     if (!w0 || !w1) return 0;
-    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
+    /* Wide (well-occupied) pair kernel is the default and is bit-identical to
+     * the legacy pair kernel; DS4_CUDA_LEGACY_ORDERED_F16=1 forces the old
+     * <<<out_dim,32>>> launch (reversibility, matches the GEMV path). */
+    if (getenv("DS4_CUDA_LEGACY_ORDERED_F16") != NULL) {
+        matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
+            (float *)out0->ptr,
+            (float *)out1->ptr,
+            w0,
+            w1,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+    }
+    matmul_f16_pair_ordered_chunks_wide_kernel<<<(unsigned)((out_dim + DET_F16_WARPS_PER_BLOCK - 1u) / DET_F16_WARPS_PER_BLOCK), 32u * DET_F16_WARPS_PER_BLOCK>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
         w0,
@@ -7398,7 +7527,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         in_dim,
         out_dim,
         out_dim);
-    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks_wide launch");
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
