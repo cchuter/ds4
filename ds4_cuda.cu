@@ -2426,6 +2426,48 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
     /* Allocate or grow the slab via cudaMalloc + d2d copy. */
     void *new_base = NULL;
     size_t new_bytes = c.bytes + want_bytes;
+
+    /* Refuse cleanly before cudaMalloc if the device clearly cannot hold
+     * the slab. The multi-tier packer reserves per-tier runtime scratch
+     * before placing tensors, but it cannot predict the cudaMalloc
+     * allocator's overhead (alignment, fragmentation after CUDA context
+     * init, default driver-side reservations). On a borderline budget
+     * that overhead pushes a "fits-by-packer-math" layout past the actual
+     * free pool and the cudaMalloc below OOMs after the engine already
+     * committed to the layout — same silent-late-OOM failure mode the
+     * upfront refusal path was added to eliminate. Catch it here too. */
+    {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            /* During slab grow we briefly hold BOTH the old and new
+             * allocations (d2d copy below). Account for that. Plus a
+             * small safety to absorb any concurrent allocations made
+             * between this check and cudaMalloc. */
+            const size_t copy_overhead = (c.present && c.bytes > 0) ? c.bytes : 0;
+            const size_t safety = (size_t)256ull * 1024ull * 1024ull;
+            const size_t need = new_bytes + copy_overhead + safety;
+            if (need > free_b) {
+                fprintf(stderr,
+                        "ds4: device cache slab needs %.2f GiB on device %d "
+                        "but only %.2f GiB free (slab=%.2f GiB + d2d grow=%.2f GiB "
+                        "+ %.2f GiB safety). Lower --gpu-vram / --ctx-max, or use "
+                        "--gpu-vram auto on a host with more free VRAM. "
+                        "Refusing upfront to avoid late OOM at cudaMalloc.\n",
+                        (double)need / 1073741824.0,
+                        device_id,
+                        (double)free_b / 1073741824.0,
+                        (double)new_bytes / 1073741824.0,
+                        (double)copy_overhead / 1073741824.0,
+                        (double)safety / 1073741824.0);
+                if (prev_device >= 0) (void)cudaSetDevice(prev_device);
+                return 5;
+            }
+        }
+        /* If cudaMemGetInfo itself failed, fall through; cudaMalloc's own
+         * error path still catches the late case, just with a less helpful
+         * message. */
+    }
+
     if (!cuda_ok(cudaMalloc(&new_base, new_bytes), "device cache alloc")) {
         if (prev_device >= 0) (void)cudaSetDevice(prev_device);
         return 5;
