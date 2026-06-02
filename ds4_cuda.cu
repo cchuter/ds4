@@ -10450,7 +10450,7 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
         uint32_t midq_blocks,
         uint32_t out_dim) {
     uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t row = blockIdx.x * (blockDim.x >> 3u) + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
     float total = 0.0f;
     #pragma unroll
@@ -10477,7 +10477,7 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         uint32_t midq_blocks,
         uint32_t out_dim) {
     uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t row = blockIdx.x * (blockDim.x >> 3u) + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
     float total = 0.0f;
     #pragma unroll
@@ -11468,9 +11468,18 @@ static int routed_moe_launch(
                 down_tile_capacity = tile16_capacity;
             }
             if (use_direct_down_sum6) {
-                dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
+                /* perf-05: down decode is occupancy-bound (grid ~128 blocks, 0.15
+                 * waves). Reads are coalesced, so smaller blocks => more blocks fills
+                 * the SMs. Byte-identical (per-row reduction unchanged): row index uses
+                 * blockDim.x>>3 rows/block. Default 256 == legacy 32-row geometry.
+                 * Env DS4_CUDA_MOE_DOWN_BLOCK in {32,64,128,256} for sweeping. */
+                unsigned dn_block = 256u;
+                const char *dn_env = getenv("DS4_CUDA_MOE_DOWN_BLOCK");
+                if (dn_env) { unsigned dv = (unsigned)atoi(dn_env); if (dv == 32u || dv == 64u || dv == 128u || dv == 256u) dn_block = dv; }
+                const unsigned dn_rpb = dn_block >> 3u;
+                dim3 sgrid((out_dim + dn_rpb - 1u) / dn_rpb, 1, 1);
                 if (q4k_path) {
-                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, dn_block>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -11480,7 +11489,7 @@ static int routed_moe_launch(
                         midq_blocks,
                         out_dim);
                 } else {
-                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_sum6_qwarp32_kernel<<<sgrid, dn_block>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
