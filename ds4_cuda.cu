@@ -2444,7 +2444,17 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
              * small safety to absorb any concurrent allocations made
              * between this check and cudaMalloc. */
             const size_t copy_overhead = (c.present && c.bytes > 0) ? c.bytes : 0;
-            const size_t safety = (size_t)256ull * 1024ull * 1024ull;
+            /* 2 GiB safety covers what the engine will allocate AFTER the
+             * cache slab in the same session_create: the per-tier graph
+             * scratch (sized by engine_per_tier_graph_overhead_bytes for
+             * the budget but allocated as many separate cudaMallocs whose
+             * cumulative alignment overhead the planner can't predict),
+             * cuBLAS workspace beyond the 64 MiB the packer already
+             * reserves, and driver-side allocator slack. Without this
+             * headroom a borderline budget that fits the slab itself can
+             * still OOM at the per-tier tensor allocations a few moments
+             * later — same silent-late-OOM failure mode, one layer up. */
+            const size_t safety = (size_t)2ull * 1024ull * 1024ull * 1024ull;
             const size_t need = new_bytes + copy_overhead + safety;
             if (need > free_b) {
                 fprintf(stderr,
