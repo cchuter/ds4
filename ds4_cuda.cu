@@ -2876,16 +2876,26 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
-/* Well-occupied, bit-identical sibling of matmul_f16_ordered_chunks_kernel.
+/* Bit-identical sibling of matmul_f16_ordered_chunks_kernel that packs more
+ * warps per block to raise SM occupancy.
  *
- * The legacy ordered kernel launches one warp (32 threads) per output element,
- * which leaves the SMs at ~2% occupancy (latency-bound). This kernel keeps the
- * EXACT same per-element arithmetic — 32 contiguous chunks, lane `tid` sums
- * chunk `tid` left-to-right, then lane 0 combines partial[0..31] in ascending
- * index order (a sequential left-fold) — but packs DET_F16_WARPS_PER_BLOCK warps
- * per block so every warp scheduler is fed and many independent rows' memory
- * loads overlap. The operands, order and rounding are unchanged, so the result
- * is bit-identical to the legacy kernel; only the launch geometry differs.
+ * The legacy ordered kernel launches one warp (32 threads) per output element
+ * (~2% achieved occupancy). This kernel keeps the EXACT same per-element
+ * arithmetic — 32 contiguous chunks, lane `tid` sums chunk `tid` left-to-right,
+ * then lane 0 combines partial[0..31] in ascending index order (a sequential
+ * left-fold) — but packs DET_F16_WARPS_PER_BLOCK warps per block. The operands,
+ * order and rounding are unchanged, so the result is bit-identical to the legacy
+ * kernel; only the launch geometry differs.
+ *
+ * NEGATIVE RESULT: raising occupancy this way is ~23% SLOWER on the box bench
+ * (gen 29.15 vs legacy 37.87). The chunked summation order forces a
+ * strided/uncoalesced weight read per warp; packing 8 such warps per block adds
+ * cache/HBM contention without adding bandwidth, so occupancy was not the
+ * bottleneck. Coalescing the read would require a different (strided-by-
+ * blockDim) summation order, which would change the result bits and break the
+ * router's bit-reproducibility — so the speedup is unattainable while preserving
+ * the exact order. This kernel is therefore opt-in (DS4_CUDA_DET_PARALLEL_F16=1),
+ * NOT the default. Retained for the record and future tuning.
  *
  * Determinism guards (do NOT change): no warp-shuffle/tree reduction, no atomics,
  * no half2/vectorized accumulation — any of those would reorder the adds and
@@ -7448,16 +7458,22 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     if (ordered_router) {
         /* The wide kernel is bit-identical to the legacy ordered kernel (same
-         * 32-chunk fixed-order arithmetic) but fills the SMs. It is the default
-         * for the ordered path; DS4_CUDA_LEGACY_ORDERED_F16=1 forces the old
-         * <<<grid,32>>> launch (reversibility). */
-        if (getenv("DS4_CUDA_LEGACY_ORDERED_F16") != NULL) {
-            matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-            return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
+         * 32-chunk fixed-order arithmetic) but packs 8 warps/block to raise SM
+         * occupancy. Empirically (box, 2x RTX 6000 Ada, IQ2XXS, canonical bench)
+         * it is ~23% SLOWER (gen 29.15 vs 37.87): the chunked summation order
+         * forces a strided/uncoalesced weight read, and packing more warps adds
+         * cache/HBM contention without adding bandwidth — occupancy was not the
+         * bottleneck. The legacy kernel therefore stays the DEFAULT; the wide
+         * kernel is opt-in behind DS4_CUDA_DET_PARALLEL_F16=1 (kept for the
+         * record / future tuning, NOT recommended on). See PR / plan for the
+         * full negative-result finding. */
+        if (getenv("DS4_CUDA_DET_PARALLEL_F16") != NULL) {
+            dim3 wide_grid((unsigned)((out_dim + DET_F16_WARPS_PER_BLOCK - 1u) / DET_F16_WARPS_PER_BLOCK), (unsigned)n_tok, 1);
+            matmul_f16_ordered_chunks_wide_kernel<<<wide_grid, 32u * DET_F16_WARPS_PER_BLOCK>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks_wide launch");
         }
-        dim3 wide_grid((unsigned)((out_dim + DET_F16_WARPS_PER_BLOCK - 1u) / DET_F16_WARPS_PER_BLOCK), (unsigned)n_tok, 1);
-        matmul_f16_ordered_chunks_wide_kernel<<<wide_grid, 32u * DET_F16_WARPS_PER_BLOCK>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-        return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks_wide launch");
+        matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
     }
     matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
@@ -7503,11 +7519,11 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_resolve_weight_ptr(model_map, weight0_offset, weight_bytes, logical_tier, "f16_pair0");
     const __half *w1 = (const __half *)cuda_resolve_weight_ptr(model_map, weight1_offset, weight_bytes, logical_tier, "f16_pair1");
     if (!w0 || !w1) return 0;
-    /* Wide (well-occupied) pair kernel is the default and is bit-identical to
-     * the legacy pair kernel; DS4_CUDA_LEGACY_ORDERED_F16=1 forces the old
-     * <<<out_dim,32>>> launch (reversibility, matches the GEMV path). */
-    if (getenv("DS4_CUDA_LEGACY_ORDERED_F16") != NULL) {
-        matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
+    /* Matches the GEMV path: the wide pair kernel is bit-identical to the legacy
+     * pair kernel but slower (see ds4_gpu_matmul_f16_tensor). Legacy is the
+     * DEFAULT; the wide kernel is opt-in behind DS4_CUDA_DET_PARALLEL_F16=1. */
+    if (getenv("DS4_CUDA_DET_PARALLEL_F16") != NULL) {
+        matmul_f16_pair_ordered_chunks_wide_kernel<<<(unsigned)((out_dim + DET_F16_WARPS_PER_BLOCK - 1u) / DET_F16_WARPS_PER_BLOCK), 32u * DET_F16_WARPS_PER_BLOCK>>>(
             (float *)out0->ptr,
             (float *)out1->ptr,
             w0,
@@ -7516,9 +7532,9 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
             in_dim,
             out_dim,
             out_dim);
-        return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+        return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks_wide launch");
     }
-    matmul_f16_pair_ordered_chunks_wide_kernel<<<(unsigned)((out_dim + DET_F16_WARPS_PER_BLOCK - 1u) / DET_F16_WARPS_PER_BLOCK), 32u * DET_F16_WARPS_PER_BLOCK>>>(
+    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
         w0,
@@ -7527,7 +7543,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         in_dim,
         out_dim,
         out_dim);
-    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks_wide launch");
+    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
