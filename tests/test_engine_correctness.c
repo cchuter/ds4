@@ -191,11 +191,13 @@ int main(void) {
     cfg.n_gpus = 2;
     cfg.device_indices[0] = 0;
     cfg.device_indices[1] = 1;
-    /* Small budgets — model + ctx=1024 KV fits comfortably even when
-     * other workloads are on the box. If actual free VRAM is lower the
-     * engine will refuse and the test SKIP_PASSes. */
-    cfg.vram_bytes[0] = (size_t)44ull * 1024ull * 1024ull * 1024ull;
-    cfg.vram_bytes[1] = (size_t)42ull * 1024ull * 1024ull * 1024ull;
+    /* Budgets sized to clear the per-tier graph overhead pre-subtract
+     * (~3.93 GiB at default ctx) plus the user-supplied safety margin
+     * plus cuBLAS workspace, then still fit the 80 GiB IQ2XXS model with
+     * room for ctx=1024 KV. If actual free VRAM is lower (other workloads
+     * on the box), the engine refuses upfront and this test SKIP_PASSes. */
+    cfg.vram_bytes[0] = (size_t)47ull * 1024ull * 1024ull * 1024ull;
+    cfg.vram_bytes[1] = (size_t)47ull * 1024ull * 1024ull * 1024ull;
     cfg.safety_margin_bytes = (size_t)1024u * 1024u * 1024u;
 
     ds4_engine *e2 = NULL;
