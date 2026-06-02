@@ -2439,35 +2439,31 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
     {
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-            /* During slab grow we briefly hold BOTH the old and new
-             * allocations (d2d copy below). Account for that. Plus a
-             * small safety to absorb any concurrent allocations made
-             * between this check and cudaMalloc. */
-            const size_t copy_overhead = (c.present && c.bytes > 0) ? c.bytes : 0;
-            /* 2 GiB safety covers what the engine will allocate AFTER the
-             * cache slab in the same session_create: the per-tier graph
-             * scratch (sized by engine_per_tier_graph_overhead_bytes for
-             * the budget but allocated as many separate cudaMallocs whose
-             * cumulative alignment overhead the planner can't predict),
+            /* free_b already excludes the existing slab (it's still
+             * allocated), so the additional cudaMalloc only needs
+             * new_bytes free — not new_bytes + c.bytes. The old slab is
+             * freed AFTER the d2d copy succeeds. 2 GiB safety covers what
+             * the engine will allocate AFTER the cache slab in the same
+             * session_create: per-tier graph scratch (the planner can't
+             * predict its cumulative cudaMalloc alignment overhead),
              * cuBLAS workspace beyond the 64 MiB the packer already
              * reserves, and driver-side allocator slack. Without this
              * headroom a borderline budget that fits the slab itself can
              * still OOM at the per-tier tensor allocations a few moments
              * later — same silent-late-OOM failure mode, one layer up. */
             const size_t safety = (size_t)2ull * 1024ull * 1024ull * 1024ull;
-            const size_t need = new_bytes + copy_overhead + safety;
+            const size_t need = new_bytes + safety;
             if (need > free_b) {
                 fprintf(stderr,
                         "ds4: device cache slab needs %.2f GiB on device %d "
-                        "but only %.2f GiB free (slab=%.2f GiB + d2d grow=%.2f GiB "
-                        "+ %.2f GiB safety). Lower --gpu-vram / --ctx-max, or use "
-                        "--gpu-vram auto on a host with more free VRAM. "
-                        "Refusing upfront to avoid late OOM at cudaMalloc.\n",
+                        "but only %.2f GiB free (slab=%.2f GiB + %.2f GiB safety). "
+                        "Lower --gpu-vram / --ctx-max, or use --gpu-vram auto on "
+                        "a host with more free VRAM. Refusing upfront to avoid "
+                        "late OOM at cudaMalloc.\n",
                         (double)need / 1073741824.0,
                         device_id,
                         (double)free_b / 1073741824.0,
                         (double)new_bytes / 1073741824.0,
-                        (double)copy_overhead / 1073741824.0,
                         (double)safety / 1073741824.0);
                 if (prev_device >= 0) (void)cudaSetDevice(prev_device);
                 return 5;
