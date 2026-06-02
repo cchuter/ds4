@@ -8250,15 +8250,35 @@ static int attention_decode_splitkv_launch(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim) {
-    /* n_tokens is fixed at 1 for the split path; compute the same logical row
-     * count the kernel will use so S is sized to the actual work. Use the
-     * single-token, head-independent upper bound (raw_count<=256 + visible_comp),
-     * which is identical across heads. */
+    /* n_tokens is fixed at 1 for the split path; compute the EXACT logical row
+     * count the kernel will use (raw_count + visible_comp) so S is sized to the
+     * real work. raw_count MUST apply the same window logic as the kernel /
+     * reference, otherwise a true-S==1 case (e.g. ratio=1, window=1, n_raw>=2,
+     * n_comp=0) could be over-estimated to S>1 and engage split-KV instead of
+     * the bit-exact old-kernel anchor. The count is head-independent. */
     const bool single_all = (ratio == 0u);
     uint32_t qpos = pos0;            /* t==0, n_tokens==1 */
+    uint32_t first_raw_pos = pos0 + 1u - n_raw;
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
-    uint32_t raw_count = n_raw > 256u ? 256u : n_raw;
+    uint32_t raw_count = 0;
+    if (n_raw != 0) {
+        const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (single_all) {
+            raw_count = n_raw > 256u ? 256u : n_raw;
+        } else if (qpos >= first_raw_pos) {
+            uint32_t lo = first_raw_pos;
+            if (window != 0 && qpos + 1u > window) {
+                const uint32_t wlo = qpos + 1u - window;
+                if (wlo > lo) lo = wlo;
+            }
+            const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+            if (hi >= lo) {
+                raw_count = hi - lo + 1u;
+                if (raw_count > 256u) raw_count = 256u;
+            }
+        }
+    }
     uint32_t n_score = raw_count + visible_comp;
     if (n_score == 0u) return 0;     /* nothing to do; let old path handle it */
     /* S = clamp(ceil(n_score / CHUNK), 1, S_MAX); raise to S_FLOOR for short
