@@ -591,10 +591,32 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
         return 512ull * 1048576ull;
     }
 
-    /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
-     * device memory free for cuBLAS workspaces, transient graph buffers, and
-     * driver bookkeeping instead of letting optional cached weights consume the
-     * last few GiB on 96 GiB cards. */
+    /* High-VRAM cards (>= 40 GiB, e.g. 48 GiB RTX 6000 Ada): use a small
+     * reserve so the selective Q8->F16 cache can actually engage at tight
+     * budgets (e.g. --gpu-vram 47,47, where the 81 GB model leaves only ~1.3
+     * GiB free and the old 4 GiB floor rejected every cache allocation,
+     * forcing the scalar DP4A prefill kernel).
+     *
+     * NOTE: this 768 MiB value is a *bounded cache-growth guard*, not a hard
+     * guarantee that live free VRAM stays >= 768 MiB.  cuda_q8_f16_cache_has_budget
+     * only blocks a *cache* allocation when free - request < reserve at that
+     * moment; allocations made outside cache accounting (cuda_tmp_alloc_on
+     * activation/prequant buffers, cuBLAS internal workspaces) can still dip
+     * below it.  768 MiB is chosen to leave headroom above the ~0.5 GiB
+     * memory-safety floor for those out-of-cache allocations; actual minimum
+     * free VRAM is verified by measurement, and the disable-after-failure path
+     * degrades gracefully if cuBLAS/alloc ever fails under pressure.  Set
+     * DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=4096 to restore the prior behavior. */
+    if (total_bytes >= 40ull * 1024ull * 1024ull * 1024ull) {
+        const uint64_t hi_min_reserve = 768ull * 1048576ull;
+        const uint64_t hi_pct_reserve = total_bytes / 100u; /* 1% */
+        return hi_pct_reserve > hi_min_reserve ? hi_pct_reserve : hi_min_reserve;
+    }
+
+    /* Smaller cards (< 40 GiB): keep the conservative reserve.  The expanded
+     * Q8->F16 cache is only an acceleration path; on a small card a sub-GiB
+     * reserve would be a large fraction of total VRAM, so keep enough free for
+     * cuBLAS workspaces, transient graph buffers, and driver bookkeeping. */
     const uint64_t min_reserve = 4096ull * 1048576ull;
     const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
     return pct_reserve > min_reserve ? pct_reserve : min_reserve;
