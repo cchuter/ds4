@@ -9961,6 +9961,19 @@ __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_hwarp16_kernel(
     }
 }
 
+// perf-04: launch-geometry tuning for the routed-MoE gate/up decode kernels
+// (moe_gate_up_mid_qwarp32 / _decode_lut_qwarp32 / _decode_q4K_qwarp32). Each
+// block processes MOE_DECODE_ROW_TILES tiles of 32 rows (row_lane in [0,32)).
+// The historical value was 4 (128 rows/block -> ~96 blocks, occupancy ~16%,
+// "grid too small to fill the device"). Lowering it issues correspondingly more
+// blocks (e.g. 1 tile -> 32 rows/block -> ~4x more blocks -> ~384) to fill the
+// SMs. The per-row arithmetic is identical regardless of this value, so output
+// is bit-identical; only the qgrid.x divisor must match MOE_DECODE_ROWS_PER_BLOCK.
+#ifndef MOE_DECODE_ROW_TILES
+#define MOE_DECODE_ROW_TILES 1u
+#endif
+#define MOE_DECODE_ROWS_PER_BLOCK (32u * MOE_DECODE_ROW_TILES)
+
 __global__ static void moe_gate_up_mid_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -9985,8 +9998,8 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+    for (uint32_t rr = 0; rr < MOE_DECODE_ROW_TILES; rr++) {
+        uint32_t row = blockIdx.x * MOE_DECODE_ROWS_PER_BLOCK + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
         const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -10047,8 +10060,8 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         __syncthreads();
         xqb = sxq;
     }
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+    for (uint32_t rr = 0; rr < MOE_DECODE_ROW_TILES; rr++) {
+        uint32_t row = blockIdx.x * MOE_DECODE_ROWS_PER_BLOCK + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
         const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -10802,8 +10815,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+    for (uint32_t rr = 0; rr < MOE_DECODE_ROW_TILES; rr++) {
+        uint32_t row = blockIdx.x * MOE_DECODE_ROWS_PER_BLOCK + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
         const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -11784,7 +11797,7 @@ static int routed_moe_launch(
                     n_expert,
                     clamp);
             } else if (ok) {
-                dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
+                dim3 qgrid((expert_mid_dim + MOE_DECODE_ROWS_PER_BLOCK - 1u) / MOE_DECODE_ROWS_PER_BLOCK, n_tokens * n_expert, 1);
                 if (use_decode_lut_gate && q4k_path) {
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
