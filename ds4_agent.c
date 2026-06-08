@@ -1,6 +1,8 @@
 #include "ds4.h"
 #include "ds4_gpu_args.h"
 #include "ds4_gpu_mgpu.h"
+#include "ds4_distributed.h"
+#include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
 #include "linenoise.h"
@@ -75,6 +77,7 @@ typedef enum {
     AGENT_WORKER_PREFILL,
     AGENT_WORKER_GENERATING,
     AGENT_WORKER_COMPACTING,
+    AGENT_WORKER_DRAINING,
     AGENT_WORKER_SAVING,
     AGENT_WORKER_ERROR,
     AGENT_WORKER_STOPPED,
@@ -85,8 +88,10 @@ typedef struct {
     int prefill_done;
     int prefill_total;
     unsigned prefill_label;
+    double prefill_tps;
     int generated;
     double gen_tps;
+    bool greedy_sampling;
     int ctx_used;
     int ctx_size;
     int power_percent;
@@ -122,6 +127,7 @@ typedef struct {
     bool power_requested;
     int requested_power;
     int progress_base;
+    double progress_started_at;
     int last_system_prompt_reminder_at;
     char *cmd_text;
     agent_status status;
@@ -241,6 +247,7 @@ typedef struct {
     char *param_name;
     bool param_is_string;
     size_t param_value_start;
+    bool param_close_prefix;
     agent_tool_calls calls;
     char error[160];
 } agent_dsml_parser;
@@ -278,6 +285,11 @@ typedef struct {
 } agent_tool_visualizer;
 
 typedef struct {
+    char tail[32];
+    size_t len;
+} agent_dsml_marker_detector;
+
+typedef struct {
     agent_token_renderer *renderer;
     agent_dsml_parser *parser;
     agent_tool_visualizer viz;
@@ -289,8 +301,8 @@ typedef struct {
     size_t pending_len;
     char dsml_start_tail[64];
     size_t dsml_start_len;
-    char think_dsml_tail[32];
-    size_t think_dsml_len;
+    agent_dsml_marker_detector plain_dsml;
+    agent_dsml_marker_detector think_dsml;
     bool dsml_in_think;
     bool dsml_in_think_reported;
     bool post_think_gap;
@@ -489,60 +501,8 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-agent [options]\n"
-        "\n"
-        "This is an experimental native DS4 agent MVP. It keeps the terminal\n"
-        "responsive with linenoise's multiplexed API while a model worker owns\n"
-        "the live KV session.\n"
-        "\n"
-        "Options:\n"
-        "  -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE             Optional MTP support GGUF.\n"
-        "  --mtp-draft N          Maximum MTP draft tokens. Default: 1\n"
-        "  --mtp-margin F         MTP verifier margin. Default: 3\n"
-        "  -c, --ctx N            Context size. Default: 100000\n"
-        "  -n, --tokens N         Max generated tokens per turn. Default: 50000\n"
-        "  -p, --prompt TEXT      Submit an initial prompt after startup.\n"
-        "  --non-interactive      Run without the TUI. With -p: one turn and exit;\n"
-        "                         without -p: read repeated prompts from stdin.\n"
-        "  -sys, --system TEXT    Extra system prompt. Empty disables extra text.\n"
-        "  --trace FILE           Write prompt, token, and DSML debug trace.\n"
-        "  --temp F               Sampling temperature. Default: 1\n"
-        "  --top-p F              Nucleus sampling probability. Default: 1\n"
-        "  --min-p F              Min-p sampling threshold. Default: 0.05\n"
-        "  --seed N               Sampling seed.\n"
-        "  --think                Use normal thinking mode. Default.\n"
-        "  --think-max            Use Think Max when context is large enough.\n"
-        "  --nothink              Disable thinking.\n"
-        "  --backend NAME         metal, cuda, or cpu.\n"
-        "  --metal, --cuda, --cpu Select backend explicitly.\n"
-        "  --gpu-vram N[,N,...]   Per-device VRAM budget in GB (comma-separated for\n"
-        "                         multi-GPU). \"auto\" detects free VRAM. \"0\" forces CPU.\n"
-        "  --gpu-devices N[,N,...] Restrict to listed CUDA device indices.\n"
-        "  -t, --threads N        CPU helper threads.\n"
-        "  --chdir DIR            Change working directory before loading runtime assets.\n"
-        "  --quality              Prefer exact kernels where available.\n"
-        "  --warm-weights         Touch mapped tensor pages before generation.\n"
-        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "  --dir-steering-file FILE\n"
-        "  --dir-steering-ffn F\n"
-        "  --dir-steering-attn F\n"
-        "  -h, --help             Show this help.\n"
-        "\n"
-        "Commands:\n"
-        "  /help                  Show runtime help.\n"
-        "  /save                  Save the current agent session.\n"
-        "  /compact               Compact the current session context now.\n"
-        "  /list                  List saved sessions in ~/.ds4/kvcache.\n"
-        "  /switch SHA            Load a saved session and show recent history.\n"
-        "  /del SHA               Delete a saved session.\n"
-        "  /strip SHA             Remove KV payload from a saved session.\n"
-        "  /history [N]           Show N recent user turns from the current session.\n"
-        "  /power N               Set GPU duty cycle percentage, 1..100.\n"
-        "  /new                   Start a fresh session from the system prompt.\n"
-        "  /quit, /exit           Exit.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_AGENT, topic);
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -576,9 +536,29 @@ static agent_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
-        } else if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.engine.distributed,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-agent: %s\n",
+                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
@@ -630,6 +610,42 @@ static agent_config parse_options(int argc, char **argv) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--ssd-streaming")) {
+            c.engine.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4-agent: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_cache_experts = experts;
+            c.engine.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-agent: --ssd-streaming-preload-experts must be positive\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--simulate-used-memory")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.engine.simulate_used_memory_bytes)) {
+                fprintf(stderr,
+                        "ds4-agent: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-agent: --prefill-chunk must be positive\n");
+                exit(2);
+            }
+            c.engine.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
@@ -648,18 +664,35 @@ static agent_config parse_options(int argc, char **argv) {
             steering_scale_set = true;
         } else {
             fprintf(stderr, "ds4-agent: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
+                                        &c.engine,
+                                        dist_err,
+                                        sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-agent: %s\n", dist_err);
+        exit(2);
+    }
+    if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
     return c;
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
-    ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+static void log_context_memory(ds4_backend backend,
+                               int         ctx_size,
+                               uint32_t    prefill_chunk) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill(backend,
+                                                 ctx_size,
+                                                 prefill_chunk);
     fprintf(stderr,
             "ds4-agent: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -1093,6 +1126,10 @@ static bool worker_is_idle(agent_worker *w);
 static void agent_set_status(agent_worker *w, agent_worker_state state) {
     pthread_mutex_lock(&w->mu);
     w->status.state = state;
+    if (state != AGENT_WORKER_PREFILL)
+        w->status.prefill_tps = 0.0;
+    if (state != AGENT_WORKER_GENERATING)
+        w->status.greedy_sampling = false;
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
 }
@@ -1100,6 +1137,8 @@ static void agent_set_status(agent_worker *w, agent_worker_state state) {
 static void agent_set_error(agent_worker *w, const char *msg) {
     pthread_mutex_lock(&w->mu);
     w->status.state = AGENT_WORKER_ERROR;
+    w->status.prefill_tps = 0.0;
+    w->status.greedy_sampling = false;
     snprintf(w->status.error, sizeof(w->status.error), "%s", msg ? msg : "unknown error");
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -1307,6 +1346,15 @@ static void agent_dsml_set_error(agent_dsml_parser *p, const char *msg) {
     snprintf(p->error, sizeof(p->error), "%s", msg);
 }
 
+static bool agent_dsml_open_tag_is(const char *tag, const char *name) {
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "<｜DSML｜%s", name);
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(tag, prefix, prefix_len) != 0) return false;
+    char c = tag[prefix_len];
+    return c == '>' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
 static bool agent_dsml_close_tag_at(const char *s, const char *name, size_t *tag_len) {
     char prefix[64];
     static const char dsml_bar[] = "｜";
@@ -1320,6 +1368,63 @@ static bool agent_dsml_close_tag_at(const char *s, const char *name, size_t *tag
     if (*p != '>') return false;
     if (tag_len) *tag_len = (size_t)(p - s) + 1;
     return true;
+}
+
+/* Recognize a streamed parameter close tag prefix.  Full close detection is
+ * handled by agent_dsml_close_tag_at(); this helper exists for online behavior:
+ * terminal rendering must hide partial close tags without waiting for the whole
+ * parameter to finish. */
+static bool agent_dsml_parameter_close_tail(const char *tail, size_t len,
+                                            bool *complete) {
+    static const char prefix[] = "</｜DSML｜parameter";
+    static const char dsml_bar[] = "｜";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    const size_t bar_len = sizeof(dsml_bar) - 1;
+    *complete = false;
+    if (len <= prefix_len) return memcmp(prefix, tail, len) == 0;
+    if (memcmp(prefix, tail, prefix_len) != 0) return false;
+    size_t i = prefix_len;
+    while (i < len && (tail[i] == ' ' || tail[i] == '\t' ||
+                       tail[i] == '\r' || tail[i] == '\n')) i++;
+    if (i < len && len - i <= bar_len) {
+        if (memcmp(dsml_bar, tail + i, len - i) == 0) return true;
+    }
+    if (i + bar_len <= len && memcmp(tail + i, dsml_bar, bar_len) == 0)
+        i += bar_len;
+    for (; i < len; i++) {
+        if (tail[i] == '>') {
+            *complete = i == len - 1;
+            return *complete;
+        }
+        if (tail[i] != ' ' && tail[i] != '\t' && tail[i] != '\r' && tail[i] != '\n')
+            return false;
+    }
+    return true;
+}
+
+static void agent_dsml_update_param_close_prefix(agent_dsml_parser *p) {
+    p->param_close_prefix = false;
+    if (p->state != AGENT_DSML_PARAM_VALUE || p->raw_len <= p->param_value_start)
+        return;
+
+    const char *value = p->raw + p->param_value_start;
+    const char *end = p->raw + p->raw_len;
+    const char *lt = end;
+    while (lt > value) {
+        lt--;
+        if (*lt == '<') break;
+    }
+    if (lt < value || *lt != '<') return;
+
+    size_t tail_len = (size_t)(end - lt);
+    if (tail_len > 64) return;
+    bool complete = false;
+    static const char dsml_marker[] = "</｜DSML｜";
+    p->param_close_prefix =
+        tail_len >= sizeof(dsml_marker) - 1 &&
+        memcmp(lt, dsml_marker, sizeof(dsml_marker) - 1) == 0 &&
+        agent_dsml_parameter_close_tail(lt, tail_len, &complete) &&
+        !complete;
 }
 
 /* Find a DSML closing tag while accepting the few harmless closing-tag variants
@@ -1339,9 +1444,6 @@ static char *agent_dsml_find_close_tag(const char *s, const char *name, size_t *
  * until enough bytes arrive, while malformed completed input switches to
  * AGENT_DSML_ERROR so the model gets a retryable tool error. */
 static void agent_dsml_parse(agent_dsml_parser *p) {
-    static const char invoke_start[] = "<｜DSML｜invoke";
-    static const char param_start[] = "<｜DSML｜parameter";
-
     while (p->state == AGENT_DSML_STRUCTURAL || p->state == AGENT_DSML_PARAM_VALUE) {
         if (p->state == AGENT_DSML_PARAM_VALUE) {
             size_t end_tag_len = 0;
@@ -1352,6 +1454,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
                                     p->raw + p->param_value_start,
                                     (size_t)(end - (p->raw + p->param_value_start)),
                                     p->param_is_string);
+            p->param_close_prefix = false;
             free(p->param_name);
             p->param_name = NULL;
             p->parse_pos = (size_t)(end - p->raw) + end_tag_len;
@@ -1383,7 +1486,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
         size_t tag_len = (size_t)(tag_end - (p->raw + p->parse_pos)) + 1;
         char *tag = xstrndup(p->raw + p->parse_pos, tag_len);
 
-        if (!strncmp(tag, invoke_start, strlen(invoke_start))) {
+        if (agent_dsml_open_tag_is(tag, "invoke")) {
             agent_tool_call_free(&p->current);
             p->current.name = agent_parse_attr(tag, "name");
             if (!p->current.name) {
@@ -1392,7 +1495,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
                 return;
             }
             p->parse_pos += tag_len;
-        } else if (!strncmp(tag, param_start, strlen(param_start))) {
+        } else if (agent_dsml_open_tag_is(tag, "parameter")) {
             free(p->param_name);
             p->param_name = agent_parse_attr(tag, "name");
             char *is_string = agent_parse_attr(tag, "string");
@@ -1405,6 +1508,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
             }
             p->parse_pos += tag_len;
             p->param_value_start = p->parse_pos;
+            p->param_close_prefix = false;
             p->state = AGENT_DSML_PARAM_VALUE;
         } else {
             snprintf(p->error, sizeof(p->error), "unexpected DSML tag: %.*s",
@@ -1445,6 +1549,10 @@ static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n) {
 
         agent_dsml_raw_append(p, &c, 1);
         agent_dsml_parse(p);
+        if (p->state == AGENT_DSML_PARAM_VALUE)
+            agent_dsml_update_param_close_prefix(p);
+        else
+            p->param_close_prefix = false;
     }
 }
 
@@ -2930,33 +3038,6 @@ static void agent_tool_viz_restore_param_color(agent_stream_renderer *sr) {
     renderer_color(sr->renderer, agent_tool_param_color(v->param_kind));
 }
 
-static bool agent_tool_viz_param_end_tail(const char *tail, size_t len, bool *complete) {
-    static const char prefix[] = "</｜DSML｜parameter";
-    static const char dsml_bar[] = "｜";
-    const size_t prefix_len = sizeof(prefix) - 1;
-    const size_t bar_len = sizeof(dsml_bar) - 1;
-    *complete = false;
-    if (len <= prefix_len) return memcmp(prefix, tail, len) == 0;
-    if (memcmp(prefix, tail, prefix_len) != 0) return false;
-    size_t i = prefix_len;
-    while (i < len && (tail[i] == ' ' || tail[i] == '\t' ||
-                       tail[i] == '\r' || tail[i] == '\n')) i++;
-    if (i < len && len - i <= bar_len) {
-        if (memcmp(dsml_bar, tail + i, len - i) == 0) return true;
-    }
-    if (i + bar_len <= len && memcmp(tail + i, dsml_bar, bar_len) == 0)
-        i += bar_len;
-    for (; i < len; i++) {
-        if (tail[i] == '>') {
-            *complete = i == len - 1;
-            return *complete;
-        }
-        if (tail[i] != ' ' && tail[i] != '\t' && tail[i] != '\r' && tail[i] != '\n')
-            return false;
-    }
-    return true;
-}
-
 /* Stream one DSML parameter byte into the visualizer.  The visualizer must not
  * wait for the whole parameter: large write/edit contents should show progress
  * as the model emits them, while still detecting the closing parameter tag. */
@@ -2977,7 +3058,7 @@ static void agent_tool_viz_param_value_byte(agent_stream_renderer *sr, char c) {
         if (v->param_end_len < sizeof(v->param_end_tail))
             v->param_end_tail[v->param_end_len++] = c;
         bool complete = false;
-        if (agent_tool_viz_param_end_tail(v->param_end_tail, v->param_end_len, &complete)) {
+        if (agent_dsml_parameter_close_tail(v->param_end_tail, v->param_end_len, &complete)) {
             if (complete) agent_tool_viz_param_end(sr);
             return;
         }
@@ -3045,6 +3126,22 @@ static void agent_stream_finish_ignored_dsml(agent_stream_renderer *sr, const ch
     agent_dsml_parser_reset(sr->parser);
     sr->dsml_active = false;
     sr->dsml_ignored = false;
+}
+
+static void agent_stream_malformed_dsml(agent_stream_renderer *sr,
+                                        const char *detail) {
+    const char *msg = detail && detail[0] ? detail :
+        "DSML markup outside a valid tool_calls block";
+    if (sr->parser->state == AGENT_DSML_ERROR) return;
+    agent_dsml_set_error(sr->parser, msg);
+    agent_trace(sr->renderer->worker, "malformed dsml in assistant output: %s", msg);
+    if (!sr->renderer->last_output_newline)
+        renderer_plain(sr->renderer, "\n", 1);
+    renderer_color(sr->renderer, "\x1b[1;31m");
+    renderer_plain(sr->renderer, "[invalid tool call: ", 20);
+    renderer_plain(sr->renderer, msg, strlen(msg));
+    renderer_plain(sr->renderer, "]\n", 2);
+    renderer_color(sr->renderer, "\x1b[0m");
 }
 
 /* Mirror parser progress into the terminal visualizer.  Parser state is the
@@ -3151,24 +3248,42 @@ static void agent_stream_start_dsml(agent_stream_renderer *sr, bool ignored) {
     }
 }
 
+static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr, char c);
+
 static void agent_stream_flush_start_tail(agent_stream_renderer *sr) {
     if (!sr->dsml_start_len) return;
     sr->post_think_gap = false;
-    for (size_t i = 0; i < sr->dsml_start_len; i++)
+    for (size_t i = 0; i < sr->dsml_start_len; i++) {
         renderer_write_char(sr->renderer, sr->dsml_start_tail[i]);
+        agent_stream_note_plain_dsml_byte(sr, sr->dsml_start_tail[i]);
+        if (sr->parser->state == AGENT_DSML_ERROR) break;
+    }
     sr->dsml_start_len = 0;
 }
 
 static bool agent_stream_dsml_start_match(const char *tail, size_t len,
-                                          bool *complete) {
+                                          bool *complete,
+                                          bool *implicit_invoke) {
     static const char canonical[] = "<｜DSML｜tool_calls>";
     static const char missing_bar[] = "<DSML｜tool_calls>";
-    const char *forms[] = {canonical, missing_bar};
+    static const char invoke[] = "<｜DSML｜invoke";
+    static const char invoke_missing_bar[] = "<DSML｜invoke";
+    struct {
+        const char *text;
+        bool implicit_invoke;
+    } forms[] = {
+        {canonical, false},
+        {missing_bar, false},
+        {invoke, true},
+        {invoke_missing_bar, true},
+    };
     *complete = false;
+    *implicit_invoke = false;
     for (size_t i = 0; i < sizeof(forms)/sizeof(forms[0]); i++) {
-        size_t form_len = strlen(forms[i]);
-        if (len <= form_len && memcmp(forms[i], tail, len) == 0) {
+        size_t form_len = strlen(forms[i].text);
+        if (len <= form_len && memcmp(forms[i].text, tail, len) == 0) {
             *complete = len == form_len;
+            *implicit_invoke = forms[i].implicit_invoke;
             return true;
         }
     }
@@ -3181,23 +3296,47 @@ static bool agent_tail_matches(const char *tail, size_t len,
            memcmp(tail + len - needle_len, needle, needle_len) == 0;
 }
 
-static void agent_stream_note_thinking_byte(agent_stream_renderer *sr, char c) {
-    if (!sr->in_think || sr->dsml_in_think) return;
-    if (sr->think_dsml_len == sizeof(sr->think_dsml_tail)) {
-        memmove(sr->think_dsml_tail, sr->think_dsml_tail + 1,
-                sizeof(sr->think_dsml_tail) - 1);
-        sr->think_dsml_len--;
+/* Detect DSML-looking control markers in text that is not currently owned by
+ * the executable DSML parser.  This helper intentionally has no policy: inside
+ * <think> the marker means "tool call attempted too early", while in normal
+ * assistant output it means malformed DSML that the model should see as a tool
+ * error. */
+static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
+                                            char c) {
+    if (d->len == sizeof(d->tail)) {
+        memmove(d->tail, d->tail + 1, sizeof(d->tail) - 1);
+        d->len--;
     }
-    sr->think_dsml_tail[sr->think_dsml_len++] = c;
+    d->tail[d->len++] = c;
 
     static const char fullwidth_marker[] = "｜DSML｜";
     static const char ascii_marker[] = "|DSML|";
-    if (agent_tail_matches(sr->think_dsml_tail, sr->think_dsml_len,
-                           fullwidth_marker, sizeof(fullwidth_marker) - 1) ||
-        agent_tail_matches(sr->think_dsml_tail, sr->think_dsml_len,
-                           ascii_marker, sizeof(ascii_marker) - 1))
-    {
+    static const char missing_open[] = "<DSML｜";
+    static const char missing_close[] = "</DSML｜";
+    return agent_tail_matches(d->tail, d->len,
+                              fullwidth_marker, sizeof(fullwidth_marker) - 1) ||
+           agent_tail_matches(d->tail, d->len,
+                              ascii_marker, sizeof(ascii_marker) - 1) ||
+           agent_tail_matches(d->tail, d->len,
+                              missing_open, sizeof(missing_open) - 1) ||
+           agent_tail_matches(d->tail, d->len,
+                              missing_close, sizeof(missing_close) - 1);
+}
+
+static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
+                                                 char c) {
+    if (!sr->in_think || sr->dsml_in_think) return;
+    if (agent_dsml_marker_detector_feed(&sr->think_dsml, c))
         sr->dsml_in_think = true;
+}
+
+static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
+                                              char c) {
+    if (sr->parser->state == AGENT_DSML_ERROR) return;
+    if (sr->dsml_active || sr->in_think || sr->dsml_in_think) return;
+    if (agent_dsml_marker_detector_feed(&sr->plain_dsml, c)) {
+        agent_stream_malformed_dsml(
+            sr, "DSML markup outside a valid tool_calls block");
     }
 }
 
@@ -3206,7 +3345,9 @@ static void agent_stream_note_thinking_byte(agent_stream_renderer *sr, char c) {
  * can split "<｜DSML｜tool_calls>" across arbitrary tokens. */
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     static const char start[] = "<｜DSML｜tool_calls>";
-    agent_stream_note_thinking_byte(sr, c);
+    static const char canonical_invoke[] = "<｜DSML｜invoke";
+    if (sr->parser->state == AGENT_DSML_ERROR) return;
+    agent_stream_note_thinking_dsml_byte(sr, c);
 
     /* DeepSeek usually emits one or more blank lines after </think> before
      * either prose or a DSML tool stanza.  At that point the bytes are just a
@@ -3223,16 +3364,22 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     if (sr->dsml_start_len || c == start[0]) {
         if (sr->dsml_start_len < sizeof(sr->dsml_start_tail))
             sr->dsml_start_tail[sr->dsml_start_len++] = c;
-        bool complete = false;
+        bool complete = false, implicit_invoke = false;
         if (agent_stream_dsml_start_match(sr->dsml_start_tail, sr->dsml_start_len,
-                                          &complete))
+                                          &complete, &implicit_invoke))
         {
             if (complete) {
                 /* Accept the common missing-leading-bar typo
                  * "<DSML｜tool_calls>" here, but seed the parser with the
                  * canonical marker so the rest of the DSML parser stays
-                 * strict and simple. */
+                 * strict and simple.  Also accept a direct invoke opener as an
+                 * implicit tool_calls block; the model often knows it wants a
+                 * tool but forgets the outer wrapper. */
                 agent_stream_start_dsml(sr, sr->in_think);
+                if (implicit_invoke) {
+                    for (size_t i = 0; i < sizeof(canonical_invoke) - 1; i++)
+                        agent_stream_feed_dsml_byte(sr, canonical_invoke[i]);
+                }
             }
             return;
         }
@@ -3241,8 +3388,15 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
         {
             sr->post_think_gap = false;
             size_t flush = sr->dsml_start_len - 1;
-            for (size_t i = 0; i < flush; i++)
+            for (size_t i = 0; i < flush; i++) {
                 renderer_write_char(sr->renderer, sr->dsml_start_tail[i]);
+                agent_stream_note_plain_dsml_byte(sr, sr->dsml_start_tail[i]);
+                if (sr->parser->state == AGENT_DSML_ERROR) break;
+            }
+            if (sr->parser->state == AGENT_DSML_ERROR) {
+                sr->dsml_start_len = 0;
+                return;
+            }
             sr->dsml_start_tail[0] = start[0];
             sr->dsml_start_len = 1;
             return;
@@ -3253,6 +3407,7 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
 
     sr->post_think_gap = false;
     renderer_write_char(sr->renderer, c);
+    agent_stream_note_plain_dsml_byte(sr, c);
 }
 
 /* This is the single streaming display state machine for assistant output.  It
@@ -3365,6 +3520,9 @@ static void worker_progress_cb(void *ud, const char *event, int current, int tot
     if (done < 0) done = 0;
     if (done > w->status.prefill_total) done = w->status.prefill_total;
     w->status.prefill_done = done;
+    double elapsed = now_sec() - w->progress_started_at;
+    w->status.prefill_tps =
+        done > 0 && elapsed > 0.0 ? (double)done / elapsed : 0.0;
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
 }
@@ -3374,6 +3532,24 @@ static bool worker_should_interrupt(agent_worker *w) {
     bool interrupt = w->interrupt || w->stop;
     pthread_mutex_unlock(&w->mu);
     return interrupt;
+}
+
+/* Ctrl+C is a latched request consumed by the worker.  Once an interrupted
+ * operation has reached a stable append-only boundary and is about to publish
+ * IDLE, the request must be acknowledged; otherwise the editor can observe an
+ * idle worker with a stale interrupt still pending. */
+static void worker_clear_interrupt(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->interrupt = false;
+    pthread_mutex_unlock(&w->mu);
+}
+
+static bool agent_err_is_interrupted(const char *err) {
+    return err && !strcmp(err, "interrupted");
+}
+
+static bool worker_cancel_session_cb(void *ud) {
+    return worker_should_interrupt(ud);
 }
 
 typedef struct {
@@ -3743,12 +3919,16 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     if (sha_out) memcpy(sha_out, sha, sizeof(sha));
 
-    uint64_t payload_bytes = ds4_session_payload_bytes(w->session);
-    if (payload_bytes == 0) {
-        snprintf(err, err_len, "session has no valid KV payload");
+    ds4_session_payload_file staged = {0};
+    char save_err[160] = {0};
+    if (ds4_session_stage_payload(w->session, &staged,
+                                  save_err, sizeof(save_err)) != 0) {
+        snprintf(err, err_len, "%s",
+                 save_err[0] ? save_err : "session has no valid KV payload");
         free(text);
         return false;
     }
+    uint64_t payload_bytes = staged.bytes;
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -3757,6 +3937,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     int fd = mkstemp(tmp);
     if (fd < 0) {
         snprintf(err, err_len, "%s", strerror(errno));
+        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
@@ -3767,6 +3948,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "%s", strerror(errno));
         close(fd);
         unlink(tmp);
+        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
@@ -3782,13 +3964,12 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
 
-    char save_err[160] = {0};
     errno = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_save_payload(w->session, fp,
-                                       save_err, sizeof(save_err)) == 0 &&
+              ds4_session_write_staged_payload(&staged, fp,
+                                               save_err, sizeof(save_err)) == 0 &&
               (!session_identity ||
                agent_kv_write_title_trailer(fp, session_title,
                                             save_err, sizeof(save_err))) &&
@@ -3809,6 +3990,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         unlink(tmp);
     }
 
+    ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     return ok;
@@ -3825,13 +4007,35 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
     if (w->cfg->non_interactive) return;
     if (isatty(STDOUT_FILENO)) {
-        agent_publish(w, "\x1b[1;33m", strlen("\x1b[1;33m"));
+        static const char marker[] = "\x1b[33m✦ \x1b[38;5;218m";
+        agent_publish(w, marker, sizeof(marker) - 1);
         agent_publish(w, msg, strlen(msg));
         agent_publish(w, "\x1b[0m\n", strlen("\x1b[0m\n"));
     } else {
+        agent_publish(w, "✦ ", strlen("✦ "));
         agent_publish(w, msg, strlen(msg));
         agent_publish(w, "\n", 1);
     }
+}
+
+static void agent_publishf_system_status(agent_worker *w, const char *fmt, ...) {
+    char stack[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(stack, sizeof(stack), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if ((size_t)n < sizeof(stack)) {
+        agent_publish_system_status(w, stack);
+        return;
+    }
+
+    char *heap = xmalloc((size_t)n + 1);
+    va_start(ap, fmt);
+    vsnprintf(heap, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    agent_publish_system_status(w, heap);
+    free(heap);
 }
 
 static int agent_web_confirm(void *privdata, const char *message,
@@ -3851,9 +4055,15 @@ static int agent_web_confirm(void *privdata, const char *message,
     snprintf(w->web_approval_message, sizeof(w->web_approval_message),
              "%s", message ? message : "Start visible Chrome browser? (y/n) ");
     agent_wake_locked(w);
-    while (!w->stop && !w->web_approval_answered)
+    while (!w->stop && !w->interrupt && !w->web_approval_answered)
         pthread_cond_wait(&w->cond, &w->mu);
     bool ok = w->web_approval_result;
+    if (!w->web_approval_answered && (w->stop || w->interrupt)) {
+        ok = false;
+        w->web_approval_pending = false;
+        snprintf(w->web_approval_error, sizeof(w->web_approval_error),
+                 "interrupted");
+    }
     if (!ok) {
         snprintf(err, err_len, "%s",
                  w->web_approval_error[0] ? w->web_approval_error :
@@ -3867,6 +4077,10 @@ static void agent_web_log(void *privdata, const char *message) {
     agent_worker *w = privdata;
     if (!w || !message || !message[0]) return;
     agent_trace(w, "web: %s", message);
+}
+
+static bool agent_web_cancel(void *privdata) {
+    return worker_should_interrupt(privdata);
 }
 
 static bool worker_take_web_approval_request(agent_worker *w,
@@ -3954,9 +4168,11 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
             w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
+        w->progress_started_at = now_sec();
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
         w->status.prefill_label = prefill_label;
+        w->status.prefill_tps = 0.0;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
         agent_wake_locked(w);
@@ -3968,7 +4184,9 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     ds4_session_set_display_progress(w->session,
                                      publish_progress ? worker_progress_cb : NULL,
                                      publish_progress ? w : NULL);
+    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
     int rc = ds4_session_sync(w->session, tokens, err, err_len);
+    ds4_session_set_cancel(w->session, NULL, NULL);
     ds4_session_set_progress(w->session, NULL, NULL);
     ds4_session_set_display_progress(w->session, NULL, NULL);
     return rc;
@@ -4048,8 +4266,10 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     w->status.state = AGENT_WORKER_IDLE;
     w->status.prefill_done = 0;
     w->status.prefill_total = 0;
+    w->status.prefill_tps = 0.0;
     w->status.generated = 0;
     w->status.gen_tps = 0.0;
+    w->status.greedy_sampling = false;
     w->status.error[0] = '\0';
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -4058,6 +4278,55 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     free(text);
     ds4_tokens_free(&sys);
     return true;
+}
+
+static bool agent_worker_should_stop(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool stop = w->stop;
+    pthread_mutex_unlock(&w->mu);
+    return stop;
+}
+
+static bool agent_worker_wait_distributed_route(agent_worker *w, char *err, size_t err_len) {
+    if (!w || !w->cfg ||
+        w->cfg->engine.distributed.role != DS4_DISTRIBUTED_COORDINATOR)
+        return true;
+
+    char last[160] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(w->session, err, err_len);
+        if (ready > 0) {
+            if (ticks != 0) {
+                if (w->cfg->non_interactive)
+                    fprintf(stderr, "ds4-agent: distributed route ready\n");
+                else
+                    agent_publish_system_status(w, "Distributed route ready.");
+            }
+            if (err_len) err[0] = '\0';
+            return true;
+        }
+        if (ready < 0) return false;
+
+        const char *why = err && err[0] ? err : "route incomplete";
+        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
+            if (w->cfg->non_interactive) {
+                fprintf(stderr, "ds4-agent: waiting for distributed route: %s\n", why);
+            } else {
+                char msg[224];
+                snprintf(msg, sizeof(msg), "Waiting for distributed route: %s", why);
+                agent_publish_system_status(w, msg);
+            }
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        if (agent_worker_should_stop(w)) {
+            snprintf(err, err_len, "agent stopped while waiting for distributed route");
+            return false;
+        }
+        nanosleep(&delay, NULL);
+        ticks++;
+    }
 }
 
 static bool agent_worker_has_user_session(agent_worker *w) {
@@ -4335,9 +4604,34 @@ static bool agent_history_has_prefix(const char *p, const char *end,
     return (size_t)(end - p) >= n && memcmp(p, prefix, n) == 0;
 }
 
+/* Tool messages are rendered as user turns in the transcript.  Return the
+ * inner payload for the current <tool_result> wrapper so /history skips these
+ * pseudo-user turns and displays their content without leaking the wrapper. */
+static bool agent_history_tool_result_payload(const char **p, const char **end) {
+    const char *s = *p, *e = *end;
+    agent_history_trim(&s, &e);
+
+    const char *open = "<tool_result>";
+    const char *close = "</tool_result>";
+    const size_t open_len = strlen(open);
+    const size_t close_len = strlen(close);
+    if (!agent_history_has_prefix(s, e, open)) return false;
+
+    s += open_len;
+    if ((size_t)(e - s) >= close_len &&
+        memcmp(e - close_len, close, close_len) == 0)
+    {
+        e -= close_len;
+    }
+    *p = s;
+    *end = e;
+    return true;
+}
+
 static bool agent_history_is_tool_user(const char *p, const char *end) {
     agent_history_trim(&p, &end);
-    return agent_history_has_prefix(p, end, "Tool:") ||
+    return agent_history_tool_result_payload(&p, &end) ||
+           agent_history_has_prefix(p, end, "Tool:") ||
            agent_history_has_prefix(p, end, "Tool result");
 }
 
@@ -4624,13 +4918,18 @@ static void agent_history_render_text(agent_worker *w, const char *text,
 
         if (mark == AGENT_HISTORY_MARK_USER) {
             if (agent_history_is_tool_user(tp, te)) {
+                const char *payload_start = tp;
+                const char *payload_end = te;
+                (void)agent_history_tool_result_payload(&payload_start,
+                                                        &payload_end);
                 if (color) {
                     const char *s = "\x1b[90mTool result:\n";
                     agent_publish(w, s, strlen(s));
                 } else {
                     agent_publish(w, "Tool result:\n", strlen("Tool result:\n"));
                 }
-                agent_history_publish_limited(w, tp, te, 12, 3000);
+                agent_history_publish_limited(w, payload_start, payload_end,
+                                              12, 3000);
                 if (color) agent_publish(w, "\x1b[0m", 4);
             } else {
                 if (color) {
@@ -5114,6 +5413,8 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->status.state = AGENT_WORKER_IDLE;
         w->status.ctx_used = w->transcript.len;
         w->status.ctx_size = w->cfg->gen.ctx_size;
+        w->status.prefill_tps = 0.0;
+        w->status.greedy_sampling = false;
         w->status.error[0] = '\0';
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
@@ -6188,6 +6489,7 @@ static char *agent_tool_google_search(agent_worker *w, const agent_tool_call *ca
     const char *query = agent_tool_arg_value(call, "query");
     if (!query || !query[0]) return xstrdup("Tool error: google_search requires query\n");
     char err[256] = {0};
+    agent_publishf_system_status(w, "Searching Google for %s...", query);
     char *md = ds4_web_google_search(w->web, query, err, sizeof(err));
     if (!md) {
         agent_buf b = {0};
@@ -6203,6 +6505,7 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
     const char *url = agent_tool_arg_value(call, "url");
     if (!url || !url[0]) return xstrdup("Tool error: visit_page requires url\n");
     char err[256] = {0};
+    agent_publishf_system_status(w, "Opening page %s...", url);
     char *md = ds4_web_visit_page(w->web, url, err, sizeof(err));
     if (!md) {
         agent_buf b = {0};
@@ -6952,10 +7255,13 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
 
     pthread_mutex_lock(&w->mu);
     w->status.state = AGENT_WORKER_COMPACTING;
+    w->progress_started_at = now_sec();
     w->status.prefill_done = 0;
     w->status.prefill_total = 0;
+    w->status.prefill_tps = 0.0;
     w->status.generated = 0;
     w->status.gen_tps = 0.0;
+    w->status.greedy_sampling = false;
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
 
@@ -6972,17 +7278,29 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
 
     ds4_session_set_progress(w->session, worker_progress_cb, w);
     ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-    if (ds4_session_sync(w->session, &prompt, err, err_len) != 0) {
-        ds4_session_set_progress(w->session, NULL, NULL);
-        ds4_session_set_display_progress(w->session, NULL, NULL);
+    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+    int sync_rc = ds4_session_sync(w->session, &prompt, err, err_len);
+    ds4_session_set_cancel(w->session, NULL, NULL);
+    ds4_session_set_progress(w->session, NULL, NULL);
+    ds4_session_set_display_progress(w->session, NULL, NULL);
+    if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+        ds4_session_invalidate(w->session);
+        snprintf(err, err_len, "interrupted");
+        agent_publish_system_status(
+            w, "Compaction interrupted; keeping the previous conversation state.");
+        ds4_tokens_free(&prompt);
+        ds4_tokens_free(&sys);
+        agent_publish(w, "\x1b[0m\n", 5);
+        worker_clear_interrupt(w);
+        return false;
+    }
+    if (sync_rc != 0) {
         ds4_session_invalidate(w->session);
         ds4_tokens_free(&prompt);
         ds4_tokens_free(&sys);
         agent_publish(w, "\x1b[0m\n", 5);
         return false;
     }
-    ds4_session_set_progress(w->session, NULL, NULL);
-    ds4_session_set_display_progress(w->session, NULL, NULL);
 
     /* From here until the final rebuild, the live KV contains the internal
      * compaction prompt/summary, while w->transcript still contains the real
@@ -6995,12 +7313,15 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     double t0 = now_sec();
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
-            snprintf(err, err_len, "compaction interrupted");
+            snprintf(err, err_len, "interrupted");
             ds4_session_invalidate(w->session);
             ds4_tokens_free(&prompt);
             ds4_tokens_free(&sys);
             free(summary.ptr);
             agent_publish(w, "\x1b[0m\n", 5);
+            agent_publish_system_status(
+                w, "Compaction interrupted; keeping the previous conversation state.");
+            worker_clear_interrupt(w);
             return false;
         }
         int token = ds4_session_argmax(w->session);
@@ -7032,6 +7353,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         pthread_mutex_lock(&w->mu);
         w->status.generated = i + 1;
         w->status.gen_tps = dt > 0.0 ? (double)(i + 1) / dt : 0.0;
+        w->status.greedy_sampling = false;
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
     }
@@ -7161,16 +7483,77 @@ static int worker_force_generated_text(agent_worker *w,
  * ============================================================================
  */
 
+/* DSML structure is a machine-readable grammar, so once the model has clearly
+ * started a tool stanza we decode grammar bytes greedily.  Parameter values are
+ * different: they can be shell commands, code, file contents, or edit bodies,
+ * and should keep the configured sampling behavior.  The only exception is a
+ * parameter closing tag once it is clearly DSML syntax, not ordinary text such
+ * as HTML/XML/code containing "</".
+ *
+ * This helper is intentionally derived only from the current streaming parser
+ * state.  The state object is local to one assistant round, so malformed output,
+ * EOS, Ctrl+C, or the next turn cannot accidentally leave sampling greedy. */
+static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) {
+    if (!sr || !sr->parser) return false;
+    if (sr->parser->state == AGENT_DSML_ERROR ||
+        sr->parser->state == AGENT_DSML_DONE)
+        return false;
+
+    /* A possible opening marker is being held back by the start detector.  A
+     * single '<' is too common in prose/code to justify forcing argmax; after
+     * the second byte, the buffered prefix still matching here is specifically
+     * DSML-shaped ("<｜..." or the tolerated "<D..." typo). */
+    if (sr->dsml_start_len > 1) return true;
+    if (!sr->dsml_active) return false;
+
+    if (sr->parser->state == AGENT_DSML_STRUCTURAL)
+        return true;
+    if (sr->parser->state != AGENT_DSML_PARAM_VALUE)
+        return false;
+
+    return sr->parser->param_close_prefix;
+}
+
+static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
+                                   bool greedy, uint64_t *rng) {
+    return ds4_session_sample(w->session,
+                              greedy ? 0.0f : cfg->gen.temperature,
+                              0,
+                              greedy ? 1.0f : cfg->gen.top_p,
+                              greedy ? 0.0f : cfg->gen.min_p,
+                              rng);
+}
+
+static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
+    pthread_mutex_lock(&w->mu);
+    if (w->status.greedy_sampling != greedy) {
+        w->status.greedy_sampling = greedy;
+        agent_wake_locked(w);
+    }
+    pthread_mutex_unlock(&w->mu);
+}
+
 /* Run one user turn until the assistant stops or returns a tool call.  Tool
  * results are appended to the transcript and the loop continues, which gives
  * the model native DSML tool iteration without a client/server protocol. */
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
     ds4_think_mode think_mode = effective_think_mode(cfg);
+    pthread_mutex_lock(&w->mu);
+    w->interrupt = false;
+    w->status.error[0] = '\0';
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+
     char compact_err[160] = {0};
     if (!agent_worker_compact_if_needed(w, "soft limit before user turn",
                                         compact_err, sizeof(compact_err)))
     {
+        if (agent_err_is_interrupted(compact_err)) {
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
         agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
         return 1;
     }
@@ -7188,10 +7571,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     pthread_mutex_lock(&w->mu);
-    w->interrupt = false;
     w->user_activity = true;
     w->session_dirty = true;
-    w->status.error[0] = '\0';
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
 
@@ -7207,6 +7588,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
                                             compact_err, sizeof(compact_err)))
         {
+            if (agent_err_is_interrupted(compact_err)) {
+                worker_clear_interrupt(w);
+                agent_set_status(w, AGENT_WORKER_IDLE);
+                return 0;
+            }
             agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
             return 1;
         }
@@ -7229,25 +7615,37 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
+        w->progress_started_at = now_sec();
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
         w->status.prefill_label = prefill_label;
+        w->status.prefill_tps = 0.0;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
+        w->status.greedy_sampling = false;
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
 
         char err[160];
         ds4_session_set_progress(w->session, worker_progress_cb, w);
         ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-        if (ds4_session_sync(w->session, prompt_for_sync, err, sizeof(err)) != 0) {
-            ds4_session_set_progress(w->session, NULL, NULL);
-            ds4_session_set_display_progress(w->session, NULL, NULL);
+        ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+        int sync_rc = ds4_session_sync(w->session, prompt_for_sync, err, sizeof(err));
+        ds4_session_set_cancel(w->session, NULL, NULL);
+        ds4_session_set_progress(w->session, NULL, NULL);
+        ds4_session_set_display_progress(w->session, NULL, NULL);
+        if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            agent_publish_system_status(
+                w, "Model reading interrupted; the model may only be aware of the prefix processed so far.");
+            ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
+        if (sync_rc != 0) {
             agent_set_error(w, err);
             return 1;
         }
-        ds4_session_set_progress(w->session, NULL, NULL);
-        ds4_session_set_display_progress(w->session, NULL, NULL);
 
         int max_tokens = cfg->gen.n_predict;
         int room = ds4_session_ctx(w->session) - ds4_session_pos(w->session);
@@ -7279,13 +7677,20 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         pthread_mutex_lock(&w->mu);
         w->status.state = AGENT_WORKER_GENERATING;
+        w->status.prefill_tps = 0.0;
+        w->status.greedy_sampling = false;
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
 
+        bool status_greedy_sampling = false;
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
-            int token = ds4_session_sample(w->session, cfg->gen.temperature, 0,
-                                           cfg->gen.top_p, cfg->gen.min_p, &rng);
+            bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
+            if (greedy_sampling != status_greedy_sampling) {
+                worker_set_greedy_sampling(w, greedy_sampling);
+                status_greedy_sampling = greedy_sampling;
+            }
+            int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
             if (token == ds4_token_eos(w->engine)) break;
 
             size_t text_len = 0;
@@ -7313,6 +7718,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
 
+            greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
+            if (greedy_sampling != status_greedy_sampling) {
+                worker_set_greedy_sampling(w, greedy_sampling);
+                status_greedy_sampling = greedy_sampling;
+            }
+
             if (dsml.state == AGENT_DSML_DONE) {
                 got_tool = true;
                 break;
@@ -7331,14 +7742,34 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             }
         }
 
+        bool interrupted = worker_should_interrupt(w);
         agent_stream_text(&stream, NULL, 0, true);
         renderer_finish(&renderer);
+        worker_set_greedy_sampling(w, false);
+        if (interrupted) {
+            ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
+            agent_dsml_parser_free(&dsml);
+            agent_publish_system_status(w, "Stopped by user");
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
         if (stream.dsml_in_think) {
             got_tool = false;
             malformed_tool = true;
             early_tool_error = false;
             snprintf(dsml.error, sizeof(dsml.error),
                      "tool calling is not allowed inside <think></think>");
+        } else if (!malformed_tool && dsml.state == AGENT_DSML_ERROR) {
+            malformed_tool = true;
+        } else if (!got_tool && !malformed_tool && !early_tool_error &&
+                   !interrupted &&
+                   (dsml.state == AGENT_DSML_STRUCTURAL ||
+                    dsml.state == AGENT_DSML_PARAM_VALUE))
+        {
+            malformed_tool = true;
+            snprintf(dsml.error, sizeof(dsml.error),
+                     "incomplete DSML tool call");
         }
 
         ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
@@ -7378,6 +7809,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             {
                 free(tool_result);
                 agent_dsml_parser_free(&dsml);
+                if (agent_err_is_interrupted(compact_err)) {
+                    worker_clear_interrupt(w);
+                    agent_set_status(w, AGENT_WORKER_IDLE);
+                    return 0;
+                }
                 agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
                 return 1;
             }
@@ -7522,6 +7958,11 @@ static void worker_run_deferred_compact(agent_worker *w) {
         }
         agent_set_status(w, AGENT_WORKER_IDLE);
     } else {
+        if (agent_err_is_interrupted(err)) {
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return;
+        }
         agent_set_error(w, err[0] ? err : "context compaction failed");
     }
 }
@@ -7536,7 +7977,8 @@ static void *worker_main(void *arg) {
                 w->cfg->engine.model_path ? w->cfg->engine.model_path : "",
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};
-    if (!agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
+    if (!agent_worker_wait_distributed_route(w, init_err, sizeof(init_err)) ||
+        !agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
         agent_set_error(w, init_err[0] ? init_err : "failed to initialize system prompt");
     }
     agent_trace_tokens(w, "initial_system_prompt", &w->transcript, 0);
@@ -7622,8 +8064,10 @@ static bool worker_submit(agent_worker *w, const char *text) {
         w->status.prefill_done = 0;
         w->status.prefill_total = 0;
         w->status.prefill_label = agent_next_prefill_label();
+        w->status.prefill_tps = 0.0;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
+        w->status.greedy_sampling = false;
         pthread_cond_signal(&w->cond);
     }
     pthread_mutex_unlock(&w->mu);
@@ -7640,6 +8084,17 @@ static int worker_status_power_locked(agent_worker *w) {
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->interrupt = true;
+    if (w->cfg &&
+        w->cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+        (w->status.state == AGENT_WORKER_PREFILL ||
+         w->status.state == AGENT_WORKER_GENERATING ||
+         w->status.state == AGENT_WORKER_COMPACTING))
+    {
+        w->status.state = AGENT_WORKER_DRAINING;
+        w->status.prefill_tps = 0.0;
+        w->status.greedy_sampling = false;
+        agent_wake_locked(w);
+    }
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -7755,8 +8210,8 @@ static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
     snprintf(buf, len, "ds4-agent> ");
 }
 
-static void agent_progress_bar(int done, int total, char *buf, size_t len,
-                               bool color) {
+static void agent_progress_bar(int done, int total, double tps,
+                               char *buf, size_t len, bool color) {
     if (len == 0) return;
     if (total <= 0) total = 1;
     if (done < 0) done = 0;
@@ -7765,6 +8220,12 @@ static void agent_progress_bar(int done, int total, char *buf, size_t len,
     if (filled < 0) filled = 0;
     if (filled > AGENT_PROGRESS_BAR_WIDTH) filled = AGENT_PROGRESS_BAR_WIDTH;
     if (color && filled == 0 && done < total) filled = 1;
+    char rate[32] = {0};
+    size_t rate_len = 0;
+    if (tps > 0.0 && filled < AGENT_PROGRESS_BAR_WIDTH) {
+        snprintf(rate, sizeof(rate), " %.0ft/s", tps);
+        rate_len = strlen(rate);
+    }
     size_t pos = 0;
     agent_progress_append(buf, len, &pos, "[");
     if (color) agent_progress_append(buf, len, &pos, AGENT_STATUS_BAR_FILL);
@@ -7772,7 +8233,12 @@ static void agent_progress_bar(int done, int total, char *buf, size_t len,
         if (color && i == filled) {
             agent_progress_append(buf, len, &pos, AGENT_STATUS_STYLE_START);
         }
-        agent_progress_append(buf, len, &pos, i < filled ? "▶" : "·");
+        if (i >= filled && rate_len > 0 && (size_t)(i - filled) < rate_len) {
+            char ch[2] = {rate[i - filled], '\0'};
+            agent_progress_append(buf, len, &pos, ch);
+        } else {
+            agent_progress_append(buf, len, &pos, i < filled ? "▶" : "·");
+        }
     }
     if (color) agent_progress_append(buf, len, &pos, AGENT_STATUS_STYLE_START);
     agent_progress_append(buf, len, &pos, "]");
@@ -7824,19 +8290,25 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
         if (done > total) done = total;
         double pct = 100.0 * (double)done / (double)total;
         char bar[AGENT_PROGRESS_BAR_MAX_BYTES];
-        agent_progress_bar(done, total, bar, sizeof(bar), stdout_is_tty());
+        agent_progress_bar(done, total, st->prefill_tps, bar, sizeof(bar),
+                           stdout_is_tty());
         snprintf(buf, len, "ctx %s/%s | %s %s %d/%d %.1f%%%s",
                  used, total_ctx, agent_prefill_label(st), bar,
                  done, total, pct, power);
         break;
     }
     case AGENT_WORKER_GENERATING:
-        snprintf(buf, len, "ctx %s/%s | generation %d tokens %.1f t/s%s",
-                 used, total_ctx, st->generated, st->gen_tps, power);
+        snprintf(buf, len, "ctx %s/%s | generation %d tokens%s %.1f t/s%s",
+                 used, total_ctx, st->generated,
+                 st->greedy_sampling ? " ❄️" : "", st->gen_tps, power);
         break;
     case AGENT_WORKER_COMPACTING:
         snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
                  used, total_ctx, st->generated, st->gen_tps, power);
+        break;
+    case AGENT_WORKER_DRAINING:
+        snprintf(buf, len, "ctx %s/%s | stopping after distributed cluster drains%s",
+                 used, total_ctx, power);
         break;
     case AGENT_WORKER_SAVING:
         snprintf(buf, len, "ctx %s/%s | saving session%s", used, total_ctx, power);
@@ -8867,6 +9339,8 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         .confirm_privdata = w,
         .log = agent_web_log,
         .log_privdata = w,
+        .cancel = agent_web_cancel,
+        .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
@@ -9257,6 +9731,20 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             }
         }
 
+        if (rc > 0 && (pfd[0].revents & POLLIN)) editor_read_stdin(&editor);
+
+        /* Linenoise runs the terminal in raw mode, so Ctrl+C normally arrives
+         * as byte 3 instead of SIGINT.  Handle it before worker output is
+         * drained and repainted; otherwise a busy decoding stream can leave the
+         * interrupt waiting behind a large terminal-output backlog. */
+        if (editor_take_queued_byte(&editor, 3)) { /* Ctrl+C */
+            if (!worker_is_idle(&worker)) {
+                worker_interrupt(&worker);
+            } else {
+                editor_cancel_input_with_hint(&editor, prompt, statusline);
+            }
+        }
+
         if (rc > 0 && (pfd[1].revents & POLLIN)) drain_wake_fd(worker.wake_fd[0]);
 
         char *out = NULL;
@@ -9284,6 +9772,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                prompt, statusline, true);
             pthread_mutex_lock(&worker.mu);
             worker.status.state = AGENT_WORKER_IDLE;
+            worker.status.prefill_tps = 0.0;
+            worker.status.greedy_sampling = false;
             worker.status.error[0] = '\0';
             pthread_mutex_unlock(&worker.mu);
         }
@@ -9352,8 +9842,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             free(echo);
             free(queued);
         }
-
-        if (rc > 0 && (pfd[0].revents & POLLIN)) editor_read_stdin(&editor);
 
         if (queue.len && editor_take_queued_byte(&editor, 24)) { /* Ctrl+X */
             char *queued = agent_prompt_queue_pop(&queue);
@@ -9439,7 +9927,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         }
                     }
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
-                    write(STDOUT_FILENO, "\a", 1);
+                    ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
+                    (void)ignored;
                     restore_line = xstrdup(cmd);
                 } else if (cmd[0] == '/' && busy) {
                     printf("command requires the model to be idle: %s\n", cmd);
@@ -9592,8 +10081,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
-
-    /* upstream: optional --chdir before model load. */
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
@@ -9608,7 +10095,6 @@ int main(int argc, char **argv) {
             cfg.engine.backend = DS4_BACKEND_CUDA;
         }
     }
-    log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
 
     /* Tell the multi-GPU packer what session ctx the agent will
      * actually use, so per-layer KV bytes are priced at the right
@@ -9649,6 +10135,9 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+    log_context_memory(cfg.engine.backend,
+                       cfg.gen.ctx_size,
+                       cfg.engine.prefill_chunk);
 
     struct sigaction old_int;
     struct sigaction sa;
