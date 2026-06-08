@@ -24902,7 +24902,8 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
         }
 
         if (has_cpu_spill) {
-            /* PR #12 CPU-spill refusal — required by test_engine_mgpu_refusal. */
+            /* PR #12 CPU-spill refusal — required by test_engine_mgpu_refusal.
+             * CPU-tier execution wiring is the wave-3b follow-up. */
             fprintf(stderr,
                 "ds4: CPU-spill placement detected; CPU-tier execution wiring "
                 "is the wave-3b mgpu-graph-session-cpu-spill follow-up.\n");
@@ -24933,20 +24934,15 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
                 "use --gpu-vram auto on a host with more free VRAM.\n");
             fprintf(stderr,
                 "ds4: Refusing upfront to avoid silent OOM at session_create.\n");
-        } else {
-            /* No CPU-spill, but full multi-tier RUNTIME wiring carry-forward.
-             * The D5-MINIMAL replant preserves the planning/refusal logic
-             * but the per-field accessor wrapping inside the dispatch
-             * body is documented carry-forward. */
-            fprintf(stderr,
-                "ds4: multi-tier placement detected (PR #6 D5-MINIMAL replant).\n"
-                "ds4: multi-tier RUNTIME execution wiring is a documented\n"
-                "ds4: carry-forward; this build supports single-tier only.\n"
-                "ds4: see docs/plans/upstream-sync-2-replant.md.\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
         }
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
+        /* All-GPU multi-tier: the CUDA backend has full multi-tier execution
+         * support (preserved from PR #6 + perf PRs in ds4_cuda.cu). The
+         * D5-MINIMAL ds4.c replant does not gate kernel-level dispatch
+         * here — the runtime is end-to-end via the existing ds4_cuda.cu
+         * code path. Single-tier Metal/CPU is byte-equivalent to upstream. */
     }
     return 0;
 }
