@@ -44,6 +44,27 @@
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
+
+/* Apple (Metal) build: ds4_cuda.cu is not linked, but the engine compiles
+ * code referencing multi-GPU plumbing symbols inside dead multi-tier branches.
+ * Provide stubs so the linker is happy. CPU-only (DS4_NO_GPU) builds
+ * never reach the multi-tier branches and never include ds4_gpu.h, so
+ * we cannot reference ds4_tensor_range there — those stubs are guarded
+ * by !DS4_NO_GPU below. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
+    (void)model_map; (void)model_size; return 1;
+}
+int ds4_gpu_device_cache_tensors(int device_id,
+                                  const ds4_tensor_range *ranges,
+                                  int n_ranges) {
+    (void)device_id; (void)ranges; (void)n_ranges; return 0;
+}
+int ds4_gpu_init_multi(const ds4_gpu_config *cfg) { (void)cfg; return 0; }
+ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {{0}};
+int         g_n_gpus = 0;
+int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{0}};
+#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -24868,83 +24889,141 @@ static void engine_print_layout(const ds4_engine *e) {
             (double)overhead / (1024.0 * 1024.0 * 1024.0));
 }
 
+static int ds4_engine_open_internal(ds4_engine **out,
+                                     const ds4_engine_options *opt,
+                                     const struct ds4_gpu_config *gpu_cfg);
+
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
-    if (!gpu_cfg) {
-        return ds4_engine_open(out, opt);
-    }
-    /* gpu_cfg != NULL: open the engine, then classify. If multi-tier,
-     * print layout + refuse upfront. */
-    int rc = ds4_engine_open(out, opt);
-    if (rc != 0 || !out || !*out) return rc;
-    ds4_engine *e = *out;
-    e->placement_ctx_hint = opt->placement_ctx_hint;
-    if (engine_classify_multi_tier(e, gpu_cfg) != 0) {
-        fprintf(stderr, "ds4: failed to classify multi-tier placement\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
-    if (e->multi_tier) {
-        /* PR #12 refusal contract: ALWAYS print layout first so the
-         * operator sees what the packer decided, then describe the
-         * specific failure mode. */
-        engine_print_layout(e);
+    return ds4_engine_open_internal(out, opt, gpu_cfg);
+}
 
-        int has_cpu_spill = 0;
-        int spilled_entries = 0;
-        for (int i = 0; i < e->n_placement_entries; i++) {
-            if (e->placement[i] == DS4_LAYER_PACK_CPU) {
-                has_cpu_spill = 1;
-                spilled_entries++;
-            }
-        }
+#ifndef DS4_NO_GPU
+/* PR #4 selective caches: register host model map (no-copy) then install
+ * per-device caches for tensors landing on each tier. Logical-tier
+ * indices are translated to physical CUDA device ids via g_gpu[]. */
+static int engine_install_per_device_caches(ds4_engine *e) {
+    if (!ds4_gpu_register_model_map_no_copy(e->model.map, e->model.size)) return -1;
 
-        if (has_cpu_spill) {
-            /* PR #12 CPU-spill refusal — required by test_engine_mgpu_refusal.
-             * CPU-tier execution wiring is the wave-3b follow-up. */
+    ds4_tensor_range *per_dev_ranges[DS4_MAX_GPUS] = {0};
+    int per_dev_n[DS4_MAX_GPUS] = {0};
+    int per_dev_cap[DS4_MAX_GPUS] = {0};
+
+    int rc = -1;
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const ds4_tensor *t = &e->model.tensors[i];
+        if (t->bytes == 0) continue;
+        int entry = tensor_to_entry(t, DS4_N_LAYER);
+        if (entry < 0 || entry >= e->n_placement_entries) entry = 0;
+        int logical_tier = e->placement[entry];
+        if (logical_tier == DS4_LAYER_PACK_CPU) continue;
+        if (logical_tier < 0 || logical_tier >= e->gpu_cfg.n_gpus) {
             fprintf(stderr,
-                "ds4: CPU-spill placement detected; CPU-tier execution wiring "
-                "is the wave-3b mgpu-graph-session-cpu-spill follow-up.\n");
-            size_t total_budget = 0;
-            size_t total_required = 0;
-            for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
-                total_budget += e->gpu_cfg.vram_bytes[d];
-            }
-            size_t entry_bytes[DS4_MAX_LAYER + 2];
-            (void)engine_compute_entry_bytes(e, entry_bytes);
-            for (int i = 0; i < e->n_placement_entries; i++) {
-                if (e->placement[i] == DS4_LAYER_PACK_CPU) {
-                    total_required += entry_bytes[i];
-                }
-            }
-            fprintf(stderr,
-                "ds4: --gpu-vram placement does not fit at the requested "
-                "context (ctx hint = %d):\n",
-                e->placement_ctx_hint);
-            fprintf(stderr,
-                "ds4:   %d placement entries spilled to CPU (%.2f GiB "
-                "unaccommodated of %.2f GiB total per-device budget).\n",
-                spilled_entries,
-                (double)total_required / (1024.0 * 1024.0 * 1024.0),
-                (double)total_budget / (1024.0 * 1024.0 * 1024.0));
-            fprintf(stderr,
-                "ds4: Lower --ctx / --ctx-max, raise --gpu-vram budgets, or "
-                "use --gpu-vram auto on a host with more free VRAM.\n");
-            fprintf(stderr,
-                "ds4: Refusing upfront to avoid silent OOM at session_create.\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+                    "ds4: placement tier %d out of range for tensor %.*s\n",
+                    logical_tier,
+                    (int)t->name.len, t->name.ptr ? t->name.ptr : "");
+            goto cleanup;
         }
-        /* All-GPU multi-tier: the CUDA backend has full multi-tier execution
-         * support (preserved from PR #6 + perf PRs in ds4_cuda.cu). The
-         * D5-MINIMAL ds4.c replant does not gate kernel-level dispatch
-         * here — the runtime is end-to-end via the existing ds4_cuda.cu
-         * code path. Single-tier Metal/CPU is byte-equivalent to upstream. */
+        const int physical_device = g_gpu[logical_tier].device_id;
+        if (per_dev_n[logical_tier] >= per_dev_cap[logical_tier]) {
+            int new_cap = per_dev_cap[logical_tier] == 0 ? 64 : per_dev_cap[logical_tier] * 2;
+            ds4_tensor_range *grow = realloc(per_dev_ranges[logical_tier],
+                                              (size_t)new_cap * sizeof(*grow));
+            if (!grow) {
+                fprintf(stderr, "ds4: out of memory growing per-device range list\n");
+                goto cleanup;
+            }
+            per_dev_ranges[logical_tier] = grow;
+            per_dev_cap[logical_tier] = new_cap;
+        }
+        per_dev_ranges[logical_tier][per_dev_n[logical_tier]].source_offset = t->abs_offset;
+        per_dev_ranges[logical_tier][per_dev_n[logical_tier]].bytes = t->bytes;
+        per_dev_ranges[logical_tier][per_dev_n[logical_tier]].target_device = physical_device;
+        per_dev_n[logical_tier]++;
     }
-    return 0;
+
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        if (per_dev_n[d] == 0) continue;
+        const int physical_device = g_gpu[d].device_id;
+        int cache_rc = ds4_gpu_device_cache_tensors(physical_device,
+                                                     per_dev_ranges[d],
+                                                     per_dev_n[d]);
+        if (cache_rc != 0) {
+            fprintf(stderr,
+                    "ds4: ds4_gpu_device_cache_tensors failed for tier %d "
+                    "(physical device %d, %d ranges) rc=%d\n",
+                    d, physical_device, per_dev_n[d], cache_rc);
+            goto cleanup;
+        }
+    }
+    rc = 0;
+
+cleanup:
+    for (int d = 0; d < DS4_MAX_GPUS; d++) free(per_dev_ranges[d]);
+    return rc;
+}
+
+/* PR #4: top-level install for multi-tier placement state.
+ * Order: print layout first (so operator sees it even on failure),
+ * then install per-device caches. */
+static int engine_install_gpu_placement(ds4_engine *e) {
+    if (!e->multi_tier) return 0;
+    engine_print_layout(e);
+    /* CPU-spill was already rejected upstream in ds4_engine_open_internal
+     * via engine_print_refusal_cpu_spill. Defensive check anyway. */
+    for (int i = 0; i < e->n_placement_entries; i++) {
+        if (e->placement[i] == DS4_LAYER_PACK_CPU) {
+            fprintf(stderr,
+                "ds4: CPU-spill placement detected at install_gpu_placement; "
+                "this should have been refused upstream.\n");
+            return -1;
+        }
+    }
+    return engine_install_per_device_caches(e);
+}
+#endif /* !DS4_NO_GPU */
+
+/* PR #12 refusal contract: prints layout via ds4_layer_pack_print, then
+ * the CPU-spill diagnostic block. Returns nonzero on refusal (caller
+ * must ds4_engine_close + null out). */
+static int engine_print_refusal_cpu_spill(ds4_engine *e) {
+    engine_print_layout(e);
+
+    int spilled_entries = 0;
+    size_t total_budget = 0;
+    size_t total_required = 0;
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        total_budget += e->gpu_cfg.vram_bytes[d];
+    }
+    size_t entry_bytes[DS4_MAX_LAYER + 2];
+    (void)engine_compute_entry_bytes(e, entry_bytes);
+    for (int i = 0; i < e->n_placement_entries; i++) {
+        if (e->placement[i] == DS4_LAYER_PACK_CPU) {
+            spilled_entries++;
+            total_required += entry_bytes[i];
+        }
+    }
+
+    fprintf(stderr,
+        "ds4: CPU-spill placement detected; CPU-tier execution wiring "
+        "is the wave-3b mgpu-graph-session-cpu-spill follow-up.\n");
+    fprintf(stderr,
+        "ds4: --gpu-vram placement does not fit at the requested "
+        "context (ctx hint = %d):\n",
+        e->placement_ctx_hint);
+    fprintf(stderr,
+        "ds4:   %d placement entries spilled to CPU (%.2f GiB "
+        "unaccommodated of %.2f GiB total per-device budget).\n",
+        spilled_entries,
+        (double)total_required / (1024.0 * 1024.0 * 1024.0),
+        (double)total_budget / (1024.0 * 1024.0 * 1024.0));
+    fprintf(stderr,
+        "ds4: Lower --ctx / --ctx-max, raise --gpu-vram budgets, or "
+        "use --gpu-vram auto on a host with more free VRAM.\n");
+    fprintf(stderr,
+        "ds4: Refusing upfront to avoid silent OOM at session_create.\n");
+    return 1;
 }
 
 #ifdef DS4_TEST_HOOKS
@@ -25065,6 +25144,12 @@ size_t ds4_test_compute_entry_bytes_sum(const ds4_test_fake_tensor *tensors,
 #endif /* DS4_TEST_HOOKS */
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    return ds4_engine_open_internal(out, opt, NULL);
+}
+
+static int ds4_engine_open_internal(ds4_engine **out,
+                                     const ds4_engine_options *opt,
+                                     const struct ds4_gpu_config *gpu_cfg) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -25231,6 +25316,56 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
     }
     if (graph_backend) {
+        /* PR #4 multi-tier path: classify placement before GPU init so we
+         * can pick ds4_gpu_init_multi(gpu_cfg) for multi-tier and skip the
+         * single-device ds4_gpu_init() — wired into the legacy single-tier
+         * code path otherwise. NULL gpu_cfg leaves e->multi_tier == 0 and
+         * falls through to the legacy single-device init below. */
+        e->placement_ctx_hint = opt->placement_ctx_hint;
+        if (gpu_cfg) {
+            if (engine_classify_multi_tier(e, gpu_cfg) != 0) {
+                fprintf(stderr, "ds4: failed to classify multi-tier placement\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        }
+        if (e->multi_tier) {
+            /* Refuse upfront on CPU-spill (PR #12 contract). */
+            int has_cpu_spill = 0;
+            for (int i = 0; i < e->n_placement_entries; i++) {
+                if (e->placement[i] == DS4_LAYER_PACK_CPU) { has_cpu_spill = 1; break; }
+            }
+            if (has_cpu_spill) {
+                (void)engine_print_refusal_cpu_spill(e);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            /* All-GPU multi-tier: initialize all configured CUDA devices via
+             * ds4_gpu_init_multi (the multi-GPU plumbing init that populates
+             * g_gpu[]), then install per-device selective caches per the
+             * placement. Skip the single-tier ds4_gpu_init / set_model_map_range
+             * path — those are explicitly single-tier behavior. */
+            /* ds4_gpu_init_multi returns 1 on success and 0 on failure. */
+            if (ds4_gpu_init_multi(gpu_cfg) == 0) {
+                fprintf(stderr, "ds4: ds4_gpu_init_multi failed; aborting multi-tier startup\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            e->metal_ready = true;
+            ds4_gpu_set_quality(e->quality);
+            (void)ds4_gpu_set_model_fd(e->model.fd);
+            if (engine_install_gpu_placement(e) != 0) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            *out = e;
+            return 0;
+        }
+
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
