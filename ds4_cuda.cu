@@ -33,7 +33,12 @@ enum {
      * becomes an out-of-bounds write at long context. */
     DS4_CUDA_ATTENTION_SCORE_CAP = 8192u,
     DS4_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
-    DS4_CUDA_TOPK_MERGE_GROUP = 8u
+    DS4_CUDA_TOPK_MERGE_GROUP = 8u,
+    /* perf-02 split-KV: fixed logical rows per chunk (shared scores = 2KB),
+     * grid S = ceil(n_score / CHUNK) clamped, so block count grows with ctx. */
+    DS4_CUDA_SPLITKV_CHUNK = 512u,
+    DS4_CUDA_SPLITKV_S_MAX = 16u,
+    DS4_CUDA_SPLITKV_S_FLOOR = 4u
 };
 
 /* struct ds4_gpu_tensor is defined in ds4_gpu.h (no longer opaque as of
@@ -4241,6 +4246,254 @@ __global__ static void attention_decode_mixed_kernel(
     }
 }
 
+/* ---- perf-02 split-KV / flash-decode (opt-in, default OFF) ----------------
+ *
+ * attention_decode_splitkv_kernel computes a partial online-softmax over a
+ * contiguous chunk of the flattened logical row set [0, n_score) used by
+ * attention_decode_mixed_kernel (raw rows first, then compressed rows, same
+ * ascending ordering). Each block handles (t = blockIdx.x, h = blockIdx.y,
+ * chunk = blockIdx.z) and writes a partial (m_j, l_j, acc_j[head_dim]) WITHOUT
+ * the sink term. attention_decode_splitkv_combine_kernel merges the S partials
+ * per (t,h), folds the sink once, and writes the final normalized head output.
+ *
+ * The math is the standard flash-attention online-softmax rescale and is
+ * algebraically identical to attention_decode_mixed_kernel; it is NOT
+ * guaranteed bit-identical in FP32 (different expf inputs + add/mul grouping),
+ * hence default-OFF behind DS4_CUDA_SPLITKV_DECODE and the S==1 dispatch to the
+ * old kernel as the bit-exact anchor (handled in the launch helper).
+ *
+ * Partials scratch layout (per logical tier), contiguous floats:
+ *   stride = head_dim + 2
+ *   base(t,h,j) = ((t*n_head + h)*S + j) * stride
+ *     [0]               = m_j   (chunk running max; -INF if empty/all-masked)
+ *     [1]               = l_j   (chunk denominator sum exp(s - m_j))
+ *     [2 .. 2+head_dim) = acc_j[head_dim] (chunk weighted value sum)
+ */
+__global__ static void attention_decode_splitkv_kernel(
+        float *partials,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *comp_mask,
+        uint32_t use_comp_mask,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t S) {
+    uint32_t t = blockIdx.x;
+    uint32_t h = blockIdx.y;
+    uint32_t j = blockIdx.z;
+    if (t >= n_tokens || h >= n_head || j >= S) return;
+    const bool single_all = (n_tokens == 1u && ratio == 0u);
+    uint32_t qpos = pos0 + t;
+    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    if (visible_comp > n_comp) visible_comp = n_comp;
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    /* scores buffer holds only this chunk's rows (cnt <= DS4_CUDA_SPLITKV_CHUNK) */
+    __shared__ float scores[DS4_CUDA_SPLITKV_CHUNK];
+    __shared__ uint32_t raw_rows[256];
+    __shared__ float partial[256];
+    __shared__ float m_s;
+    __shared__ float l_s;
+    __shared__ uint32_t raw_count;
+    __shared__ uint32_t raw_first_idx;
+    float scale = rsqrtf((float)head_dim);
+    if (threadIdx.x == 0) {
+        raw_count = 0;
+        raw_first_idx = 0;
+        if (n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (single_all) {
+                raw_count = n_raw > 256u ? 256u : n_raw;
+            } else if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0 && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    uint32_t n_score = raw_count + visible_comp;
+    /* even split of [0, n_score) across S chunks: first (n_score % S) chunks
+     * get base+1, identical deterministic partition for every block. */
+    uint32_t qbase = n_score / S;
+    uint32_t rem = n_score % S;
+    uint32_t g0 = j * qbase + (j < rem ? j : rem);
+    uint32_t cnt = qbase + (j < rem ? 1u : 0u);
+    uint32_t g1 = g0 + cnt;          /* exclusive end of this chunk */
+    /* Map raw rows that fall in this chunk into shared raw_rows[]. The chunk's
+     * raw portion is [raw_lo, raw_hi). cnt <= CHUNK and raw rows <= 256, so
+     * the slice fits raw_rows[256]. */
+    uint32_t raw_lo = g0 < raw_count ? g0 : raw_count;
+    uint32_t raw_hi = g1 < raw_count ? g1 : raw_count;
+    for (uint32_t r = raw_lo + threadIdx.x; r < raw_hi; r += blockDim.x) {
+        raw_rows[r - raw_lo] = (raw_start + raw_first_idx + r) % raw_cap;
+    }
+    __syncthreads();
+    float *pout = partials + (((uint64_t)t * n_head + h) * S + j) * (head_dim + 2u);
+    /* Pass 1: scores for this chunk's rows into shared scores[0..cnt). */
+    float local_max = -INFINITY;
+    for (uint32_t i = threadIdx.x; i < cnt; i += blockDim.x) {
+        uint32_t g = g0 + i;
+        float s;
+        if (g < raw_count) {
+            const float *kvrow = raw_kv + (uint64_t)raw_rows[g - raw_lo] * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            s = dot * scale;
+        } else {
+            uint32_t c = g - raw_count;
+            float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
+            s = -INFINITY;
+            if (add > -1.0e20f) {
+                const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                s = dot * scale + add;
+            }
+        }
+        scores[i] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) m_s = partial[0];
+    __syncthreads();
+    float chunk_max = m_s;
+    /* All-masked / empty-chunk guard: never evaluate exp(-INF - -INF) -> NaN.
+     * Write zero partial (m=-INF, l=0, acc=0) and return. */
+    if (!isfinite(chunk_max)) {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) pout[2u + d] = 0.0f;
+        if (threadIdx.x == 0) { pout[0] = -INFINITY; pout[1] = 0.0f; }
+        return;
+    }
+    /* Pass 2: exponentiate in place and reduce denominator. */
+    float den_local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < cnt; i += blockDim.x) {
+        float e = expf(scores[i] - chunk_max);
+        scores[i] = e;
+        den_local += e;
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) l_s = partial[0];
+    __syncthreads();
+    /* Pass 3: weighted value accumulation over this chunk's rows (ascending g),
+     * preserving raw-then-comp ordering to match the reference accumulation. */
+    if (head_dim == 512u && blockDim.x == 256u) {
+        uint32_t d0 = threadIdx.x;
+        uint32_t d1 = d0 + 256u;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (uint32_t i = 0; i < cnt; i++) {
+            uint32_t g = g0 + i;
+            float s = scores[i];
+            const float *kv = (g < raw_count)
+                    ? raw_kv + (uint64_t)raw_rows[g - raw_lo] * head_dim
+                    : comp_kv + (uint64_t)(g - raw_count) * head_dim;
+            acc0 += kv[d0] * s;
+            acc1 += kv[d1] * s;
+        }
+        pout[2u + d0] = acc0;
+        pout[2u + d1] = acc1;
+    } else {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float acc = 0.0f;
+            for (uint32_t i = 0; i < cnt; i++) {
+                uint32_t g = g0 + i;
+                float s = scores[i];
+                const float *kv = (g < raw_count)
+                        ? raw_kv + (uint64_t)raw_rows[g - raw_lo] * head_dim
+                        : comp_kv + (uint64_t)(g - raw_count) * head_dim;
+                acc += kv[d] * s;
+            }
+            pout[2u + d] = acc;
+        }
+    }
+    if (threadIdx.x == 0) {
+        pout[0] = chunk_max;
+        pout[1] = l_s;
+    }
+}
+
+__global__ static void attention_decode_splitkv_combine_kernel(
+        float *heads,
+        const float *sinks,
+        const float *partials,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t S) {
+    uint32_t t = blockIdx.x;
+    uint32_t h = blockIdx.y;
+    if (t >= n_tokens || h >= n_head) return;
+    const float *base = partials + (((uint64_t)t * n_head + h) * S) * (head_dim + 2u);
+    uint32_t stride = head_dim + 2u;
+    __shared__ float M_s;
+    __shared__ float L_s;
+    if (threadIdx.x == 0) {
+        /* Global max M = max(sink, max_j m_j); sink placed first to match the
+         * reference (sink seeds local_max). */
+        float M = sinks[h];
+        for (uint32_t jj = 0; jj < S; jj++) {
+            float m_j = base[(uint64_t)jj * stride];
+            M = fmaxf(M, m_j);   /* -INF partials never raise M */
+        }
+        M_s = M;
+        /* L = Σ_j exp(m_j - M) * l_j + exp(sink - M); sink term added last to
+         * mirror the reference's denom = Σ scores + expf(sink - max). Chunks
+         * with l_j == 0 / m_j == -INF contribute exactly 0 (guarded to avoid
+         * exp(-INF - finite) * 0 edge cases). */
+        float L = 0.0f;
+        for (uint32_t jj = 0; jj < S; jj++) {
+            float m_j = base[(uint64_t)jj * stride];
+            float l_j = base[(uint64_t)jj * stride + 1u];
+            if (l_j != 0.0f && isfinite(m_j)) L += expf(m_j - M) * l_j;
+        }
+        L += expf(sinks[h] - M);
+        L_s = L;
+    }
+    __syncthreads();
+    float M = M_s;
+    float L = L_s;
+    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float A = 0.0f;
+        for (uint32_t jj = 0; jj < S; jj++) {
+            float m_j = base[(uint64_t)jj * stride];
+            float l_j = base[(uint64_t)jj * stride + 1u];
+            if (l_j != 0.0f && isfinite(m_j)) {
+                A += expf(m_j - M) * base[(uint64_t)jj * stride + 2u + d];
+            }
+        }
+        oh[d] = A / L;
+    }
+}
+
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -7992,6 +8245,97 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
             0, 0, ratio);
     return cuda_ok(cudaGetLastError(), "compressor state set launch");
 }
+
+/* perf-02 split-KV / flash-decode launch helper (opt-in, default OFF).
+ * Returns 1 if the split path handled the launch, 0 if the caller should fall
+ * through to the existing attention_decode_mixed_kernel path.
+ *
+ * Engages only for the single-token decode shape (n_tokens==1) and only when
+ * DS4_CUDA_SPLITKV_DECODE is set. S==1 is NOT handled here: the caller dispatches
+ * the old kernel as the bit-exact anchor when S would be 1.
+ */
+static int attention_decode_splitkv_launch(
+        int logical_tier,
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *comp_mask,
+        uint32_t use_comp_mask,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    /* n_tokens is fixed at 1 for the split path; compute the EXACT logical row
+     * count the kernel will use (raw_count + visible_comp) so S is sized to the
+     * real work. raw_count MUST apply the same window logic as the kernel /
+     * reference, otherwise a true-S==1 case (e.g. ratio=1, window=1, n_raw>=2,
+     * n_comp=0) could be over-estimated to S>1 and engage split-KV instead of
+     * the bit-exact old-kernel anchor. The count is head-independent. */
+    const bool single_all = (ratio == 0u);
+    uint32_t qpos = pos0;            /* t==0, n_tokens==1 */
+    uint32_t first_raw_pos = pos0 + 1u - n_raw;
+    uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    if (visible_comp > n_comp) visible_comp = n_comp;
+    uint32_t raw_count = 0;
+    if (n_raw != 0) {
+        const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (single_all) {
+            raw_count = n_raw > 256u ? 256u : n_raw;
+        } else if (qpos >= first_raw_pos) {
+            uint32_t lo = first_raw_pos;
+            if (window != 0 && qpos + 1u > window) {
+                const uint32_t wlo = qpos + 1u - window;
+                if (wlo > lo) lo = wlo;
+            }
+            const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+            if (hi >= lo) {
+                raw_count = hi - lo + 1u;
+                if (raw_count > 256u) raw_count = 256u;
+            }
+        }
+    }
+    uint32_t n_score = raw_count + visible_comp;
+    if (n_score == 0u) return 0;     /* nothing to do; let old path handle it */
+    /* S = clamp(ceil(n_score / CHUNK), 1, S_MAX); raise to S_FLOOR for short
+     * context to fill more SMs, but never exceed n_score (no empty chunks). */
+    uint32_t S = (n_score + DS4_CUDA_SPLITKV_CHUNK - 1u) / DS4_CUDA_SPLITKV_CHUNK;
+    if (S < DS4_CUDA_SPLITKV_S_FLOOR) {
+        S = DS4_CUDA_SPLITKV_S_FLOOR < n_score ? DS4_CUDA_SPLITKV_S_FLOOR : n_score;
+    }
+    if (S > DS4_CUDA_SPLITKV_S_MAX) S = DS4_CUDA_SPLITKV_S_MAX;
+    if (S <= 1u) return 0;           /* S==1: caller uses the old kernel anchor */
+    /* Partials scratch: n_head * S * (head_dim + 2) floats (n_tokens==1). */
+    uint64_t stride = (uint64_t)head_dim + 2u;
+    uint64_t count = (uint64_t)n_head * S * stride;
+    float *partials = (float *)cuda_tmp_alloc_on(logical_tier, count * sizeof(float),
+                                                 "attention splitkv partials");
+    if (!partials) return 0;
+    dim3 split_grid(1, n_head, S);
+    attention_decode_splitkv_kernel<<<split_grid, 256>>>(partials,
+                                                         q,
+                                                         raw_kv,
+                                                         comp_kv,
+                                                         comp_mask,
+                                                         use_comp_mask,
+                                                         1, pos0, n_raw, raw_cap, raw_start,
+                                                         n_comp, window, ratio, n_head, head_dim, S);
+    if (!cuda_ok(cudaGetLastError(), "attention splitkv partial launch")) return -1;
+    dim3 combine_grid(1, n_head, 1);
+    attention_decode_splitkv_combine_kernel<<<combine_grid, 256>>>(heads,
+                                                                   sinks,
+                                                                   partials,
+                                                                   1, n_head, head_dim, S);
+    if (!cuda_ok(cudaGetLastError(), "attention splitkv combine launch")) return -1;
+    return 1;
+}
+
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -8048,6 +8392,18 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
+    }
+    /* perf-02 split-KV opt-in (default OFF). n_tokens==1 here by construction.
+     * S==1 / disabled / unhandled -> rc 0, fall through to the old kernel. */
+    if (getenv("DS4_CUDA_SPLITKV_DECODE") != NULL) {
+        int rc = attention_decode_splitkv_launch(
+                logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
+                0, n_raw, raw_cap, raw_start, n_comp, 0, 0, n_head, head_dim);
+        if (rc == 1) return cuda_ok(cudaGetLastError(), "attention decode splitkv launch");
+        if (rc < 0) return 0;
     }
     dim3 grid(1, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
@@ -8244,6 +8600,19 @@ static int attention_decode_batch_launch(
                                                                    n_head,
                                                                    head_dim);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
+    }
+    /* perf-02 split-KV opt-in (default OFF). Single-token decode only; multi-
+     * token batch shapes already fill the grid and fall through unchanged.
+     * S==1 / disabled / unhandled -> rc 0, fall through to the old kernel. */
+    if (n_tokens == 1u && getenv("DS4_CUDA_SPLITKV_DECODE") != NULL) {
+        int rc = attention_decode_splitkv_launch(
+                logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                use_comp_mask ? (const float *)comp_mask->ptr : NULL, use_comp_mask,
+                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head, head_dim);
+        if (rc == 1) return cuda_ok(cudaGetLastError(), "attention decode splitkv batch launch");
+        if (rc < 0) return 0;
     }
     dim3 grid(n_tokens, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
