@@ -24838,6 +24838,36 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
  * ds4_engine_open. When non-NULL and the computed placement is
  * single-tier, the engine opens normally. Multi-tier placement triggers
  * the upfront refusal printed by engine_classify_multi_tier's caller. */
+/* Pretty-print the layout via the layer packer + per-tier overhead. */
+static void engine_print_layout(const ds4_engine *e) {
+    size_t entry_bytes[DS4_MAX_LAYER + 2];
+    (void)engine_compute_entry_bytes(e, entry_bytes);
+
+    size_t used[DS4_LAYER_PACK_MAX_GPUS] = {0};
+    size_t budget[DS4_LAYER_PACK_MAX_GPUS] = {0};
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        budget[d] = e->gpu_cfg.vram_bytes[d];
+    }
+    for (int i = 0; i < e->n_placement_entries; i++) {
+        int dev = e->placement[i];
+        if (dev >= 0 && dev < e->gpu_cfg.n_gpus) used[dev] += entry_bytes[i];
+    }
+    ds4_layer_pack_print(stderr,
+                          e->placement,
+                          e->n_placement_entries,
+                          DS4_N_LAYER,
+                          entry_bytes,
+                          used,
+                          budget,
+                          e->gpu_cfg.n_gpus);
+
+    const size_t overhead = engine_per_tier_graph_overhead_bytes(e->placement_ctx_hint);
+    fprintf(stderr,
+            "ds4: per-tier graph scratch reserved on each GPU: %.2f GiB "
+            "(pre-subtracted from each --gpu-vram budget before packing).\n",
+            (double)overhead / (1024.0 * 1024.0 * 1024.0));
+}
+
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
@@ -24845,7 +24875,7 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
         return ds4_engine_open(out, opt);
     }
     /* gpu_cfg != NULL: open the engine, then classify. If multi-tier,
-     * print layout + refuse upfront (no GPU init). */
+     * print layout + refuse upfront. */
     int rc = ds4_engine_open(out, opt);
     if (rc != 0 || !out || !*out) return rc;
     ds4_engine *e = *out;
@@ -24857,11 +24887,63 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
         return 1;
     }
     if (e->multi_tier) {
-        fprintf(stderr,
-            "ds4: multi-tier placement detected (PR #6 D5-MINIMAL replant).\n"
-            "ds4: multi-tier RUNTIME execution wiring is a documented\n"
-            "ds4: carry-forward; this build supports single-tier only.\n"
-            "ds4: see docs/plans/upstream-sync-2-replant.md.\n");
+        /* PR #12 refusal contract: ALWAYS print layout first so the
+         * operator sees what the packer decided, then describe the
+         * specific failure mode. */
+        engine_print_layout(e);
+
+        int has_cpu_spill = 0;
+        int spilled_entries = 0;
+        for (int i = 0; i < e->n_placement_entries; i++) {
+            if (e->placement[i] == DS4_LAYER_PACK_CPU) {
+                has_cpu_spill = 1;
+                spilled_entries++;
+            }
+        }
+
+        if (has_cpu_spill) {
+            /* PR #12 CPU-spill refusal — required by test_engine_mgpu_refusal. */
+            fprintf(stderr,
+                "ds4: CPU-spill placement detected; CPU-tier execution wiring "
+                "is the wave-3b mgpu-graph-session-cpu-spill follow-up.\n");
+            size_t total_budget = 0;
+            size_t total_required = 0;
+            for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+                total_budget += e->gpu_cfg.vram_bytes[d];
+            }
+            size_t entry_bytes[DS4_MAX_LAYER + 2];
+            (void)engine_compute_entry_bytes(e, entry_bytes);
+            for (int i = 0; i < e->n_placement_entries; i++) {
+                if (e->placement[i] == DS4_LAYER_PACK_CPU) {
+                    total_required += entry_bytes[i];
+                }
+            }
+            fprintf(stderr,
+                "ds4: --gpu-vram placement does not fit at the requested "
+                "context (ctx hint = %d):\n",
+                e->placement_ctx_hint);
+            fprintf(stderr,
+                "ds4:   %d placement entries spilled to CPU (%.2f GiB "
+                "unaccommodated of %.2f GiB total per-device budget).\n",
+                spilled_entries,
+                (double)total_required / (1024.0 * 1024.0 * 1024.0),
+                (double)total_budget / (1024.0 * 1024.0 * 1024.0));
+            fprintf(stderr,
+                "ds4: Lower --ctx / --ctx-max, raise --gpu-vram budgets, or "
+                "use --gpu-vram auto on a host with more free VRAM.\n");
+            fprintf(stderr,
+                "ds4: Refusing upfront to avoid silent OOM at session_create.\n");
+        } else {
+            /* No CPU-spill, but full multi-tier RUNTIME wiring carry-forward.
+             * The D5-MINIMAL replant preserves the planning/refusal logic
+             * but the per-field accessor wrapping inside the dispatch
+             * body is documented carry-forward. */
+            fprintf(stderr,
+                "ds4: multi-tier placement detected (PR #6 D5-MINIMAL replant).\n"
+                "ds4: multi-tier RUNTIME execution wiring is a documented\n"
+                "ds4: carry-forward; this build supports single-tier only.\n"
+                "ds4: see docs/plans/upstream-sync-2-replant.md.\n");
+        }
         ds4_engine_close(e);
         *out = NULL;
         return 1;
