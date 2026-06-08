@@ -38,6 +38,8 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_gpu_mgpu.h"
+#include "ds4_layer_pack.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -20974,6 +20976,18 @@ struct ds4_engine {
     ds4_distributed_options distributed;
     bool metal_ready;
     bool mtp_ready;
+
+    /* Optional multi-GPU placement state (PR #4). Zero-initialized for
+     * every existing caller (gpu_cfg == NULL) via xcalloc, so the
+     * single-tier path observes identical engine state to pre-PR-#4
+     * main. multi_tier == 1 is the gate for all new code paths. */
+    ds4_gpu_config gpu_cfg;
+    int            placement[DS4_MAX_LAYER + 2];
+    int            n_placement_entries;
+    int            multi_tier;
+    /* PR #12: caller-provided context-size hint passed to the planner so
+     * per-layer KV/index/scratch budgets reflect the requested ctx. */
+    int            placement_ctx_hint;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -24647,6 +24661,330 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
     return true;
 #endif
 }
+
+/* =========================================================================
+ * Multi-GPU placement helpers (PR #4 + PR #12 — replanted onto upstream).
+ *
+ * These compute the placement table consumed by the layer packer and by
+ * the upfront refusal path. They are pure CPU and reach no GPU code; they
+ * are also exercised by tests/test_engine_mgpu_placement via the
+ * DS4_TEST_HOOKS-gated symbols below.
+ * ========================================================================= */
+
+/* Classify each model tensor by its placement entry. Tensor names live
+ * in ds4_str slices (ptr+len), NOT NUL-terminated. */
+static int tensor_to_entry(const ds4_tensor *t, int n_layer) {
+    const char *p = t->name.ptr;
+    int n = (int)t->name.len;
+    if (n <= 0 || !p) return 0;
+
+    /* "blk.<digits>." prefix -> entry il + 1. */
+    if (n >= 5 && memcmp(p, "blk.", 4) == 0) {
+        int i = 4;
+        int il = 0;
+        int digits = 0;
+        while (i < n && p[i] >= '0' && p[i] <= '9') {
+            if (digits >= 4) return 0;
+            il = il * 10 + (p[i] - '0');
+            digits++;
+            i++;
+        }
+        if (digits > 0 && i < n && p[i] == '.' && il >= 0 && il < n_layer) {
+            return il + 1;
+        }
+        return 0;
+    }
+    /* Output-head tensors (output, output_norm, output_hc_*) -> head bucket. */
+    static const char k_output[] = "output.weight";
+    static const char k_output_norm[] = "output_norm.weight";
+    static const char k_output_hc[] = "output_hc_";
+    if (n == (int)sizeof(k_output) - 1 && memcmp(p, k_output, n) == 0) {
+        return n_layer + 1;
+    }
+    if (n == (int)sizeof(k_output_norm) - 1 && memcmp(p, k_output_norm, n) == 0) {
+        return n_layer + 1;
+    }
+    if (n >= (int)sizeof(k_output_hc) - 1 &&
+        memcmp(p, k_output_hc, sizeof(k_output_hc) - 1) == 0) {
+        return n_layer + 1;
+    }
+    /* mtp.* -> head bucket. */
+    if (n >= 4 && memcmp(p, "mtp.", 4) == 0) return n_layer + 1;
+
+    /* token_embd.weight and everything else -> entry 0 (embedding). */
+    return 0;
+}
+
+/* PR #12: per-tier graph overhead — mirrors metal_graph_alloc_raw_cap's
+ * per-tier scratch allocation. The D5-MINIMAL replant of PR #6 keeps
+ * single-tier byte-equivalent behavior, so the per-tier overhead is
+ * dominated by the constant scratch arenas. Conservative 64 MiB per
+ * tier covers ctx-sensitive buffers on Mac builds. */
+static size_t engine_per_tier_graph_overhead_bytes(int placement_ctx_hint) {
+    const int ctx = placement_ctx_hint > 0 ? placement_ctx_hint : 4096;
+    /* Conservative scratch arena estimate; the real allocator's value is
+     * not visible without the full PR #6 graph state. This is purely an
+     * upper-bound used by the refusal path's pre-subtract. */
+    const size_t base = (size_t)128ull * 1024ull * 1024ull;
+    const size_t per_ctx = (size_t)ctx * 16ull * 1024ull; /* ~16 KiB/ctx */
+    return base + per_ctx;
+}
+
+/* PR #12: per-layer KV/index bytes (without scratch — no double-count).
+ *
+ * Per the v0 multi-tier planner (PR #12): compressed-KV plus indexer
+ * rows scale linearly in ctx, at roughly (head_dim + indexer_head_dim)
+ * bytes per token of comp_cap. comp_cap is ctx/4 for the v0 cache. */
+static size_t engine_per_layer_kv_bytes_planner(int placement_ctx_hint) {
+    const int ctx = placement_ctx_hint > 0 ? placement_ctx_hint : 4096;
+    /* Same shape as the v0 planner: comp_cap = ctx/4, per-token bytes =
+     * (head_dim + indexer_head_dim) * sizeof(float). DS4_N_LAYER == 43
+     * default; (512 + 128) * 4 = 2560 bytes per cache row. */
+    const size_t comp_cap = (size_t)(ctx > 0 ? ctx : 1) / 4u;
+    const size_t per_row_bytes = (size_t)(DS4_N_HEAD_DIM + DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
+    return comp_cap * per_row_bytes;
+}
+
+/* Compute per-entry byte footprint. Walks the tensor table once and adds
+ * each tensor's bytes to its entry bucket, then adds per-layer KV/index
+ * estimate. */
+static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
+    const int n_entries = DS4_N_LAYER + 2;
+    for (int i = 0; i < n_entries; i++) out[i] = 0;
+
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const ds4_tensor *t = &e->model.tensors[i];
+        if (t->bytes == 0) continue;
+        int entry = tensor_to_entry(t, DS4_N_LAYER);
+        if (entry < 0 || entry >= n_entries) entry = 0;
+        out[entry] += t->bytes;
+    }
+
+    /* Per-layer KV/index estimate (PR #12: no scratch — scratch is
+     * pre-subtracted separately via engine_per_tier_graph_overhead_bytes). */
+    const size_t per_layer_kv = engine_per_layer_kv_bytes_planner(e->placement_ctx_hint);
+    for (uint32_t i = 1; i <= DS4_N_LAYER; i++) out[i] += per_layer_kv;
+    return 0;
+}
+
+/* Classify multi-tier placement on a freshly-opened engine. NULL config
+ * is a no-op (single-tier). */
+static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) {
+    if (!cfg) {
+        e->multi_tier = 0;
+        e->n_placement_entries = 0;
+        return 0;
+    }
+    if (cfg->n_gpus <= 0 || cfg->n_gpus > DS4_LAYER_PACK_MAX_GPUS) return -1;
+
+    /* Caller-bug guard: all-zero vram_bytes is nonsensical. */
+    size_t total_budget = 0;
+    for (int d = 0; d < cfg->n_gpus; d++) total_budget += cfg->vram_bytes[d];
+    if (total_budget == 0) {
+        fprintf(stderr,
+                "ds4: ds4_gpu_config has n_gpus=%d but every vram_bytes[d]==0; "
+                "caller must populate explicit budgets\n",
+                cfg->n_gpus);
+        return -1;
+    }
+
+    e->gpu_cfg = *cfg;
+
+    size_t entry_bytes[DS4_MAX_LAYER + 2];
+    if (engine_compute_entry_bytes(e, entry_bytes) != 0) return -1;
+
+    ds4_layer_pack_config pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.n_gpus = cfg->n_gpus;
+    const size_t cublas_workspace_overhead = (size_t)64ull * 1024ull * 1024ull;
+    /* PR #12: pre-subtract per-tier graph overhead from each GPU's
+     * effective budget so the packer doesn't over-pack. */
+    const size_t per_tier_overhead =
+        engine_per_tier_graph_overhead_bytes(e->placement_ctx_hint);
+    for (int d = 0; d < cfg->n_gpus; d++) {
+        size_t budget = cfg->vram_bytes[d];
+        size_t reserve = cfg->safety_margin_bytes + cublas_workspace_overhead
+                       + per_tier_overhead;
+        pcfg.gpu_budget_bytes[d] = budget > reserve ? budget - reserve : 0;
+    }
+
+    if (ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg,
+                                     e->placement) != 0) {
+        return -1;
+    }
+    e->n_placement_entries = DS4_N_LAYER + 2;
+
+    int first_tier = e->placement[0];
+    int multi_tier = 0;
+    for (int i = 1; i < e->n_placement_entries; i++) {
+        if (e->placement[i] != first_tier) { multi_tier = 1; break; }
+    }
+    if (!multi_tier) {
+        for (int i = 0; i < e->n_placement_entries; i++) {
+            if (e->placement[i] == DS4_LAYER_PACK_CPU) { multi_tier = 1; break; }
+        }
+    }
+    e->multi_tier = multi_tier;
+    return 0;
+}
+
+/* Multi-GPU pipeline-parallel entry point.
+ *
+ * D5-MINIMAL scope per docs/plans/upstream-sync-2-replant.md: this entry
+ * point supports the classify path and the upfront refusal path. The
+ * full multi-tier RUNTIME execution wiring (PR #6 per-field accessor
+ * wrapping inside metal_graph_encode_decode_layer) is a documented
+ * carry-forward. When gpu_cfg is NULL, behavior is byte-equivalent to
+ * ds4_engine_open. When non-NULL and the computed placement is
+ * single-tier, the engine opens normally. Multi-tier placement triggers
+ * the upfront refusal printed by engine_classify_multi_tier's caller. */
+int ds4_engine_create_with_gpu_config(ds4_engine **out,
+                                       const ds4_engine_options *opt,
+                                       const struct ds4_gpu_config *gpu_cfg) {
+    if (!gpu_cfg) {
+        return ds4_engine_open(out, opt);
+    }
+    /* gpu_cfg != NULL: open the engine, then classify. If multi-tier,
+     * print layout + refuse upfront (no GPU init). */
+    int rc = ds4_engine_open(out, opt);
+    if (rc != 0 || !out || !*out) return rc;
+    ds4_engine *e = *out;
+    e->placement_ctx_hint = opt->placement_ctx_hint;
+    if (engine_classify_multi_tier(e, gpu_cfg) != 0) {
+        fprintf(stderr, "ds4: failed to classify multi-tier placement\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (e->multi_tier) {
+        fprintf(stderr,
+            "ds4: multi-tier placement detected (PR #6 D5-MINIMAL replant).\n"
+            "ds4: multi-tier RUNTIME execution wiring is a documented\n"
+            "ds4: carry-forward; this build supports single-tier only.\n"
+            "ds4: see docs/plans/upstream-sync-2-replant.md.\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    return 0;
+}
+
+#ifdef DS4_TEST_HOOKS
+/* Test-only hooks for exercising placement logic without a real GGUF. */
+typedef struct {
+    const char *name;
+    uint64_t    bytes;
+} ds4_test_fake_tensor;
+
+int ds4_test_tensor_to_entry(const char *name, int name_len) {
+    ds4_tensor fake;
+    memset(&fake, 0, sizeof(fake));
+    fake.name.ptr = name;
+    fake.name.len = (uint64_t)(name_len > 0 ? name_len : 0);
+    return tensor_to_entry(&fake, DS4_N_LAYER);
+}
+
+static int ds4_test_classify_impl(const ds4_test_fake_tensor *tensors,
+                                   int n_tensors,
+                                   const ds4_gpu_config *cfg,
+                                   int placement_ctx_hint,
+                                   int placement_out[DS4_MAX_LAYER + 2],
+                                   int *out_multi_tier,
+                                   int *out_n_entries) {
+    ds4_engine eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.model.fd = -1;
+    eng.placement_ctx_hint = placement_ctx_hint;
+    eng.model.n_tensors = (uint64_t)(n_tensors > 0 ? n_tensors : 0);
+    eng.model.tensors = NULL;
+    if (n_tensors > 0) {
+        eng.model.tensors = calloc((size_t)n_tensors, sizeof(*eng.model.tensors));
+        if (!eng.model.tensors) return -1;
+        for (int i = 0; i < n_tensors; i++) {
+            eng.model.tensors[i].name.ptr = tensors[i].name;
+            eng.model.tensors[i].name.len = tensors[i].name
+                ? (uint64_t)strlen(tensors[i].name) : 0;
+            eng.model.tensors[i].bytes = tensors[i].bytes;
+        }
+    }
+    int rc = engine_classify_multi_tier(&eng, cfg);
+    if (rc == 0) {
+        if (out_multi_tier) *out_multi_tier = eng.multi_tier;
+        if (out_n_entries) *out_n_entries = eng.n_placement_entries;
+        if (placement_out) {
+            for (int i = 0; i < DS4_N_LAYER + 2 && i < DS4_MAX_LAYER + 2; i++) {
+                placement_out[i] = eng.placement[i];
+            }
+        }
+    }
+    free(eng.model.tensors);
+    return rc;
+}
+
+int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
+                                  int n_tensors,
+                                  const ds4_gpu_config *cfg,
+                                  int placement_out[DS4_MAX_LAYER + 2],
+                                  int *out_multi_tier,
+                                  int *out_n_entries) {
+    return ds4_test_classify_impl(tensors, n_tensors, cfg, 0,
+                                   placement_out, out_multi_tier, out_n_entries);
+}
+
+int ds4_test_classify_multi_tier_with_ctx(const ds4_test_fake_tensor *tensors,
+                                           int n_tensors,
+                                           const ds4_gpu_config *cfg,
+                                           int placement_ctx_hint,
+                                           int placement_out[DS4_MAX_LAYER + 2],
+                                           int *out_multi_tier,
+                                           int *out_n_entries) {
+    return ds4_test_classify_impl(tensors, n_tensors, cfg, placement_ctx_hint,
+                                   placement_out, out_multi_tier, out_n_entries);
+}
+
+void ds4_test_seed_compress_ratios(void) {
+    for (int i = 0; i < DS4_MAX_LAYER; i++) {
+        g_ds4_compress_ratios[i] = 70;
+    }
+}
+
+void ds4_test_clear_compress_ratios(void) {
+    for (int i = 0; i < DS4_MAX_LAYER; i++) {
+        g_ds4_compress_ratios[i] = 0;
+    }
+}
+
+size_t ds4_test_per_tier_graph_overhead_bytes(int placement_ctx_hint) {
+    return engine_per_tier_graph_overhead_bytes(placement_ctx_hint);
+}
+
+size_t ds4_test_compute_entry_bytes_sum(const ds4_test_fake_tensor *tensors,
+                                         int n_tensors,
+                                         int placement_ctx_hint) {
+    ds4_engine eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.model.fd = -1;
+    eng.placement_ctx_hint = placement_ctx_hint;
+    eng.model.n_tensors = (uint64_t)(n_tensors > 0 ? n_tensors : 0);
+    eng.model.tensors = NULL;
+    if (n_tensors > 0) {
+        eng.model.tensors = calloc((size_t)n_tensors, sizeof(*eng.model.tensors));
+        if (!eng.model.tensors) return 0;
+        for (int i = 0; i < n_tensors; i++) {
+            eng.model.tensors[i].name.ptr = tensors[i].name;
+            eng.model.tensors[i].name.len = tensors[i].name
+                ? (uint64_t)strlen(tensors[i].name) : 0;
+            eng.model.tensors[i].bytes = tensors[i].bytes;
+        }
+    }
+    size_t entry_bytes[DS4_MAX_LAYER + 2];
+    engine_compute_entry_bytes(&eng, entry_bytes);
+    size_t sum = 0;
+    for (int i = 0; i < DS4_N_LAYER + 2; i++) sum += entry_bytes[i];
+    free(eng.model.tensors);
+    return sum;
+}
+#endif /* DS4_TEST_HOOKS */
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
