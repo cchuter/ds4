@@ -3221,8 +3221,10 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
-    if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
-    return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
+    const gguf_type_info *info = tensor_type(t->type);
+    if (!info || info->block_elems == 0) ds4_die("unsupported routed expert tensor type");
+    if ((t->dim[0] % info->block_elems) != 0) ds4_die("routed expert row is not quant block aligned");
+    return (t->dim[0] / info->block_elems) * routed_expert_block_bytes(t->type);
 }
 
 static bool ds4_streaming_routed_expert_bytes(
