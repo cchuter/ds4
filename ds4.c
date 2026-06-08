@@ -24736,34 +24736,228 @@ static int tensor_to_entry(const ds4_tensor *t, int n_layer) {
     return 0;
 }
 
-/* PR #12: per-tier graph overhead — mirrors metal_graph_alloc_raw_cap's
- * per-tier scratch allocation. The D5-MINIMAL replant of PR #6 keeps
- * single-tier byte-equivalent behavior, so the per-tier overhead is
- * dominated by the constant scratch arenas. Conservative 64 MiB per
- * tier covers ctx-sensitive buffers on Mac builds. */
-static size_t engine_per_tier_graph_overhead_bytes(int placement_ctx_hint) {
-    const int ctx = placement_ctx_hint > 0 ? placement_ctx_hint : 4096;
-    /* Conservative scratch arena estimate; the real allocator's value is
-     * not visible without the full PR #6 graph state. This is purely an
-     * upper-bound used by the refusal path's pre-subtract. */
-    const size_t base = (size_t)128ull * 1024ull * 1024ull;
-    const size_t per_ctx = (size_t)ctx * 16ull * 1024ull; /* ~16 KiB/ctx */
-    return base + per_ctx;
+/* PR #12 planner: prefill_cap derivation matching runtime. */
+static uint32_t engine_planner_prefill_cap(int prompt_len) {
+    if (prompt_len <= 0) return 1;
+    uint32_t cap = (uint32_t)prompt_len;
+    const char *env = getenv("DS4_METAL_PREFILL_CHUNK");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const long v = strtol(env, &endp, 10);
+        if (endp != env) {
+            if (v <= 0) return cap;
+            cap = (uint32_t)v;
+        }
+    } else if (prompt_len > 4096) {
+        cap = 4096u;
+    }
+    if (cap == 0) cap = 1;
+    if (cap > (uint32_t)prompt_len) cap = (uint32_t)prompt_len;
+    return cap;
 }
 
-/* PR #12: per-layer KV/index bytes (without scratch — no double-count).
- *
- * Per the v0 multi-tier planner (PR #12): compressed-KV plus indexer
- * rows scale linearly in ctx, at roughly (head_dim + indexer_head_dim)
- * bytes per token of comp_cap. comp_cap is ctx/4 for the v0 cache. */
-static size_t engine_per_layer_kv_bytes_planner(int placement_ctx_hint) {
-    const int ctx = placement_ctx_hint > 0 ? placement_ctx_hint : 4096;
-    /* Same shape as the v0 planner: comp_cap = ctx/4, per-token bytes =
-     * (head_dim + indexer_head_dim) * sizeof(float). DS4_N_LAYER == 43
-     * default; (512 + 128) * 4 = 2560 bytes per cache row. */
-    const size_t comp_cap = (size_t)(ctx > 0 ? ctx : 1) / 4u;
-    const size_t per_row_bytes = (size_t)(DS4_N_HEAD_DIM + DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
-    return comp_cap * per_row_bytes;
+/* PR #12 planner: raw_cap derivation matching runtime. */
+static uint32_t engine_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
+    if (ctx_size <= 0) return 1;
+    uint32_t raw_window = DS4_N_SWA;
+    if (raw_window > (uint32_t)ctx_size) raw_window = (uint32_t)ctx_size;
+    if (raw_window == 0) raw_window = 1;
+
+    uint64_t wanted = (uint64_t)raw_window + prefill_cap;
+    if (wanted > (uint32_t)ctx_size) wanted = (uint32_t)ctx_size;
+    if (wanted == 0) wanted = 1;
+    const uint64_t align = 256u;
+    wanted = (wanted + align - 1u) & ~(align - 1u);
+    if (wanted > 8192u) wanted = 8192u;
+    uint32_t raw_cap = (uint32_t)wanted;
+    if (raw_cap < raw_window) raw_cap = raw_window;
+
+    const char *env = getenv("DS4_METAL_GRAPH_RAW_CAP");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const long v = strtol(env, &endp, 10);
+        if (endp != env && v > 0) {
+            raw_cap = (uint32_t)v;
+            if (raw_cap > (uint32_t)ctx_size) raw_cap = (uint32_t)ctx_size;
+            if (raw_cap > 8192u) raw_cap = 8192u;
+            if (raw_cap < raw_window) raw_cap = raw_window;
+        }
+    }
+    return raw_cap;
+}
+
+/* PR #12 planner: per-layer KV/index bytes (without scratch — no double-count).
+ * Mirrors the per-layer raw_cap KV + ratio-conditional compressed-KV +
+ * indexer allocations in metal_graph_alloc_kv_cache_tensor_on. */
+static size_t engine_per_layer_kv_bytes_planner(uint32_t il, int ctx_size) {
+    if (ctx_size <= 0) return 0;
+    if (il >= DS4_N_LAYER) return 0;
+    const uint32_t ctx = (uint32_t)ctx_size;
+    const uint32_t prefill_cap = engine_planner_prefill_cap((int)ctx);
+    const uint32_t raw_cap = engine_planner_raw_cap((int)ctx, prefill_cap);
+    size_t bytes = (size_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio != 0) {
+        const uint32_t layer_comp_cap = ctx / ratio + 2u;
+        bytes += (size_t)layer_comp_cap * DS4_N_HEAD_DIM * sizeof(float);
+        if (ratio == 4) {
+            bytes += (size_t)layer_comp_cap * DS4_N_INDEXER_HEAD_DIM *
+                     sizeof(float);
+        }
+    }
+    return bytes;
+}
+
+#if defined(__APPLE__)
+#define DS4_PLANNER_ATTN_COMP_CACHE_F16 1
+#else
+#define DS4_PLANNER_ATTN_COMP_CACHE_F16 0
+#endif
+
+/* PR #12: per-used-tier Class-P graph overhead estimate, mirroring the
+ * runtime per-tier scratch allocations in metal_graph_alloc_raw_cap.
+ * Pre-subtracted from each device's vram_bytes in classify so the packer
+ * cannot accept a layout that would late-OOM at session_create. */
+static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
+    const uint64_t hc_dim         = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc         = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_rank         = DS4_N_LORA_Q;
+    const uint64_t q_dim          = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t low_dim        = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t group_dim      = (uint64_t)DS4_N_HEAD_DIM *
+                                    (DS4_N_HEAD / DS4_N_OUT_GROUP);
+    const uint64_t shared_dim     = DS4_N_FF_EXP;
+    const uint64_t routed_mid_dim = DS4_N_FF_EXP;
+    const uint64_t vocab_dim      = DS4_N_VOCAB;
+    const uint64_t comp_width_max =
+        2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
+                ? DS4_N_HEAD_DIM
+                : DS4_N_INDEXER_HEAD_DIM);
+    const uint64_t indexer_q_dim  =
+        (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+
+    const int est_ctx = (e->placement_ctx_hint > 0) ? e->placement_ctx_hint
+                                                    : 4096;
+    const uint32_t prefill_cap = engine_planner_prefill_cap(est_ctx);
+
+    uint32_t min_ratio = UINT32_MAX;
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
+    }
+    if (min_ratio == UINT32_MAX) {
+        min_ratio = est_ctx > 0 ? (uint32_t)est_ctx : 1u;
+    }
+    uint32_t comp_cap = (uint32_t)est_ctx / min_ratio + 2u;
+    if (comp_cap < 2u) comp_cap = 2u;
+    uint32_t attn_comp_stage_cap = 0;
+    if (DS4_PLANNER_ATTN_COMP_CACHE_F16) {
+        attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
+        if (attn_comp_stage_cap < 2u) attn_comp_stage_cap = 2u;
+    }
+    const uint64_t pc = (uint64_t)prefill_cap;
+
+    size_t total = 0;
+
+    /* Class P decode HC scratch */
+    total += hc_dim * sizeof(float);
+    total += hc_dim * sizeof(float);
+    total += mix_hc * sizeof(float);
+    total += mix_hc * sizeof(float);
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += q_rank * sizeof(float);
+    total += q_rank * sizeof(float);
+    total += q_dim * sizeof(float);
+    total += (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    total += (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+
+    /* Class P FFN / routed-expert state */
+    total += comp_width_max * sizeof(float);
+    total += comp_width_max * sizeof(float);
+    if (DS4_PLANNER_ATTN_COMP_CACHE_F16) {
+        total += (uint64_t)attn_comp_stage_cap *
+                 DS4_N_HEAD_DIM * sizeof(float);
+    }
+    total += indexer_q_dim * sizeof(float);
+    total += (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float);
+    total += (uint64_t)comp_cap * pc * sizeof(float);
+    total += (uint64_t)comp_cap * pc * sizeof(float);
+    const uint64_t top_k =
+        (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u);
+    total += top_k * pc * sizeof(uint32_t);
+    total += q_dim * sizeof(float);
+    total += low_dim * sizeof(float);
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += hc_dim * sizeof(float);
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += shared_dim * sizeof(float);
+    total += shared_dim * sizeof(float);
+    total += shared_dim * sizeof(float);
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += (uint64_t)DS4_N_EXPERT * sizeof(float);
+    total += (uint64_t)DS4_N_EXPERT * sizeof(float);
+    total += (uint64_t)DS4_N_EXPERT_USED * sizeof(int);
+    total += (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+    total += (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float);
+    total += (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float);
+    total += (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float);
+    total += (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += hc_dim * sizeof(float);
+
+    /* Class P chunked-prefill batch scratch (largest per-tier allocations) */
+    total += pc * hc_dim * sizeof(float);
+    total += pc * hc_dim * sizeof(float);
+    total += pc * hc_dim * sizeof(float);
+    total += pc * mix_hc * sizeof(float);
+    total += pc * mix_hc * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += pc * q_rank * sizeof(float);
+    total += pc * q_rank * sizeof(float);
+    total += pc * q_dim * sizeof(float);
+    total += pc * (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    total += pc * (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    total += pc * comp_width_max * sizeof(float);
+    total += pc * comp_width_max * sizeof(float);
+    total += pc * indexer_q_dim * sizeof(float);
+    total += pc * (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float);
+    total += pc * q_dim * sizeof(float);
+    total += pc * low_dim * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += pc * group_dim * sizeof(float);
+    total += pc * (uint64_t)DS4_N_LORA_O * sizeof(float);
+    total += pc * hc_dim * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += pc * shared_dim * sizeof(float);
+    total += pc * shared_dim * sizeof(float);
+    total += pc * shared_dim * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EXPERT * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EXPERT * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * sizeof(int);
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
+    total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);
+
+    /* Class E prefill_tokens (charged to all tiers conservatively) */
+    total += pc * sizeof(int32_t);
+
+    /* Head-tier extras (charged to all tiers conservatively) */
+    total += (uint64_t)DS4_N_HC   * sizeof(float);
+    total += (uint64_t)DS4_N_HC   * sizeof(float);
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);
+    total += vocab_dim * sizeof(float);
+
+    return total;
 }
 
 /* Compute per-entry byte footprint. Walks the tensor table once and adds
@@ -24783,8 +24977,10 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
 
     /* Per-layer KV/index estimate (PR #12: no scratch — scratch is
      * pre-subtracted separately via engine_per_tier_graph_overhead_bytes). */
-    const size_t per_layer_kv = engine_per_layer_kv_bytes_planner(e->placement_ctx_hint);
-    for (uint32_t i = 1; i <= DS4_N_LAYER; i++) out[i] += per_layer_kv;
+    const int ctx_hint = e->placement_ctx_hint > 0 ? e->placement_ctx_hint : 4096;
+    for (uint32_t i = 1; i <= DS4_N_LAYER; i++) {
+        out[i] += engine_per_layer_kv_bytes_planner(i - 1u, ctx_hint);
+    }
     return 0;
 }
 
@@ -24821,7 +25017,7 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     /* PR #12: pre-subtract per-tier graph overhead from each GPU's
      * effective budget so the packer doesn't over-pack. */
     const size_t per_tier_overhead =
-        engine_per_tier_graph_overhead_bytes(e->placement_ctx_hint);
+        engine_per_tier_graph_overhead_bytes(e);
     for (int d = 0; d < cfg->n_gpus; d++) {
         size_t budget = cfg->vram_bytes[d];
         size_t reserve = cfg->safety_margin_bytes + cublas_workspace_overhead
@@ -24882,7 +25078,7 @@ static void engine_print_layout(const ds4_engine *e) {
                           budget,
                           e->gpu_cfg.n_gpus);
 
-    const size_t overhead = engine_per_tier_graph_overhead_bytes(e->placement_ctx_hint);
+    const size_t overhead = engine_per_tier_graph_overhead_bytes(e);
     fprintf(stderr,
             "ds4: per-tier graph scratch reserved on each GPU: %.2f GiB "
             "(pre-subtracted from each --gpu-vram budget before packing).\n",
@@ -25100,19 +25296,20 @@ int ds4_test_classify_multi_tier_with_ctx(const ds4_test_fake_tensor *tensors,
 }
 
 void ds4_test_seed_compress_ratios(void) {
-    for (int i = 0; i < DS4_MAX_LAYER; i++) {
-        g_ds4_compress_ratios[i] = 70;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g_ds4_compress_ratios[il] = ds4_expected_layer_compress_ratio(il);
     }
 }
 
 void ds4_test_clear_compress_ratios(void) {
-    for (int i = 0; i < DS4_MAX_LAYER; i++) {
-        g_ds4_compress_ratios[i] = 0;
-    }
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
 }
 
 size_t ds4_test_per_tier_graph_overhead_bytes(int placement_ctx_hint) {
-    return engine_per_tier_graph_overhead_bytes(placement_ctx_hint);
+    ds4_engine eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.placement_ctx_hint = placement_ctx_hint;
+    return engine_per_tier_graph_overhead_bytes(&eng);
 }
 
 size_t ds4_test_compute_entry_bytes_sum(const ds4_test_fake_tensor *tensors,
