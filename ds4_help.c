@@ -168,6 +168,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-preload-experts N", "Metal SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
+    opt(fp, c, "--gpu-vram N1,N2,...|auto", "CUDA multi-GPU: per-tier VRAM budget in GiB, or 'auto' to detect. Single-tier or omitted = legacy single-device.");
+    opt(fp, c, "--gpu-devices D1,D2,...", "CUDA multi-GPU: explicit device indices to bind, ordered with --gpu-vram. Default: 0,1,..N-1.");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
