@@ -1,6 +1,8 @@
 #include "ds4.h"
 #include "ds4_gpu_args.h"
 #include "ds4_gpu_mgpu.h"
+#include "ds4_distributed.h"
+#include "ds4_help.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -28,6 +30,7 @@ typedef struct {
     const char *chat_prompt_path;
     const char *system;
     const char *csv_path;
+    const char *expert_profile_path;
     ds4_backend backend;
     int threads;
     int ctx_start;
@@ -36,10 +39,18 @@ typedef struct {
     int step_incr;
     int gen_tokens;
     int power_percent;
+    uint32_t prefill_chunk;
+    uint32_t ssd_streaming_cache_experts;
+    uint64_t ssd_streaming_cache_bytes;
+    uint32_t ssd_streaming_preload_experts;
+    uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    ds4_dist_options dist;
     bool warm_weights;
     bool quality;
+    bool ssd_streaming;
+    bool ssd_streaming_cold;
     /* CLI flag wiring: raw --gpu-vram / --gpu-devices argv values. */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
@@ -55,57 +66,24 @@ static double bench_now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-bench --prompt-file FILE [options]\n"
-        "\n"
-        "Benchmarks instantaneous prefill and generation throughput at context\n"
-        "frontiers such as 2048, 4096, 6144, ... . Generation is always greedy,\n"
-        "runs for exactly --gen-tokens tokens, and skips EOS so every row is\n"
-        "comparable.\n"
-        "\n"
-        "Input:\n"
-        "  --prompt-file FILE\n"
-        "      Raw benchmark text. The fixed token sequence is sliced at each frontier.\n"
-        "  --chat-prompt-file FILE\n"
-        "      Render FILE as one no-thinking chat user message, then slice that sequence.\n"
-        "  -sys, --system TEXT\n"
-        "      System prompt used only with --chat-prompt-file.\n"
-        "\n"
-        "Model and backend:\n"
-        "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
-        "      --cuda is device-0-only; use --gpu-vram for multi-GPU.\n"
-        "  --gpu-vram N[,N,...]   Per-device VRAM budget in GB (comma-separated for\n"
-        "                         multi-GPU). \"auto\" detects free VRAM. \"0\" forces CPU.\n"
-        "  --gpu-devices N[,N,...] Restrict to listed CUDA device indices.\n"
-        "  -t, --threads N        CPU helper threads.\n"
-        "  --quality              Prefer exact kernels where applicable.\n"
-        "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
-        "  --show-output          Decode + print generated tokens after each iteration\n"
-        "                         (correctness smoke check; output to stderr).\n"
-        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "\n"
-        "Sweep:\n"
-        "  --ctx-start N          First measured frontier. Default: 2048\n"
-        "  --ctx-max N            Last measured frontier. Default: 32768\n"
-        "  --ctx-alloc N          Allocated context. Default: ctx-max + gen-tokens + 1\n"
-        "  --step-mul F           Multiplicative step. Default: 1\n"
-        "  --step-incr N          Linear step when --step-mul is 1. Default: 2048\n"
-        "  --gen-tokens N         Greedy decode tokens per frontier. Default: 128\n"
-        "\n"
-        "Output:\n"
-        "  --csv FILE             Write CSV there instead of stdout.\n"
-        "  --dump-frontier-logits-dir DIR\n"
-        "      Write one full-logit JSON file per measured frontier. DIR must exist.\n"
-        "  -h, --help             Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_BENCH, topic);
 }
 
 static int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT_MAX) {
+        fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static int parse_nonnegative_int(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT_MAX) {
         fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
         exit(2);
     }
@@ -132,10 +110,18 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static ds4_backend parse_backend(const char *s, const char *opt) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+#ifdef DS4_ROCM_BUILD
+    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
+#else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
+#ifdef DS4_ROCM_BUILD
+    fprintf(stderr, "ds4-bench: valid backends are: metal, rocm, cpu\n");
+#else
     fprintf(stderr, "ds4-bench: valid backends are: metal, cuda, cpu\n");
+#endif
     exit(2);
 }
 
@@ -203,9 +189,29 @@ static bench_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.dist,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-bench: %s\n",
+                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
@@ -224,19 +230,26 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--step-mul")) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
-            c.gen_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-profile")) {
+            c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--metal")) {
             c.backend = DS4_BACKEND_METAL;
+#ifdef DS4_ROCM_BUILD
+        } else if (!strcmp(arg, "--rocm")) {
+            c.backend = DS4_BACKEND_CUDA;
+#else
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = DS4_BACKEND_CUDA;
+#endif
         } else if (!strcmp(arg, "--gpu-vram")) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
@@ -247,6 +260,37 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
+        } else if (!strcmp(arg, "--ssd-streaming")) {
+            c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            c.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4-bench: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.ssd_streaming_cache_experts = experts;
+            c.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-bench: --ssd-streaming-preload-experts must be positive\n");
+                exit(2);
+            }
+            c.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--simulate-used-memory")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.simulate_used_memory_bytes)) {
+                fprintf(stderr,
+                        "ds4-bench: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--power")) {
             c.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.power_percent < 1 || c.power_percent > 100) {
@@ -257,7 +301,7 @@ static bench_config parse_options(int argc, char **argv) {
             c.warm_weights = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
@@ -285,6 +329,15 @@ static bench_config parse_options(int argc, char **argv) {
     if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
     if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
+        exit(2);
+    }
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-bench: %s\n", dist_err);
+        exit(2);
+    }
+    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-bench: --role worker is a serving mode; start workers with ./ds4\n");
         exit(2);
     }
     return c;
@@ -401,8 +454,13 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
-    ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+static void log_context_memory(ds4_backend backend,
+                               int         ctx_size,
+                               uint32_t    prefill_chunk) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill(backend,
+                                                 ctx_size,
+                                                 prefill_chunk);
     fprintf(stderr,
             "ds4-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -411,6 +469,55 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.prefill_cap,
             m.raw_cap,
             m.comp_cap);
+}
+
+static int wait_distributed_route(ds4_session *session) {
+    char err[256] = {0};
+    char last[256] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(session, err, sizeof(err));
+        if (ready > 0) {
+            if (ticks) fprintf(stderr, "ds4-bench: distributed route ready\n");
+            return 0;
+        }
+        if (ready < 0) {
+            fprintf(stderr,
+                    "ds4-bench: distributed route readiness failed: %s\n",
+                    err[0] ? err : "unknown error");
+            return 1;
+        }
+        const char *why = err[0] ? err : "route incomplete";
+        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
+            fprintf(stderr, "ds4-bench: waiting for distributed route: %s\n", why);
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        nanosleep(&delay, NULL);
+        ticks++;
+    }
+}
+
+static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_session *session) {
+    if (!cfg || !session || cfg->dist.role != DS4_DISTRIBUTED_COORDINATOR) return;
+    uint32_t chunk = cfg->dist.prefill_chunk;
+    if (chunk == 0) {
+        const int cap = ds4_session_prefill_cap(session);
+        if (cap > 0) chunk = (uint32_t)cap;
+    }
+    if (chunk == 0) return;
+    if (cfg->step_mul == 1.0 &&
+        cfg->step_incr > 0 &&
+        (uint32_t)cfg->step_incr < chunk &&
+        cfg->ctx_start < cfg->ctx_max)
+    {
+        fprintf(stderr,
+                "ds4-bench: note: --step-incr=%d is smaller than distributed prefill chunk %u; "
+                "suffix rows will not show multi-chunk pipeline overlap\n",
+                cfg->step_incr,
+                chunk);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -423,7 +530,6 @@ int main(int argc, char **argv) {
             cfg.backend = DS4_BACKEND_CUDA;
         }
     }
-    log_context_memory(cfg.backend, cfg.ctx_alloc);
 
     /* Hint the packer at the largest ctx this bench run will exercise
      * so per-layer KV bytes are priced for the real session size, not
@@ -435,11 +541,25 @@ int main(int argc, char **argv) {
         .model_path = cfg.model_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .prefill_chunk = cfg.prefill_chunk,
+        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
+        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
+        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
+        .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .ssd_streaming = cfg.ssd_streaming,
+        .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .expert_profile_path = cfg.expert_profile_path,
+        .distributed = cfg.dist,
         .placement_ctx_hint = placement_ctx_hint,
     };
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-bench: %s\n", dist_err);
+        return 2;
+    }
     ds4_engine *engine = NULL;
     /* CLI flag wiring: route through ds4_engine_create_with_gpu_config
      * when --gpu-vram or --gpu-devices was supplied. See
@@ -475,6 +595,7 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         return 1;
     }
+    log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
@@ -502,6 +623,15 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+    if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
+        wait_distributed_route(session) != 0)
+    {
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    maybe_warn_distributed_step_shape(&cfg, session);
 
     FILE *out = stdout;
     if (cfg.csv_path) {
@@ -518,6 +648,7 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
+    const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
     ds4_session_snapshot snap = {0};
     char err[256];
     int previous = 0;
@@ -545,10 +676,12 @@ int main(int argc, char **argv) {
             break;
         }
 
-        if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
-            fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
-            rc = 1;
-            break;
+        if (cfg.gen_tokens > 0 && !distributed) {
+            if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
+                rc = 1;
+                break;
+            }
         }
 
         /* When --show-output is set, capture generated token IDs so we
@@ -598,10 +731,20 @@ int main(int argc, char **argv) {
         free(gen_token_buf);
         if (rc != 0) break;
 
-        if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
-            fprintf(stderr, "ds4-bench: restore at %d failed: %s\n", frontier, err);
-            rc = 1;
-            break;
+        if (cfg.gen_tokens == 0) {
+            /* Pure prefill benchmark: leave the live session at the frontier. */
+        } else if (distributed) {
+            if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: distributed replay restore at %d failed: %s\n", frontier, err);
+                rc = 1;
+                break;
+            }
+        } else {
+            if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: restore at %d failed: %s\n", frontier, err);
+                rc = 1;
+                break;
+            }
         }
 
         const double gen_sec = gen_t1 - gen_t0;
@@ -612,7 +755,7 @@ int main(int argc, char **argv) {
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)snap.len);
+                (unsigned long long)(distributed ? 0 : snap.len));
         fflush(out);
 
         previous = frontier;
