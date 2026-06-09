@@ -25646,6 +25646,44 @@ static int engine_install_per_device_caches(ds4_engine *e) {
         per_dev_n[logical_tier]++;
     }
 
+    /* Replicate token_embd to every used tier's selective cache. The
+     * batch-embed dispatch (metal_graph_upload_prompt_embeddings_hc →
+     * ds4_gpu_embed_tokens_hc_tensor) derives logical_tier from out_hc's
+     * slot, which can be any used tier — not just emb_tier. Without this,
+     * strict cache lookup misses on non-emb tiers and the kernel returns
+     * failure. ~1 GiB cost per extra tier; covers the tied-weight output
+     * head case too. */
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const ds4_tensor *t = &e->model.tensors[i];
+        if (t->bytes == 0) continue;
+        if (t->name.len < 10 || !t->name.ptr) continue;
+        if (memcmp(t->name.ptr, "token_embd", 10) != 0) continue;
+        const int entry = tensor_to_entry(t, DS4_N_LAYER);
+        const int valid_entry = (entry < 0 || entry >= e->n_placement_entries) ? 0 : entry;
+        const int home_tier = e->placement[valid_entry];
+        if (home_tier == DS4_LAYER_PACK_CPU) continue;
+        for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+            if (d == home_tier) continue;
+            if (per_dev_n[d] == 0) continue; /* unused tier — skip */
+            if (per_dev_n[d] >= per_dev_cap[d]) {
+                int new_cap = per_dev_cap[d] == 0 ? 64 : per_dev_cap[d] * 2;
+                ds4_tensor_range *grow = realloc(per_dev_ranges[d],
+                                                  (size_t)new_cap * sizeof(*grow));
+                if (!grow) {
+                    fprintf(stderr, "ds4: out of memory replicating token_embd to tier %d\n", d);
+                    goto cleanup;
+                }
+                per_dev_ranges[d] = grow;
+                per_dev_cap[d] = new_cap;
+            }
+            const int physical_device = g_gpu[d].device_id;
+            per_dev_ranges[d][per_dev_n[d]].source_offset = t->abs_offset;
+            per_dev_ranges[d][per_dev_n[d]].bytes = t->bytes;
+            per_dev_ranges[d][per_dev_n[d]].target_device = physical_device;
+            per_dev_n[d]++;
+        }
+    }
+
     for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
         if (per_dev_n[d] == 0) continue;
         const int physical_device = g_gpu[d].device_id;
