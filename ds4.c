@@ -11547,44 +11547,52 @@ static bool metal_graph_alloc_raw_cap(
             }
         }
     }
-    g->comp_kv_cur_by_tier[0] = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    g->comp_sc_cur_by_tier[0] = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-        g->attn_comp_stage_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
-                                                  DS4_N_HEAD_DIM * sizeof(float));
+    /* Half-B (B5): Class P decode-side scratch — replicated across every used tier. */
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        if (!used_tier[t]) continue;
+        g->comp_kv_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_width_max * sizeof(float));
+        g->comp_sc_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_width_max * sizeof(float));
+        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+            g->attn_comp_stage_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
+                (uint64_t)g->attn_comp_stage_cap * DS4_N_HEAD_DIM * sizeof(float));
+        }
+        g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
+        g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
+        g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
+        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
+        g->comp_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
+            (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) * pc * sizeof(uint32_t));
+        g->heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, q_dim * sizeof(float));
+        g->attn_low_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, low_dim * sizeof(float));
+        g->attn_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->after_attn_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, hc_dim * sizeof(float));
+        g->ffn_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->ffn_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->shared_gate_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, shared_dim * sizeof(float));
+        g->shared_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, shared_dim * sizeof(float));
+        g->shared_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, shared_dim * sizeof(float));
+        g->shared_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->router_logits_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT * sizeof(float));
+        g->router_probs_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT * sizeof(float));
+        g->router_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT_USED * sizeof(int));
+        g->router_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT_USED * sizeof(float));
+        g->routed_gate_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+        g->routed_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+        g->routed_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+        g->routed_down_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+        g->routed_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->after_ffn_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, hc_dim * sizeof(float));
     }
-    g->indexer_q_by_tier[0] = ds4_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
-    g->indexer_weights_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-    g->indexer_scores_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
-    g->comp_mask_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
-    g->comp_selected_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
-                                              pc * sizeof(uint32_t));
-    g->heads_by_tier[0] = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
-    g->attn_low_by_tier[0] = ds4_gpu_tensor_alloc(low_dim * sizeof(float));
-    g->attn_out_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->after_attn_hc_by_tier[0] = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-    g->ffn_cur_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->ffn_norm_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
-    g->shared_gate_by_tier[0] = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_up_by_tier[0] = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_mid_by_tier[0] = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_out_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->router_logits_by_tier[0] = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
-    g->router_probs_by_tier[0] = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
-    g->router_selected_by_tier[0] = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
-    g->router_weights_by_tier[0] = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
-    g->routed_gate_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_up_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_mid_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_down_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
-    g->routed_out_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->after_ffn_hc_by_tier[0] = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-    g->output_pre_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
-    g->output_weights_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
-    g->output_embd_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->output_norm_by_tier[0] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->logits_by_tier[0] = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
+    /* Half-B (B3): Class H — output-head buffers live only on head_tier.
+     * head_tier = placement[DS4_N_LAYER + 1] in multi-tier, else 0. */
+    g->head_tier = placement ? placement[DS4_N_LAYER + 1] : 0;
+    if (g->head_tier < 0 || g->head_tier >= DS4_MAX_GPUS) g->head_tier = 0;
+    g->output_pre_by_tier[g->head_tier] = ds4_gpu_tensor_alloc_ptr_on(g->head_tier, (uint64_t)DS4_N_HC * sizeof(float));
+    g->output_weights_by_tier[g->head_tier] = ds4_gpu_tensor_alloc_ptr_on(g->head_tier, (uint64_t)DS4_N_HC * sizeof(float));
+    g->output_embd_by_tier[g->head_tier] = ds4_gpu_tensor_alloc_ptr_on(g->head_tier, (uint64_t)DS4_N_EMBD * sizeof(float));
+    g->output_norm_by_tier[g->head_tier] = ds4_gpu_tensor_alloc_ptr_on(g->head_tier, (uint64_t)DS4_N_EMBD * sizeof(float));
+    g->logits_by_tier[g->head_tier] = ds4_gpu_tensor_alloc_ptr_on(g->head_tier, vocab_dim * sizeof(float));
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
      * does not opt in with --mtp must allocate and execute exactly the same
@@ -11608,50 +11616,57 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_n_raw = 0;
     }
 
-    g->prefill_tokens_by_tier[0] = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
-    g->batch_cur_hc_by_tier[0] = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_next_hc_by_tier[0] = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_flat_hc_by_tier[0] = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_hc_mix_by_tier[0] = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
-    g->batch_hc_split_by_tier[0] = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
-    g->batch_attn_cur_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_attn_norm_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_qr_by_tier[0] = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
-    g->batch_qr_norm_by_tier[0] = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
-    g->batch_q_by_tier[0] = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    /* Half-B (B4): Class E — prompt-token integer buffer lives on emb_tier only. */
+    g->prefill_tokens_by_tier[g->emb_tier] = ds4_gpu_tensor_alloc_ptr_on(g->emb_tier, pc * sizeof(int32_t));
+    /* Half-B (B5): Class P batch scratch — replicated across every used tier. */
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        if (!used_tier[t]) continue;
+        g->batch_cur_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
+        g->batch_next_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
+        g->batch_flat_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
+        g->batch_hc_mix_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * mix_hc * sizeof(float));
+        g->batch_hc_split_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * mix_hc * sizeof(float));
+        g->batch_attn_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
+        g->batch_attn_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
+        g->batch_qr_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_rank * sizeof(float));
+        g->batch_qr_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_rank * sizeof(float));
+        g->batch_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_dim * sizeof(float));
+        g->batch_kv_raw_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_HEAD_DIM * sizeof(float));
+        g->batch_kv_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_HEAD_DIM * sizeof(float));
+        g->batch_comp_kv_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * comp_width_max * sizeof(float));
+        g->batch_comp_sc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * comp_width_max * sizeof(float));
+        g->batch_indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * indexer_q_dim * sizeof(float));
+        g->batch_indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_INDEXER_HEAD * sizeof(float));
+        g->batch_heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_dim * sizeof(float));
+        g->batch_attn_low_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * low_dim * sizeof(float));
+        g->batch_attn_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
+        g->batch_group_tmp_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * group_dim * sizeof(float));
+        g->batch_low_tmp_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_LORA_O * sizeof(float));
+        g->batch_after_attn_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
+        g->batch_ffn_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
+        g->batch_ffn_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
+        g->batch_shared_gate_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * shared_dim * sizeof(float));
+        g->batch_shared_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * shared_dim * sizeof(float));
+        g->batch_shared_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * shared_dim * sizeof(float));
+        g->batch_shared_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
+        g->batch_router_logits_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT * sizeof(float));
+        g->batch_router_probs_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT * sizeof(float));
+        g->batch_router_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * sizeof(int));
+        g->batch_router_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * sizeof(float));
+        g->batch_routed_gate_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+        g->batch_routed_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+        g->batch_routed_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+        g->batch_routed_down_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+        g->batch_routed_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
+    }
+    /* Fork-only single-tier scalar (SplitKV-decode staging). */
     g->batch_q_half = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
-    g->batch_kv_raw_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
-    g->batch_kv_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
-    g->batch_comp_kv_by_tier[0] = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
-    g->batch_comp_sc_by_tier[0] = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
-    g->batch_indexer_q_by_tier[0] = ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
-    g->batch_indexer_weights_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
-    g->batch_heads_by_tier[0] = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
-    g->batch_attn_low_by_tier[0] = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
-    g->batch_attn_out_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_group_tmp_by_tier[0] = ds4_gpu_tensor_alloc(pc * group_dim * sizeof(float));
-    g->batch_low_tmp_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_LORA_O * sizeof(float));
-    g->batch_after_attn_hc_by_tier[0] = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_ffn_cur_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_ffn_norm_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_shared_gate_by_tier[0] = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
-    g->batch_shared_up_by_tier[0] = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
-    g->batch_shared_mid_by_tier[0] = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
-    g->batch_shared_out_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_router_logits_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT * sizeof(float));
-    g->batch_router_probs_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT * sizeof(float));
-    g->batch_router_selected_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(int));
-    g->batch_router_weights_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(float));
+    /* Fork-only single-tier (PR #12 selective-expert cache). */
     g->prefill_seed_router_selected =
         ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER *
                              DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
                              DS4_N_EXPERT_USED *
                              sizeof(int32_t));
-    g->batch_routed_gate_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->batch_routed_up_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->batch_routed_mid_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->batch_routed_down_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
-    g->batch_routed_out_by_tier[0] = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
