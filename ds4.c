@@ -19036,8 +19036,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                                                  token);
             if (ok) {
                 ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
-                g->cur_hc_by_tier[0] = metal_graph_after_ffn_hc(g);
-                g->after_ffn_hc_by_tier[0] = tmp;
+                g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
+                g->after_ffn_hc_by_tier[g->active_tier] = tmp;
             }
         }
         if (ok && logits) {
@@ -19102,8 +19102,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
         if (encoded_layer) {
             ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
-            g->cur_hc_by_tier[0] = metal_graph_after_ffn_hc(g);
-            g->after_ffn_hc_by_tier[0] = tmp;
+            g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
+            g->after_ffn_hc_by_tier[g->active_tier] = tmp;
         }
         const double tl_encoded = profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -20091,9 +20091,10 @@ static bool metal_graph_prefill_layer_major(
             ok = last_hc != NULL;
         }
         if (ok && logits) {
-            g->cur_hc_by_tier[0] = last_hc;
+            const int saved_tier = g->active_tier;
+            g->cur_hc_by_tier[saved_tier] = last_hc;
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-            g->cur_hc_by_tier[g->active_tier] = saved_cur;
+            g->cur_hc_by_tier[saved_tier] = saved_cur;
         }
 
         const double t_encoded = profile ? now_sec() : 0.0;
@@ -20472,15 +20473,16 @@ static bool metal_graph_prefill_layer_major(
             ok = metal_graph_stream_map_output(model, weights);
         }
     }
+    const int saved_tier_head = g->active_tier;
     if (ok && logits) {
-        g->cur_hc_by_tier[0] = last_hc;
+        g->cur_hc_by_tier[saved_tier_head] = last_hc;
         ok = ds4_gpu_begin_commands() != 0;
     }
     if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     const double t_head_encoded = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_end_commands() != 0;
     const double t_head_done = profile ? now_sec() : 0.0;
-    g->cur_hc_by_tier[0] = saved_cur;
+    g->cur_hc_by_tier[saved_tier_head] = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
     if (!ok) return false;
 
@@ -26822,8 +26824,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                  n_raw,
                                                  tokens[0]);
             ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
-            g->cur_hc_by_tier[0] = metal_graph_after_ffn_hc(g);
-            g->after_ffn_hc_by_tier[0] = tmp;
+            g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
+            g->after_ffn_hc_by_tier[g->active_tier] = tmp;
             encoded_layers++;
             if (ok &&
                 split_after_layers != 0 &&
@@ -26893,13 +26895,14 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         last_hc = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g), n_tokens - 1u, hc_dim);
         ok = last_hc != NULL;
         if (ok) {
-            g->cur_hc_by_tier[0] = last_hc;
+            const int active = g->active_tier;
+            g->cur_hc_by_tier[active] = last_hc;
             ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
-            g->cur_hc_by_tier[0] = saved_cur;
+            g->cur_hc_by_tier[active] = saved_cur;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (saved_cur) g->cur_hc_by_tier[0] = saved_cur;
+    if (saved_cur) g->cur_hc_by_tier[g->active_tier] = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
 
     if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
