@@ -10866,51 +10866,64 @@ static inline ds4_gpu_tensor *metal_graph_attn_comp_stage(const ds4_gpu_graph *g
     return g->attn_comp_stage_by_tier[g->active_tier];
 }
 
-/* Release every Metal tensor owned by the whole-model graph runtime. */
+/* Release every Metal tensor owned by the whole-model graph runtime.
+ *
+ * Half-B (B5): Class P/E/H fields are tier-replicated. Iterate every
+ * DS4_MAX_GPUS slot and free any that were allocated (NULL slots are
+ * no-ops). Single-tier (placement==NULL) populated only slot 0;
+ * multi-tier populates every used tier. Restricting the loop to
+ * used_tier[] would require remembering it; freeing NULL is cheap so we
+ * just iterate the full range. */
 static void metal_graph_free(ds4_gpu_graph *g) {
-    ds4_gpu_tensor_free(metal_graph_directional_steering_dirs(g));
-    ds4_gpu_tensor_free(metal_graph_batch_ffn_out(g));
-    ds4_gpu_tensor_free(metal_graph_batch_routed_out(g));
-    ds4_gpu_tensor_free(metal_graph_batch_routed_down(g));
-    ds4_gpu_tensor_free(metal_graph_batch_routed_mid(g));
-    ds4_gpu_tensor_free(metal_graph_batch_routed_up(g));
-    ds4_gpu_tensor_free(metal_graph_batch_routed_gate(g));
-    ds4_gpu_tensor_free(metal_graph_batch_router_weights(g));
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        ds4_gpu_tensor_free(g->directional_steering_dirs_by_tier[t]);
+        g->directional_steering_dirs_by_tier[t] = NULL;
+        ds4_gpu_tensor_free(g->batch_ffn_out_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_routed_out_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_routed_down_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_routed_mid_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_routed_up_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_routed_gate_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_router_weights_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_router_selected_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_router_probs_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_router_logits_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_shared_out_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_shared_mid_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_shared_up_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_shared_gate_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_ffn_norm_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_ffn_cur_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_after_attn_hc_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_low_tmp_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_group_tmp_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_attn_out_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_attn_low_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_heads_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_indexer_weights_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_indexer_q_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_comp_sc_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_comp_kv_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_kv_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_kv_raw_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_q_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_qr_norm_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_qr_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_attn_norm_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_attn_cur_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_hc_split_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_hc_mix_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_flat_hc_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_next_hc_by_tier[t]);
+        ds4_gpu_tensor_free(g->batch_cur_hc_by_tier[t]);
+        ds4_gpu_tensor_free(g->prefill_tokens_by_tier[t]);
+        ds4_gpu_tensor_free(g->logits_by_tier[t]);
+    }
+    /* Fork-only single-tier scalars. */
     ds4_gpu_tensor_free(g->prefill_seed_router_selected);
-    ds4_gpu_tensor_free(metal_graph_batch_router_selected(g));
-    ds4_gpu_tensor_free(metal_graph_batch_router_probs(g));
-    ds4_gpu_tensor_free(metal_graph_batch_router_logits(g));
-    ds4_gpu_tensor_free(metal_graph_batch_shared_out(g));
-    ds4_gpu_tensor_free(metal_graph_batch_shared_mid(g));
-    ds4_gpu_tensor_free(metal_graph_batch_shared_up(g));
-    ds4_gpu_tensor_free(metal_graph_batch_shared_gate(g));
-    ds4_gpu_tensor_free(metal_graph_batch_ffn_norm(g));
-    ds4_gpu_tensor_free(metal_graph_batch_ffn_cur(g));
-    ds4_gpu_tensor_free(metal_graph_batch_after_attn_hc(g));
-    ds4_gpu_tensor_free(metal_graph_batch_low_tmp(g));
-    ds4_gpu_tensor_free(metal_graph_batch_group_tmp(g));
-    ds4_gpu_tensor_free(metal_graph_batch_attn_out(g));
-    ds4_gpu_tensor_free(metal_graph_batch_attn_low(g));
-    ds4_gpu_tensor_free(metal_graph_batch_heads(g));
-    ds4_gpu_tensor_free(metal_graph_batch_indexer_weights(g));
-    ds4_gpu_tensor_free(metal_graph_batch_indexer_q(g));
-    ds4_gpu_tensor_free(metal_graph_batch_comp_sc(g));
-    ds4_gpu_tensor_free(metal_graph_batch_comp_kv(g));
-    ds4_gpu_tensor_free(metal_graph_batch_kv(g));
-    ds4_gpu_tensor_free(metal_graph_batch_kv_raw(g));
+    g->prefill_seed_router_selected = NULL;
     ds4_gpu_tensor_free(g->batch_q_half);
-    ds4_gpu_tensor_free(metal_graph_batch_q(g));
-    ds4_gpu_tensor_free(metal_graph_batch_qr_norm(g));
-    ds4_gpu_tensor_free(metal_graph_batch_qr(g));
-    ds4_gpu_tensor_free(metal_graph_batch_attn_norm(g));
-    ds4_gpu_tensor_free(metal_graph_batch_attn_cur(g));
-    ds4_gpu_tensor_free(metal_graph_batch_hc_split(g));
-    ds4_gpu_tensor_free(metal_graph_batch_hc_mix(g));
-    ds4_gpu_tensor_free(metal_graph_batch_flat_hc(g));
-    ds4_gpu_tensor_free(metal_graph_batch_next_hc(g));
-    ds4_gpu_tensor_free(metal_graph_batch_cur_hc(g));
-    ds4_gpu_tensor_free(metal_graph_prefill_tokens(g));
-    ds4_gpu_tensor_free(metal_graph_logits(g));
+    g->batch_q_half = NULL;
     ds4_gpu_tensor_free(g->mtp_raw_cache);
     ds4_gpu_tensor_free(g->mtp_next_hc);
     ds4_gpu_tensor_free(g->mtp_state_hc);
@@ -10922,39 +10935,43 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_enorm);
     ds4_gpu_tensor_free(g->mtp_embed);
     ds4_gpu_tensor_free(g->spec_logits);
-    ds4_gpu_tensor_free(metal_graph_output_norm(g));
-    ds4_gpu_tensor_free(metal_graph_output_embd(g));
-    ds4_gpu_tensor_free(metal_graph_output_weights(g));
-    ds4_gpu_tensor_free(metal_graph_output_pre(g));
-    ds4_gpu_tensor_free(metal_graph_after_ffn_hc(g));
-    ds4_gpu_tensor_free(metal_graph_ffn_out(g));
-    ds4_gpu_tensor_free(metal_graph_routed_out(g));
-    ds4_gpu_tensor_free(metal_graph_routed_down(g));
-    ds4_gpu_tensor_free(metal_graph_routed_mid(g));
-    ds4_gpu_tensor_free(metal_graph_routed_up(g));
-    ds4_gpu_tensor_free(metal_graph_routed_gate(g));
-    ds4_gpu_tensor_free(metal_graph_router_weights(g));
-    ds4_gpu_tensor_free(metal_graph_router_selected(g));
-    ds4_gpu_tensor_free(metal_graph_router_probs(g));
-    ds4_gpu_tensor_free(metal_graph_router_logits(g));
-    ds4_gpu_tensor_free(metal_graph_shared_out(g));
-    ds4_gpu_tensor_free(metal_graph_shared_mid(g));
-    ds4_gpu_tensor_free(metal_graph_shared_up(g));
-    ds4_gpu_tensor_free(metal_graph_shared_gate(g));
-    ds4_gpu_tensor_free(metal_graph_ffn_norm(g));
-    ds4_gpu_tensor_free(metal_graph_ffn_cur(g));
-    ds4_gpu_tensor_free(metal_graph_after_attn_hc(g));
-    ds4_gpu_tensor_free(metal_graph_attn_out(g));
-    ds4_gpu_tensor_free(metal_graph_attn_low(g));
-    ds4_gpu_tensor_free(metal_graph_heads(g));
-    ds4_gpu_tensor_free(metal_graph_comp_sc_cur(g));
-    ds4_gpu_tensor_free(metal_graph_comp_kv_cur(g));
-    ds4_gpu_tensor_free(metal_graph_attn_comp_stage(g));
-    ds4_gpu_tensor_free(metal_graph_comp_mask(g));
-    ds4_gpu_tensor_free(metal_graph_comp_selected(g));
-    ds4_gpu_tensor_free(metal_graph_indexer_scores(g));
-    ds4_gpu_tensor_free(metal_graph_indexer_weights(g));
-    ds4_gpu_tensor_free(metal_graph_indexer_q(g));
+    /* Half-B (B5): Class P decode-side scratch + Class H output-head —
+     * free every tier slot. */
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        ds4_gpu_tensor_free(g->output_norm_by_tier[t]);
+        ds4_gpu_tensor_free(g->output_embd_by_tier[t]);
+        ds4_gpu_tensor_free(g->output_weights_by_tier[t]);
+        ds4_gpu_tensor_free(g->output_pre_by_tier[t]);
+        ds4_gpu_tensor_free(g->after_ffn_hc_by_tier[t]);
+        ds4_gpu_tensor_free(g->ffn_out_by_tier[t]);
+        ds4_gpu_tensor_free(g->routed_out_by_tier[t]);
+        ds4_gpu_tensor_free(g->routed_down_by_tier[t]);
+        ds4_gpu_tensor_free(g->routed_mid_by_tier[t]);
+        ds4_gpu_tensor_free(g->routed_up_by_tier[t]);
+        ds4_gpu_tensor_free(g->routed_gate_by_tier[t]);
+        ds4_gpu_tensor_free(g->router_weights_by_tier[t]);
+        ds4_gpu_tensor_free(g->router_selected_by_tier[t]);
+        ds4_gpu_tensor_free(g->router_probs_by_tier[t]);
+        ds4_gpu_tensor_free(g->router_logits_by_tier[t]);
+        ds4_gpu_tensor_free(g->shared_out_by_tier[t]);
+        ds4_gpu_tensor_free(g->shared_mid_by_tier[t]);
+        ds4_gpu_tensor_free(g->shared_up_by_tier[t]);
+        ds4_gpu_tensor_free(g->shared_gate_by_tier[t]);
+        ds4_gpu_tensor_free(g->ffn_norm_by_tier[t]);
+        ds4_gpu_tensor_free(g->ffn_cur_by_tier[t]);
+        ds4_gpu_tensor_free(g->after_attn_hc_by_tier[t]);
+        ds4_gpu_tensor_free(g->attn_out_by_tier[t]);
+        ds4_gpu_tensor_free(g->attn_low_by_tier[t]);
+        ds4_gpu_tensor_free(g->heads_by_tier[t]);
+        ds4_gpu_tensor_free(g->comp_sc_cur_by_tier[t]);
+        ds4_gpu_tensor_free(g->comp_kv_cur_by_tier[t]);
+        ds4_gpu_tensor_free(g->attn_comp_stage_by_tier[t]);
+        ds4_gpu_tensor_free(g->comp_mask_by_tier[t]);
+        ds4_gpu_tensor_free(g->comp_selected_by_tier[t]);
+        ds4_gpu_tensor_free(g->indexer_scores_by_tier[t]);
+        ds4_gpu_tensor_free(g->indexer_weights_by_tier[t]);
+        ds4_gpu_tensor_free(g->indexer_q_by_tier[t]);
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_raw_cache[il]);
     }
@@ -11622,7 +11639,10 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_n_raw = 0;
     }
 
-    /* Half-B (B4): Class E — prompt-token integer buffer lives on emb_tier only. */
+    /* Half-B (B4): Class E — prompt-token integer buffer lives on emb_tier only.
+     * emb_tier = placement[0] in multi-tier, else 0. */
+    g->emb_tier = placement ? placement[0] : 0;
+    if (g->emb_tier < 0 || g->emb_tier >= DS4_MAX_GPUS) g->emb_tier = 0;
     g->prefill_tokens_by_tier[g->emb_tier] = ds4_gpu_tensor_alloc_ptr_on(g->emb_tier, pc * sizeof(int32_t));
     /* Half-B (B5): Class P batch scratch — replicated across every used tier. */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
@@ -20085,13 +20105,13 @@ static bool metal_graph_prefill_layer_major(
             }
         }
         ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
+        const int saved_tier = g->active_tier;
         ds4_gpu_tensor *last_hc = NULL;
         if (ok && logits) {
             last_hc = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g), output_row, hc_dim);
             ok = last_hc != NULL;
         }
         if (ok && logits) {
-            const int saved_tier = g->active_tier;
             g->cur_hc_by_tier[saved_tier] = last_hc;
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
             g->cur_hc_by_tier[saved_tier] = saved_cur;
@@ -20100,7 +20120,10 @@ static bool metal_graph_prefill_layer_major(
         const double t_encoded = profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double t_done = profile ? now_sec() : 0.0;
-        g->cur_hc_by_tier[g->active_tier] = saved_cur;
+        /* saved_cur is already restored above; this line is intentionally a
+         * second restore to ensure the saved_tier slot holds saved_cur even
+         * if metal_graph_encode_output_head failed (after-error cleanup). */
+        g->cur_hc_by_tier[saved_tier] = saved_cur;
         if (last_hc) ds4_gpu_tensor_free(last_hc);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
@@ -20450,6 +20473,7 @@ static bool metal_graph_prefill_layer_major(
         }
     }
     ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
+    const int saved_tier_head = g->active_tier;
     ds4_gpu_tensor *last_hc = NULL;
 
     const double t_head0 = profile ? now_sec() : 0.0;
@@ -20473,7 +20497,6 @@ static bool metal_graph_prefill_layer_major(
             ok = metal_graph_stream_map_output(model, weights);
         }
     }
-    const int saved_tier_head = g->active_tier;
     if (ok && logits) {
         g->cur_hc_by_tier[saved_tier_head] = last_hc;
         ok = ds4_gpu_begin_commands() != 0;
@@ -26881,6 +26904,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     ds4_gpu_tensor *last_hc = NULL;
     ds4_gpu_tensor *saved_cur = NULL;
+    int saved_cur_tier = 0;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
         ok = metal_graph_encode_layer_batch(g,
@@ -26892,17 +26916,17 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     }
     if (ok && output_logits) {
         saved_cur = metal_graph_cur_hc(g);
+        saved_cur_tier = g->active_tier;
         last_hc = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g), n_tokens - 1u, hc_dim);
         ok = last_hc != NULL;
         if (ok) {
-            const int active = g->active_tier;
-            g->cur_hc_by_tier[active] = last_hc;
+            g->cur_hc_by_tier[saved_cur_tier] = last_hc;
             ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
-            g->cur_hc_by_tier[active] = saved_cur;
+            g->cur_hc_by_tier[saved_cur_tier] = saved_cur;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (saved_cur) g->cur_hc_by_tier[g->active_tier] = saved_cur;
+    if (saved_cur) g->cur_hc_by_tier[saved_cur_tier] = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
 
     if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
