@@ -11368,6 +11368,12 @@ static bool metal_graph_alloc_raw_cap(
      * kernel-dispatch wrapper. NULL in single-tier callers (placement
      * was already NULL on entry). */
     g->placement = placement;
+    /* Force active_tier=0 and CUDA device 0 on graph init. The per-tier
+     * allocator loop below switches devices via WITH_DEVICE, so without
+     * this we may end up on tier 1's device when warmup runs, causing
+     * cuBLAS EXECUTION_FAILED / xdev copy invalid-argument errors. */
+    g->active_tier = 0;
+    (void)ds4_gpu_set_current_device(0);
     g->mtp_enabled = enable_mtp;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
