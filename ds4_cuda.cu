@@ -2271,18 +2271,9 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
                                         const ds4_gpu_tensor *src,
                                         uint64_t bytes) {
-    if (!dst || !src) {
-        fprintf(stderr, "ds4: xdev copy: NULL tensor (dst=%p src=%p)\n",
-                (void*)dst, (void*)src);
-        return 0;
-    }
+    if (!dst || !src) return 0;
     if (bytes == 0) return 1;
-    if (bytes > dst->bytes || bytes > src->bytes) {
-        fprintf(stderr, "ds4: xdev copy bytes overflow: req=%llu dst.bytes=%llu src.bytes=%llu\n",
-                (unsigned long long)bytes,
-                (unsigned long long)dst->bytes, (unsigned long long)src->bytes);
-        return 0;
-    }
+    if (bytes > dst->bytes || bytes > src->bytes) return 0;
     int sd = ds4_tensor_device_idx(src);
     int dd = ds4_tensor_device_idx(dst);
 
@@ -2294,11 +2285,6 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
             ok = cuda_ok(cudaMemcpyAsync(dst->ptr, src->ptr, bytes,
                                          cudaMemcpyDeviceToDevice, s),
                           "xdev same-device copy");
-            if (!ok) {
-                fprintf(stderr,
-                    "ds4: xdev same-device copy details: sd=%d dst.ptr=%p src.ptr=%p bytes=%llu stream=%p\n",
-                    sd, dst->ptr, src->ptr, (unsigned long long)bytes, (void*)s);
-            }
             if (ok) ok = cuda_ok(cudaStreamSynchronize(s),
                                  "xdev same-device sync");
         }
