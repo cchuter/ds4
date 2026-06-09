@@ -604,7 +604,6 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
-    int max_thinking_tokens;
     bool has_tools;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
@@ -815,8 +814,7 @@ static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     return ok;
 }
 
-static bool parse_thinking_control_value(const char **p, bool *thinking_enabled,
-                                         int *budget_tokens) {
+static bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
@@ -841,13 +839,6 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled,
             if (!strcmp(type, "enabled")) *thinking_enabled = true;
             else if (!strcmp(type, "disabled")) *thinking_enabled = false;
             free(type);
-        } else if (!strcmp(key, "budget_tokens")) {
-            int budget = 0;
-            if (!json_int(p, &budget)) {
-                free(key);
-                return false;
-            }
-            if (budget_tokens && budget > 0) *budget_tokens = budget;
         } else if (!json_skip_value(p)) {
             free(key);
             return false;
@@ -2695,11 +2686,6 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "max_thinking_tokens")) {
-            if (!json_int(&p, &r->max_thinking_tokens)) {
-                free(key);
-                goto bad;
-            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -2744,8 +2730,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled,
-                                              &r->max_thinking_tokens)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
                 goto bad;
             }
@@ -2912,11 +2897,6 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "max_thinking_tokens")) {
-            if (!json_int(&p, &r->max_thinking_tokens)) {
-                free(key);
-                goto bad;
-            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -2947,8 +2927,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled,
-                                              &r->max_thinking_tokens)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
                 goto bad;
             }
@@ -3638,8 +3617,7 @@ fail:
  * summary is surfaced unless the client opts in. */
 static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
                                       bool *summary_opted_in,
-                                      bool *effort_seen,
-                                      int *budget_tokens) {
+                                      bool *effort_seen) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '{') return json_skip_value(p);
@@ -3690,13 +3668,6 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
                 free(key);
                 return false;
             }
-        } else if (!strcmp(key, "budget_tokens")) {
-            int budget = 0;
-            if (!json_int(p, &budget)) {
-                free(key);
-                return false;
-            }
-            if (budget_tokens && budget > 0) *budget_tokens = budget;
         } else if (!json_skip_value(p)) {
             free(key);
             return false;
@@ -3828,11 +3799,6 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "max_thinking_tokens")) {
-            if (!json_int(&p, &r->max_thinking_tokens)) {
-                free(key);
-                goto bad;
-            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3856,8 +3822,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             bool effort_seen = false;
             if (!parse_responses_reasoning(&p, &reasoning_effort,
                                            &r->reasoning_summary_emit,
-                                           &effort_seen,
-                                           &r->max_thinking_tokens)) {
+                                           &effort_seen)) {
                 free(key);
                 goto bad;
             }
@@ -4052,11 +4017,6 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "max_thinking_tokens")) {
-            if (!json_int(&p, &r->max_thinking_tokens)) {
-                free(key);
-                goto bad;
-            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4101,8 +4061,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled,
-                                              &r->max_thinking_tokens)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
                 goto bad;
             }
@@ -7744,11 +7703,6 @@ struct server {
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
-    int max_request_tokens;
-    int max_thinking_tokens;
-    int soft_limit_reply_budget;
-    int hard_limit_reply_budget;
-    int soft_limit_think_close_rank;
     kv_disk_cache kv;
     tool_memory tool_mem;
     live_tool_state responses_live;
@@ -9431,41 +9385,6 @@ typedef struct {
     int tail_len;
 } thinking_state;
 
-typedef enum {
-    THINK_CLOSE_NONE,
-    THINK_CLOSE_NATURAL,
-    THINK_CLOSE_MAX_TOKENS,
-    THINK_CLOSE_SOFT_REPLY,
-    THINK_CLOSE_HARD_REPLY,
-} think_close_kind;
-
-static const char *think_close_kind_name(think_close_kind kind) {
-    switch (kind) {
-    case THINK_CLOSE_NATURAL: return "natural";
-    case THINK_CLOSE_MAX_TOKENS: return "max_thinking_tokens";
-    case THINK_CLOSE_SOFT_REPLY: return "soft_reply_budget";
-    case THINK_CLOSE_HARD_REPLY: return "hard_reply_budget";
-    case THINK_CLOSE_NONE:
-    default: return "none";
-    }
-}
-
-static int token_rank_in_top(ds4_session *session, int token, int max_rank) {
-    if (token < 0 || max_rank <= 0) return 0;
-    ds4_token_score *top = malloc((size_t)max_rank * sizeof(top[0]));
-    if (!top) return 0;
-    int n = ds4_session_top_logprobs(session, top, max_rank);
-    int rank = 0;
-    for (int i = 0; i < n; i++) {
-        if (top[i].id == token) {
-            rank = i + 1;
-            break;
-        }
-    }
-    free(top);
-    return rank;
-}
-
 static bool thinking_tail_ends_with(const thinking_state *st, const char *s) {
     int n = (int)strlen(s);
     return st->tail_len >= n && !memcmp(st->tail + st->tail_len - n, s, (size_t)n);
@@ -10371,11 +10290,6 @@ decode_again:
     int next_tool_progress = 128;
     int next_decode_log = 50;
     if (max_tokens < 0) max_tokens = 0;
-    if (s->max_request_tokens > 0 && max_tokens > s->max_request_tokens) {
-        trace_event(s, trace_id, "clamped max_tokens from %d to %d",
-                    max_tokens, s->max_request_tokens);
-        max_tokens = s->max_request_tokens;
-    }
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
@@ -10385,18 +10299,6 @@ decode_again:
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
-    int effective_max_thinking_tokens = j->req.max_thinking_tokens > 0 ?
-        j->req.max_thinking_tokens : s->max_thinking_tokens;
-    ds4_tokens think_close_tokens = {0};
-    if (thinking_gates_tool_markers && thinking.inside) {
-        ds4_tokenize_text(s->engine, "</think>", &think_close_tokens);
-    }
-    int thinking_tokens = 0;
-    int forced_think_close_pos = -1;
-    think_close_kind recorded_think_close = THINK_CLOSE_NONE;
-    int recorded_think_close_token = 0;
-    int recorded_think_close_remaining = 0;
-    int recorded_think_close_rank = 0;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
@@ -10421,46 +10323,7 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int remaining_budget = max_tokens - completion;
-        int close_rank = 0;
-        think_close_kind close_kind = THINK_CLOSE_NONE;
-        int token = -1;
-        const bool currently_in_think = thinking_gates_tool_markers && thinking.inside;
-        if (currently_in_think && think_close_tokens.len > 0) {
-            if (forced_think_close_pos >= 0) {
-                token = think_close_tokens.v[forced_think_close_pos++];
-                if (forced_think_close_pos >= think_close_tokens.len) forced_think_close_pos = -1;
-            } else if (effective_max_thinking_tokens > 0 &&
-                       thinking_tokens >= effective_max_thinking_tokens) {
-                close_kind = THINK_CLOSE_MAX_TOKENS;
-                token = think_close_tokens.v[0];
-                forced_think_close_pos = think_close_tokens.len > 1 ? 1 : -1;
-            } else if (s->hard_limit_reply_budget > 0 &&
-                       remaining_budget <= s->hard_limit_reply_budget) {
-                close_kind = THINK_CLOSE_HARD_REPLY;
-                token = think_close_tokens.v[0];
-                forced_think_close_pos = think_close_tokens.len > 1 ? 1 : -1;
-            } else if (s->soft_limit_reply_budget > 0 &&
-                       remaining_budget <= s->soft_limit_reply_budget &&
-                       think_close_tokens.len == 1) {
-                close_rank = token_rank_in_top(s->session, think_close_tokens.v[0],
-                                               s->soft_limit_think_close_rank);
-                if (close_rank > 0) {
-                    close_kind = THINK_CLOSE_SOFT_REPLY;
-                    token = think_close_tokens.v[0];
-                }
-            }
-        }
-        if (token < 0)
-            token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
-        if (close_kind != THINK_CLOSE_NONE &&
-            recorded_think_close == THINK_CLOSE_NONE)
-        {
-            recorded_think_close = close_kind;
-            recorded_think_close_token = completion + 1;
-            recorded_think_close_remaining = remaining_budget;
-            recorded_think_close_rank = close_rank;
-        }
+        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -10508,35 +10371,7 @@ decode_again:
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
-            const bool was_in_think = thinking_gates_tool_markers && thinking.inside;
-            if (was_in_think) thinking_tokens++;
             thinking_state_feed(&thinking, piece, piece_len);
-            if (was_in_think && !thinking.inside) {
-                if (recorded_think_close == THINK_CLOSE_NONE) {
-                    recorded_think_close = THINK_CLOSE_NATURAL;
-                    recorded_think_close_token = completion;
-                    recorded_think_close_remaining = max_tokens - completion;
-                    recorded_think_close_rank = 0;
-                }
-                server_log(DS4_LOG_GENERATION,
-                           "ds4-server: %s ctx=%s%s%s closed thinking kind=%s gen=%d think=%d remaining=%d rank=%d",
-                           j->req.kind == REQ_CHAT ? "chat" : "completion",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags,
-                           think_close_kind_name(recorded_think_close),
-                           recorded_think_close_token,
-                           thinking_tokens,
-                           recorded_think_close_remaining,
-                           recorded_think_close_rank);
-                trace_event(s, trace_id,
-                            "closed thinking kind=%s gen=%d think=%d remaining=%d rank=%d",
-                            think_close_kind_name(recorded_think_close),
-                            recorded_think_close_token,
-                            thinking_tokens,
-                            recorded_think_close_remaining,
-                            recorded_think_close_rank);
-            }
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
             }
@@ -11085,7 +10920,6 @@ decode_again:
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
     buf_free(&text);
-    ds4_tokens_free(&think_close_tokens);
     ds4_tokens_free(&effective_prompt);
 }
 
@@ -11446,11 +11280,6 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
-    int max_request_tokens;
-    int max_thinking_tokens;
-    int soft_limit_reply_budget;
-    int hard_limit_reply_budget;
-    int soft_limit_think_close_rank;
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
@@ -11583,10 +11412,6 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
-        .max_request_tokens = 0,
-        .soft_limit_reply_budget = 0,
-        .hard_limit_reply_budget = 0,
-        .soft_limit_think_close_rank = 3,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
@@ -11629,16 +11454,6 @@ static server_config parse_options(int argc, char **argv) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--max-request-tokens")) {
-            c.max_request_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--max-thinking-tokens")) {
-            c.max_thinking_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--soft-limit-reply-budget")) {
-            c.soft_limit_reply_budget = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--hard-limit-reply-budget")) {
-            c.hard_limit_reply_budget = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--soft-limit-think-close-rank")) {
-            c.soft_limit_think_close_rank = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
@@ -11760,13 +11575,6 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
-    if (c.soft_limit_reply_budget > 0 &&
-        c.soft_limit_reply_budget < c.hard_limit_reply_budget)
-    {
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: --soft-limit-reply-budget must be 0 or >= --hard-limit-reply-budget");
-        exit(2);
-    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -11861,11 +11669,6 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
-    s.max_request_tokens = cfg.max_request_tokens;
-    s.max_thinking_tokens = cfg.max_thinking_tokens;
-    s.soft_limit_reply_budget = cfg.soft_limit_reply_budget;
-    s.hard_limit_reply_budget = cfg.hard_limit_reply_budget;
-    s.soft_limit_think_close_rank = cfg.soft_limit_think_close_rank;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -13146,13 +12949,11 @@ static void test_reasoning_effort_mapping(void) {
 
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
-    int budget = 0;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &budget));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
     TEST_ASSERT(!enabled);
-    TEST_ASSERT(budget == 1024);
     thinking = "true";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &budget));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
     TEST_ASSERT(enabled);
 
     ds4_think_mode mode = DS4_THINK_HIGH;
