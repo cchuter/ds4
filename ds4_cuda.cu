@@ -11540,7 +11540,12 @@ static int routed_moe_launch(
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+    /* Q4_K decode kernel (moe_gate_up_mid_q4K_qwarp32 / moe_down_q4K_*)
+     * still requires n_expert == 6. Prefill (n_tokens > 1) now goes through
+     * the sorted-pairs + expert-tile path (use_q4_expert_tiles below), which
+     * launches moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel and the Q4_K
+     * down expert-tile kernels. */
+    if (q4k_path && n_expert != 6u) return 0;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
