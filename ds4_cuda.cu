@@ -10898,6 +10898,37 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
+/* Q4_K prefill (n_tokens > 1) down kernel. Mirrors moe_down_qwarp32_kernel
+ * geometry exactly; only the weight block type and dot helper differ. The
+ * pair = blockIdx.y indexing means the same grid shape (out_dim/32, n_tokens*n_expert)
+ * used by the IQ2 path applies here. The downstream moe_sum_kernel is
+ * weight-type-agnostic and sums these per-pair outputs into the final output. */
+__global__ static void moe_down_q4K_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t pair = blockIdx.y;
+    if (row >= out_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+}
+
 __global__ static void moe_down_sorted_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -11540,7 +11571,17 @@ static int routed_moe_launch(
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+    /* Q4_K routed-MoE dispatch:
+     *   n_tokens == 1: use_direct_down_sum6 + moe_gate_up_mid_decode_q4K_qwarp32
+     *                  + moe_down_q4K_sum6_qwarp32. Direct sum6 path requires
+     *                  n_expert == 6.
+     *   n_tokens >  1: terminal else-branch of the gate/up dispatch reuses
+     *                  moe_gate_up_mid_decode_q4K_qwarp32_kernel (token-indexed
+     *                  via blockIdx.y), and the down dispatch falls to the new
+     *                  moe_down_q4K_qwarp32_kernel. The IQ2-typed sorted-pairs /
+     *                  expert-tile / p2 paths are disabled for q4k_path via
+     *                  use_sorted_pairs below. */
+    if (q4k_path && n_expert != 6u) return 0;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
@@ -11577,7 +11618,13 @@ static int routed_moe_launch(
             if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
         }
         const uint32_t pair_count = n_tokens * n_expert;
-        const uint32_t use_sorted_pairs = n_tokens > 1u;
+        /* Q4_K prefill uses the per-pair decode kernel + new q4K down kernel.
+         * Disabling use_sorted_pairs for q4k_path cascades through use_expert_tiles,
+         * use_p2_sorted, use_atomic_down, use_gate_row2048, use_down_tile16, and
+         * use_down_row2048 (all derive from it), routing the q4k_path through the
+         * terminal else-branches of the gate/up and down dispatch. The IQ2 path
+         * (q4k_path == 0) is unaffected. */
+        const uint32_t use_sorted_pairs = !q4k_path && n_tokens > 1u;
         const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
         const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
@@ -11798,7 +11845,12 @@ static int routed_moe_launch(
                     clamp);
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + MOE_DECODE_ROWS_PER_BLOCK - 1u) / MOE_DECODE_ROWS_PER_BLOCK, n_tokens * n_expert, 1);
-                if (use_decode_lut_gate && q4k_path) {
+                if (q4k_path) {
+                    /* Q4_K gate/up: the decode kernel is token-indexed via
+                     * pair = blockIdx.y; tok = pair / n_expert, so the same
+                     * launch covers both n_tokens == 1 (decode) and n_tokens > 1
+                     * (prefill). q4k_path is steered here by use_sorted_pairs = 0
+                     * cascading the IQ2 sorted/expert-tile branches off. */
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -11968,6 +12020,22 @@ static int routed_moe_launch(
                     down_w,
                     midq,
                     sorted_pairs,
+                    (const int32_t *)selected->ptr,
+                    down_expert_bytes,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim,
+                    n_expert);
+            } else if (q4k_path) {
+                /* Q4_K prefill down. New kernel mirrors moe_down_qwarp32_kernel
+                 * grid/geometry, swapping the weight block type to cuda_block_q4_K
+                 * and the dot helper to dev_dot_q4_K_q8_K_block. Writes per-pair
+                 * outputs into down->ptr; moe_sum_kernel below sums them across
+                 * experts into out->ptr. */
+                moe_down_q4K_qwarp32_kernel<<<dgrid, 256>>>(
+                    (float *)down->ptr,
+                    down_w,
+                    midq,
                     (const int32_t *)selected->ptr,
                     down_expert_bytes,
                     down_row_bytes,
